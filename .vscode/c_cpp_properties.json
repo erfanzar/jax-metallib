@@ -1,0 +1,26 @@
+{
+    "configurations": [
+        {
+            "name": "Mac",
+            "compileCommands": "${workspaceFolder}/build/cp313-cp313-macosx_26_0_arm64/compile_commands.json",
+            "includePath": [
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/build/cp313-cp313-macosx_26_0_arm64",
+                "/Users/erfan/.local/jax-metallib-deps/include"
+            ],
+            "defines": [],
+            "macFrameworkPath": [
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+            ],
+            "compilerPath": "/usr/bin/clang++",
+            "compilerArgs": [
+                "-x",
+                "objective-c++"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "macos-clang-arm64"
+        }
+    ],
+    "version": 4
+}

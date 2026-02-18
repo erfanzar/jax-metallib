@@ -1,0 +1,76 @@
+[project]
+name = "jax-metallib"
+version = "0.9.4.5"
+description = "JAX backend for Apple M series of chips"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = ["jax>=0.9.0,<0.10", "jaxlib>=0.9.0,<0.10"]
+keywords = ["jax", "metal", "mps", "apple", "gpu", "machine-learning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/erfanzar/jax-metallib"
+Repository = "https://github.com/erfanzar/jax-metallib"
+
+[project.entry-points."jax_plugins"]
+mps = "jax_plugins.silicon"
+
+[build-system]
+requires = ["scikit-build-core>=0.8"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+# Build directory
+build-dir = "build/{wheel_tag}"
+
+# CMake configuration
+cmake.build-type = "Release"
+build.verbose = true
+
+# Install the built library to the package
+wheel.packages = ["src/jax_plugins"]
+wheel.install-dir = "jax_plugins/silicon"
+
+[tool.cibuildwheel]
+build = ["cp311-macosx_arm64", "cp312-macosx_arm64", "cp313-macosx_arm64"]
+environment = { CMAKE_PREFIX_PATH = "$HOME/.local/jax-metallib-deps" }
+before-all = "./scripts/setup_deps.sh"
+
+[tool.uv.sources]
+ctcache = { git = "https://github.com/matus-chochlik/ctcache.git" }
+
+[dependency-groups]
+dev = [
+    "ctcache",
+    "numpyro>=0.20.0",
+    "pre-commit>=4.5.1",
+    "pytest",
+    "ruff>=0.14.13",
+    "tqdm>=4.67.1",
+    "flax",
+]
+
+[tool.black]
+line-length = 121
+target-version = ["py311"]
+preview = true
+
+[tool.ruff]
+line-length = 121
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
+ignore = ["F722", "B008", "UP015", "A005", "F821", "E741", "UP037", "RUF002"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]
