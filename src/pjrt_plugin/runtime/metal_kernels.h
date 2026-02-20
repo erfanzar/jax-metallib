@@ -30,6 +30,10 @@ struct FastNativeKernelCacheEntry {
 
 NSString* FastNativeKernelsSource();
 
+// MPP (MetalPerformancePrimitives) GEMM kernel source — requires Metal 3.1+ with tensor support.
+// Returns nil if not supported (pre-M3 hardware).
+NSString* MppGemmKernelSource();
+
 } // namespace jax_metallib
 
 #endif

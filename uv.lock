@@ -343,7 +343,7 @@ wheels = [
 
 [[package]]
 name = "jax-metallib"
-version = "0.9.4.5"
+version = "0.9.4.10"
 source = { editable = "." }
 dependencies = [
     { name = "jax" },

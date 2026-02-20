@@ -24,10 +24,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# ---------------------------------------------------------------------------
-# Benchmark definitions: each is a (name, description, python_source) triple.
-# The source defines `benchmark()` which returns {"times": [...], "dtype": str}.
-# ---------------------------------------------------------------------------
 
 # Shared preamble injected into every subprocess
 _PREAMBLE = textwrap.dedent(
@@ -515,6 +511,26 @@ _add(
 )
 
 _add(
+    "pattern.attention_f16",
+    "Scaled dot-product attention [2,8,128,32], float16",
+    """
+    rng = np.random.default_rng(42)
+    B, H, T, Dh = 2, 8, 128, 32
+    q = jnp.array(rng.standard_normal((B, H, T, Dh)).astype(np.float16))
+    k = jnp.array(rng.standard_normal((B, H, T, Dh)).astype(np.float16))
+    v = jnp.array(rng.standard_normal((B, H, T, Dh)).astype(np.float16))
+    def attention(q, k, v):
+        scale = jnp.float16(Dh) ** jnp.float16(-0.5)
+        logits = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) * scale
+        weights = jax.nn.softmax(logits, axis=-1)
+        return jnp.matmul(weights, v)
+    result = bench(attention, (q, k, v))
+    result["dtype"] = "float16"
+    print(json.dumps(result))
+""",
+)
+
+_add(
     "pattern.conv_relu_block_f32",
     "3xConv+ReLU+residual [2,64,64,32], float32",
     """
@@ -622,10 +638,49 @@ _add(
 """,
 )
 
+_add(
+    "pattern.transformer_layer_f16",
+    "Transformer layer (attn+MLP+LN) [2,128,256], float16",
+    """
+    rng = np.random.default_rng(42)
+    B, T, D, H = 2, 128, 256, 8
+    Dh = D // H
+    x = jnp.array(rng.standard_normal((B, T, D)).astype(np.float32).astype(np.float16))
+    wqkv = jnp.array((rng.standard_normal((D, 3*D)) * 0.02).astype(np.float32).astype(np.float16))
+    wo = jnp.array((rng.standard_normal((D, D)) * 0.02).astype(np.float32).astype(np.float16))
+    w1 = jnp.array((rng.standard_normal((D, 4*D)) * 0.02).astype(np.float32).astype(np.float16))
+    w2 = jnp.array((rng.standard_normal((4*D, D)) * 0.02).astype(np.float32).astype(np.float16))
 
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
+    def transformer_layer(x, wqkv, wo, w1, w2):
+        mean = x.mean(axis=-1, keepdims=True)
+        var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+        xn = (x - mean) * jax.lax.rsqrt(var + jnp.float16(1e-5))
+
+        qkv = xn @ wqkv
+        qkv = qkv.reshape((B, T, 3, H, Dh))
+        q = jnp.swapaxes(qkv[:, :, 0, :, :], 1, 2)
+        k = jnp.swapaxes(qkv[:, :, 1, :, :], 1, 2)
+        v = jnp.swapaxes(qkv[:, :, 2, :, :], 1, 2)
+        scale = jnp.float16(Dh) ** jnp.float16(-0.5)
+        logits = jnp.einsum('bhtd,bhsd->bhts', q, k) * scale
+        weights = jax.nn.softmax(logits, axis=-1)
+        attn_out = jnp.einsum('bhts,bhsd->bhtd', weights, v)
+        attn_out = attn_out.transpose((0, 2, 1, 3)).reshape((B, T, D))
+        x = x + attn_out @ wo
+
+        mean = x.mean(axis=-1, keepdims=True)
+        var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+        xn = (x - mean) * jax.lax.rsqrt(var + jnp.float16(1e-5))
+        h = xn @ w1
+        h = jax.nn.gelu(h)
+        x = x + h @ w2
+        return x
+
+    result = bench(transformer_layer, (x, wqkv, wo, w1, w2))
+    result["dtype"] = "float16"
+    print(json.dumps(result))
+""",
+)
 
 
 def run_one_benchmark(
@@ -692,14 +747,14 @@ def main():
     args = parser.parse_args()
 
     # Verify interpreters exist
-    for label, path in [("jax-metallib", args.jax_silicon_python), ("jax-mps", args.jax_mps_python)]:
+    for label, path in [("jax-metallib", args.jax_metallib_python), ("jax-mps", args.jax_mps_python)]:
         if not Path(path).exists():
             print(f"ERROR: {label} Python not found at {path}")
             print(f"  Install {label} in the appropriate venv first.")
             sys.exit(1)
 
     # Get version info
-    for label, pybin in [("jax-metallib", args.jax_silicon_python), ("jax-mps", args.jax_mps_python)]:
+    for label, pybin in [("jax-metallib", args.jax_metallib_python), ("jax-mps", args.jax_mps_python)]:
         try:
             out = subprocess.check_output(
                 [pybin, "-c", "import jax; print(jax.__version__)"],
@@ -724,7 +779,7 @@ def main():
         sys.stdout.write(f"{name:<40} ")
         sys.stdout.flush()
 
-        silicon_result = run_one_benchmark(args.jax_silicon_python, name, source, "silicon", args.timeout)
+        silicon_result = run_one_benchmark(args.jax_metallib_python, name, source, "silicon", args.timeout)
         mps_result = run_one_benchmark(args.jax_mps_python, name, source, "jax-mps", args.timeout)
 
         silicon_ms = silicon_result["median_ms"] if silicon_result else None
