@@ -70,7 +70,7 @@ static ProcessResult HandleConstant(HandlerContext& ctx) {
                 scalarValue = denseAttr.getSplatValue<float>();
             } else if (elemType.isF64()) {
                 scalarValue = denseAttr.getSplatValue<double>();
-            } else if (elemType.isF16()) {
+            } else if (elemType.isF16() || elemType.isBF16()) {
                 auto apVal = denseAttr.getSplatValue<llvm::APFloat>();
                 scalarValue = apVal.convertToFloat();
             } else if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elemType)) {

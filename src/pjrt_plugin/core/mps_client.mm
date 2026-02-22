@@ -197,6 +197,13 @@ std::unique_ptr<MpsBuffer> MpsClient::BufferFromHostBuffer(const void* data, int
 
     id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)metal_device_;
     id<MTLBuffer> buffer = nil;
+
+    // Zero-element tensors (e.g. shape [0] or [5,0,3]) are valid in JAX/XLA.
+    // Metal doesn't allow zero-length buffers, so allocate a 4-byte placeholder.
+    if (byte_size == 0) {
+        byte_size = 4;
+    }
+
     const bool contiguous = IsContiguous(dims, byte_strides, element_size);
     const bool prefer_private = EnvFlagEnabled("JAX_METALLIB_USE_PRIVATE_INPUT_BUFFERS");
     id<MTLCommandQueue> commandQueue = (__bridge id<MTLCommandQueue>)command_queue_;

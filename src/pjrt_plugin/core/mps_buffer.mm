@@ -171,6 +171,15 @@ bool MpsBuffer::ToHostBuffer(void* dst, std::function<void()> on_done, std::stri
     }
 
     size_t nbytes = byte_size();
+
+    // Zero-element tensors have byte_size 0 — nothing to copy.
+    if (nbytes == 0) {
+        if (on_done) {
+            on_done();
+        }
+        return true;
+    }
+
     id<MTLBuffer> staging = [mtl_device newBufferWithLength:nbytes options:MTLResourceStorageModeShared];
     if (!staging) {
         NSLog(@"ERROR: ToHostBuffer failed to allocate staging buffer (%zu bytes)", nbytes);
@@ -355,6 +364,8 @@ std::unique_ptr<MpsBuffer> MpsBuffer::Clone(std::string* error) const {
     }
 
     size_t nbytes = byte_size();
+    // Zero-element tensors — allocate a minimum 4-byte placeholder for Metal.
+    size_t alloc_nbytes = (nbytes == 0) ? 4 : nbytes;
     id<MTLBuffer> src = (__bridge id<MTLBuffer>)metal_buffer_;
 
     void* src_contents = [src contents];
@@ -363,12 +374,12 @@ std::unique_ptr<MpsBuffer> MpsBuffer::Clone(std::string* error) const {
     if (src_contents) {
 
         dst_buffer = [mtl_device newBufferWithBytes:src_contents
-                                             length:nbytes
+                                             length:alloc_nbytes
                                             options:MTLResourceStorageModeShared];
     } else {
 
-        dst_buffer = [mtl_device newBufferWithLength:nbytes options:MTLResourceStorageModePrivate];
-        if (dst_buffer) {
+        dst_buffer = [mtl_device newBufferWithLength:alloc_nbytes options:MTLResourceStorageModePrivate];
+        if (dst_buffer && nbytes > 0) {
             id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
             if (cmd) {
                 id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];

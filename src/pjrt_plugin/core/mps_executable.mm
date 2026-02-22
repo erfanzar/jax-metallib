@@ -5158,6 +5158,7 @@ static ProcessResult processCallOp(HandlerContext& ctx, mlir::func::CallOp callO
     HandlerContext calleeCtx(ctx.graph, nullptr, ctx.values, ctx.module, ctx.depth + 1,
                              processOperationsAdapter);
     calleeCtx.variables = ctx.variables;
+    calleeCtx.in_control_flow = ctx.in_control_flow;
     ProcessResult calleeResult = processOperations(calleeCtx, calleeBlock);
     if (!calleeResult.ok()) {
         return calleeResult;
@@ -5221,6 +5222,7 @@ static ProcessResult processOperations(HandlerContext& ctx, mlir::Block& block) 
 
         HandlerContext opCtx(ctx.graph, op, ctx.values, ctx.module, ctx.depth, processOperationsAdapter);
         opCtx.variables = ctx.variables;
+        opCtx.in_control_flow = ctx.in_control_flow;
         ProcessResult opResult = handler->graph_handler(opCtx);
         if (!opResult.ok())
             return opResult;
@@ -6483,8 +6485,10 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     }
                 }
                 if (byte_size == 0) {
-                    return ExecutionResult::Error("Invalid (zero) slot buffer size for slot " +
-                                                  std::to_string(slot));
+                    // Zero-element tensors (e.g. shape [0] or [5,0,3]) are valid in JAX/XLA.
+                    // Metal doesn't allow zero-length buffers, so allocate a minimum 4-byte
+                    // placeholder.  The tensor carries no data so the buffer is never read.
+                    byte_size = 4;
                 }
 
                 const bool is_input = slot >= 0 && (size_t)slot < plan_->slot_is_input.size() &&

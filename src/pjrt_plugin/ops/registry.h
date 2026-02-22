@@ -51,6 +51,8 @@ struct ProcessResult {
 
 struct HandlerContext;
 
+inline bool InControlFlowContext();
+
 using BlockProcessor = ProcessResult (*)(HandlerContext& ctx, mlir::Block& block);
 
 struct HandlerContext {
@@ -59,16 +61,23 @@ struct HandlerContext {
     ValueMap& values;
 
     ValueMap* variables = nullptr;
+    bool in_control_flow = false;
 
     mlir::ModuleOp module;
     int depth;
     BlockProcessor processBlock;
 
     HandlerContext(MPSGraph* g, mlir::Operation* o, ValueMap& v)
-        : graph(g), op(o), values(v), variables(nullptr), module(nullptr), depth(0), processBlock(nullptr) {}
+        : graph(g), op(o), values(v), variables(nullptr), in_control_flow(false),
+          module(nullptr), depth(0), processBlock(nullptr) {}
 
     HandlerContext(MPSGraph* g, mlir::Operation* o, ValueMap& v, mlir::ModuleOp m, int d, BlockProcessor bp)
-        : graph(g), op(o), values(v), variables(nullptr), module(m), depth(d), processBlock(bp) {}
+        : graph(g), op(o), values(v), variables(nullptr), in_control_flow(false),
+          module(m), depth(d), processBlock(bp) {}
+
+    bool isInControlFlow() const {
+        return in_control_flow || InControlFlowContext();
+    }
 };
 
 using GraphOpHandler = ProcessResult (*)(HandlerContext& ctx);

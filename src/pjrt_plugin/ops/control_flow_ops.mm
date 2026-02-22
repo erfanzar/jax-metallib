@@ -113,6 +113,7 @@ MPSGraphTensor* EvaluateWhileCond(MPSGraph* graph, mlir::Block& condBlock, const
 
     HandlerContext condCtx(graph, nullptr, condValues, module, depth + 1, processBlock);
     condCtx.variables = variables;
+    condCtx.in_control_flow = true;
     ScopedControlFlowContext cf_guard;
     ProcessResult condResult = processBlock(condCtx, condBlock);
     if (!condResult.ok() || condResult.return_values.empty()) {
@@ -139,6 +140,9 @@ NSArray<MPSGraphTensor*>* EvaluateLoopBody(MPSGraph* graph, mlir::Block& bodyBlo
 
     HandlerContext bodyCtx(graph, nullptr, bodyValues, module, depth + 1, processBlock);
     bodyCtx.variables = variables;
+    if (markWhileContext) {
+        bodyCtx.in_control_flow = true;
+    }
     ProcessResult bodyResult;
     if (markWhileContext) {
         ScopedControlFlowContext cf_guard;

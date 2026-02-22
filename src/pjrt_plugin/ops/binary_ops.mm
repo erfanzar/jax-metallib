@@ -395,12 +395,26 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
         return ProcessResult::Error(oss.str());
     }
 
-    std::vector<int64_t> lhsMatShape = batchSizes;
-    lhsMatShape.push_back(m);
-    lhsMatShape.push_back(k);
-    std::vector<int64_t> rhsMatShape = batchSizes;
-    rhsMatShape.push_back(k);
-    rhsMatShape.push_back(n);
+    // MPSGraph matrixMultiplication only supports rank 2 (M×K * K×N) or rank 3
+    // (batch×M×K * batch×K×N).  When dot_general has multiple batch dimensions
+    // (e.g. attention einsum "btnh,bsnh->bnts" with batch dims [0,2]) we must
+    // flatten them into a single batch dimension before the matmul and reshape
+    // the result back afterwards.
+    std::vector<int64_t> lhsMatShape;
+    std::vector<int64_t> rhsMatShape;
+    if (batchSizes.empty()) {
+        // No batch dims → rank-2 matmul [M, K] * [K, N]
+        lhsMatShape = {m, k};
+        rhsMatShape = {k, n};
+    } else if (batchSizes.size() == 1) {
+        // Single batch dim → rank-3 matmul [B, M, K] * [B, K, N]
+        lhsMatShape = {batchSizes[0], m, k};
+        rhsMatShape = {batchSizes[0], k, n};
+    } else {
+        // Multiple batch dims → flatten to single batch [B1*B2*..., M, K]
+        lhsMatShape = {batchCheck, m, k};
+        rhsMatShape = {batchCheck, k, n};
+    }
 
     NSArray<NSNumber*>* lhsMatShapeArray = ToNSArray(lhsMatShape);
     if (lhsMatShapeArray && lhs.shape && ![lhsMatShapeArray isEqualToArray:lhs.shape]) {
