@@ -682,6 +682,97 @@ _add(
 """,
 )
 
+# ===== 10. Full transformer models (multi-layer, realistic GPT-2 configs) =====
+
+
+# Helper to generate transformer model benchmark source
+def _transformer_model_source(B, T, D, H, n_layers, dtype):
+    cast = ".astype(np.float16)" if dtype == "float16" else ""
+    eps_val = "jnp.float16(1e-5)" if dtype == "float16" else "1e-5"
+    scale_dt = "jnp.float16" if dtype == "float16" else "jnp.float32"
+    Dh = D // H
+    ff = 4 * D
+    return f"""
+    rng = np.random.default_rng(42)
+    B, T, D, H, Dh, n_layers, ff = {B}, {T}, {D}, {H}, {Dh}, {n_layers}, {ff}
+    x = jnp.array(rng.standard_normal((B, T, D)).astype(np.float32){cast})
+    flat_wqkv = jnp.array((rng.standard_normal(({n_layers}, D, 3*D)) * 0.02).astype(np.float32){cast})
+    flat_wo   = jnp.array((rng.standard_normal(({n_layers}, D, D))   * 0.02).astype(np.float32){cast})
+    flat_w1   = jnp.array((rng.standard_normal(({n_layers}, D, ff))  * 0.02).astype(np.float32){cast})
+    flat_w2   = jnp.array((rng.standard_normal(({n_layers}, ff, D))  * 0.02).astype(np.float32){cast})
+
+    def layernorm(x):
+        mean = x.mean(axis=-1, keepdims=True)
+        var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+        return (x - mean) * jax.lax.rsqrt(var + {eps_val})
+
+    def transformer_block(x, wqkv, wo, w1, w2):
+        xn = layernorm(x)
+        qkv = xn @ wqkv
+        qkv = qkv.reshape((B, T, 3, H, Dh))
+        q = jnp.swapaxes(qkv[:, :, 0, :, :], 1, 2)
+        k = jnp.swapaxes(qkv[:, :, 1, :, :], 1, 2)
+        v = jnp.swapaxes(qkv[:, :, 2, :, :], 1, 2)
+        scale = {scale_dt}(Dh) ** {scale_dt}(-0.5)
+        logits = jnp.einsum('bhtd,bhsd->bhts', q, k) * scale
+        weights = jax.nn.softmax(logits, axis=-1)
+        attn_out = jnp.einsum('bhts,bhsd->bhtd', weights, v)
+        attn_out = attn_out.transpose((0, 2, 1, 3)).reshape((B, T, D))
+        x = x + attn_out @ wo
+        xn = layernorm(x)
+        h = jax.nn.gelu(xn @ w1)
+        x = x + h @ w2
+        return x
+
+    def forward(x, wqkv_all, wo_all, w1_all, w2_all):
+        def body(carry, layer_idx):
+            return transformer_block(carry, wqkv_all[layer_idx], wo_all[layer_idx],
+                                     w1_all[layer_idx], w2_all[layer_idx]), None
+        x, _ = jax.lax.scan(body, x, jnp.arange(n_layers))
+        return layernorm(x)
+
+    result = bench(forward, (x, flat_wqkv, flat_wo, flat_w1, flat_w2), warmup=5, iters=30)
+    result["dtype"] = "{dtype}"
+    print(json.dumps(result))
+"""
+
+
+_add(
+    "model.gpt2_small_f32",
+    "GPT-2 Small 4-layer [1,128,256], float32",
+    _transformer_model_source(1, 128, 256, 8, 4, "float32"),
+)
+
+_add(
+    "model.gpt2_small_f16",
+    "GPT-2 Small 4-layer [1,128,256], float16",
+    _transformer_model_source(1, 128, 256, 8, 4, "float16"),
+)
+
+_add(
+    "model.gpt2_medium_f32",
+    "GPT-2 Medium 6-layer [1,256,512], float32",
+    _transformer_model_source(1, 256, 512, 8, 6, "float32"),
+)
+
+_add(
+    "model.gpt2_medium_f16",
+    "GPT-2 Medium 6-layer [1,256,512], float16",
+    _transformer_model_source(1, 256, 512, 8, 6, "float16"),
+)
+
+_add(
+    "model.gpt2_large_f16",
+    "GPT-2 Large 6-layer [1,512,768], float16",
+    _transformer_model_source(1, 512, 768, 12, 6, "float16"),
+)
+
+_add(
+    "model.gpt2_batch_f16",
+    "GPT-2 Small batched 4-layer [4,128,256], float16",
+    _transformer_model_source(4, 128, 256, 8, 4, "float16"),
+)
+
 
 def run_one_benchmark(
     python_bin: str,
@@ -827,7 +918,6 @@ def main():
 
     speedups = [r["speedup"] for r in results if r["speedup"] is not None]
     if speedups:
-
         geo_mean = np.exp(np.mean(np.log(speedups))) if speedups else 0
         print(f"Geometric mean speedup (silicon over jax-mps): {geo_mean:.2f}x")
         print(f"Max speedup: {max(speedups):.2f}x  |  Min: {min(speedups):.2f}x")

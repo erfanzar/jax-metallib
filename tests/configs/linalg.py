@@ -31,9 +31,7 @@ def _solve_triangular_unit_diag(L, B):
     return solve_triangular(L, B, lower=True, unit_diagonal=True)
 
 
-def _random_triangular(
-    rng: numpy.random.Generator, n: int, lower: bool = True
-) -> numpy.ndarray:
+def _random_triangular(rng: numpy.random.Generator, n: int, lower: bool = True) -> numpy.ndarray:
     """Generate a random well-conditioned triangular matrix."""
     M = rng.standard_normal((n, n)).astype(numpy.float32)
     L = numpy.tril(M) if lower else numpy.triu(M)
@@ -137,9 +135,7 @@ def make_linalg_op_configs():
         )
         yield OperationTestConfig(
             _solve_triangular_lower,
-            lambda rng: numpy.stack(
-                [_random_triangular(rng, 3, lower=True), _random_triangular(rng, 3, lower=True)]
-            ),
+            lambda rng: numpy.stack([_random_triangular(rng, 3, lower=True), _random_triangular(rng, 3, lower=True)]),
             lambda rng: rng.standard_normal((2, 3, 2)).astype(numpy.float32),
             name="triangular_solve_lower_batched",
         )

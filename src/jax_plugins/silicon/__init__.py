@@ -14,14 +14,17 @@
 
 """JAX metallib plugin for the Apple MPS backend."""
 
+import logging
 import os
 import sys
 import warnings
 from pathlib import Path
 
+_logger = logging.getLogger(__name__)
+
 # jaxlib version this plugin was built against (major.minor). Used for runtime
 # compatibility checking.
-_BUILT_FOR_JAXLIB = (0, 9)
+_BUILT_FOR_JAXLIB = (0, 10)
 _LIB_NAME = "libpjrt_plugin_silicon.dylib"
 
 
@@ -48,6 +51,22 @@ def _get_search_paths():
     ]
 
 
+def _validate_path(path):
+    """Check if a path exists and is a file.
+
+    Args:
+        path: Path to validate.
+
+    Returns:
+        True if path exists and is a file, False otherwise.
+    """
+    try:
+        return Path(path).is_file()
+    except (OSError, ValueError) as e:
+        _logger.debug("Failed to validate path %s: %s", path, e)
+        return False
+
+
 def _find_library():
     """Find the pjrt_plugin_silicon shared library.
 
@@ -59,19 +78,24 @@ def _find_library():
     for env_var in ("JAX_METALLIB_LIBRARY_PATH", "JAX_SILICON_LIBRARY_PATH", "JAX_MPS_LIBRARY_PATH"):
         if env_var in os.environ:
             env_path = os.environ[env_var]
-            if Path(env_path).exists():
+            if _validate_path(env_path):
                 return env_path
-            raise SiliconPluginError(
-                f"{env_var} is set to '{env_path}', but the file does not exist."
+            warnings.warn(
+                f"{env_var} is set to '{env_path}', but the file does not exist or is not a file.",
+                stacklevel=2,
             )
+            break
 
     for path, _ in _get_search_paths():
         # Handle glob patterns
         if "*" in str(path):
-            for match in Path("/").glob(str(path).lstrip("/")):
-                if match.exists():
-                    return str(match)
-        elif path.exists():
+            try:
+                for match in Path("/").glob(str(path).lstrip("/")):
+                    if _validate_path(match):
+                        return str(match)
+            except OSError as e:
+                _logger.debug("Failed to check glob pattern %s: %s", path, e)
+        elif _validate_path(path):
             return str(path)
 
     return None
@@ -99,22 +123,25 @@ def _check_jaxlib_version():
                 f"jax-metallib was built for jaxlib {_BUILT_FOR_JAXLIB[0]}.{_BUILT_FOR_JAXLIB[1]}.x, "
                 f"but jaxlib {version_str} is installed. This may cause compatibility "
                 f"issues with StableHLO bytecode parsing. Consider installing jaxlib "
-                f">={_BUILT_FOR_JAXLIB[0]}.{_BUILT_FOR_JAXLIB[1]}.0,"
-                f"<{_BUILT_FOR_JAXLIB[0]}.{_BUILT_FOR_JAXLIB[1] + 1}",
-                stacklevel=3,
+                f">={_BUILT_FOR_JAXLIB[0]}.{_BUILT_FOR_JAXLIB[1]}.x.",
+                stacklevel=2,
             )
     except Exception:
-        pass  # Don't fail initialization due to version check issues
+        # Silently ignore version check failures - they are non-fatal.
+        pass
 
 
-def _mark_backend_nonexperimental(xla_bridge, platform: str) -> None:
-    """Best-effort suppression of JAX experimental backend warning."""
+def _mark_backend_nonexperimental(xb, backend_name):
+    """Mark a backend as non-experimental in JAX's registry.
+
+    This suppresses the "experimental backend" warning for plugin backends.
+    """
     try:
-        nonexperimental = getattr(xla_bridge, "_nonexperimental_plugins", None)
-        if isinstance(nonexperimental, set):
-            nonexperimental.add(platform)
-    except Exception:
-        # Keep plugin initialization robust across JAX internals changes.
+        factory = xb._backends[backend_name]
+        if hasattr(factory, "options"):
+            factory.options["available"] = True
+    except (KeyError, TypeError):
+        # Backend not yet registered or doesn't support options - ignore.
         pass
 
 
@@ -129,7 +156,7 @@ def initialize():
     # Check platform first
     if sys.platform != "darwin":
         raise SiliconPluginError(
-            f"MPS plugin requires macOS, but running on {sys.platform}. MPS (Metal "
+            f"MPS plugin requires macOS, but running on {sys.platform}. MPS "
             "Performance Shaders) is only available on Apple devices."
         )
 
@@ -140,12 +167,11 @@ def initialize():
     if library_path is None:
         searched = "\n".join(f"  - {desc}" for _, desc in _get_search_paths())
         raise SiliconPluginError(
-            f"Could not find {_LIB_NAME}. Searched paths:\n{searched}\n"
-            "You can also set JAX_METALLIB_LIBRARY_PATH."
+            f"Could not find {_LIB_NAME}. Searched paths:\n{searched}\nYou can also set JAX_METALLIB_LIBRARY_PATH."
         )
 
     # Disable shardy partitioner - it produces sdy dialect ops that our StableHLO parser
-    # doesn't support yet (JAX 0.9+ enables it by default)
+    # doesn't support yet (JAX 0.10+ enables it by default)
     try:
         import jax
 
@@ -171,16 +197,9 @@ def initialize():
         _mark_backend_nonexperimental(xb, "mps")
         xb.register_plugin(
             "mps",
-            priority=500,  # Higher than CPU (0) but lower than GPU (1000)
+            priority=500,
             library_path=library_path,
-            options=None,
+            options={},
         )
     except Exception as e:
-        # Handle "already registered" case - this is fine, not an error
-        if "ALREADY_EXISTS" in str(e) and "mps" in str(e).lower():
-            return
-        raise SiliconPluginError(f"Failed to register MPS plugin with JAX: {e}") from e
-
-
-# Backward-compatible alias for older imports.
-MPSPluginError = SiliconPluginError
+        raise SiliconPluginError(f"Failed to register MPS plugin: {e}") from e

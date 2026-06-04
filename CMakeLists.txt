@@ -295,11 +295,14 @@ if(UTF8_VALIDITY_LIB)
     list(APPEND UTF8_LIBS ${UTF8_VALIDITY_LIB})
 endif()
 
+find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+
 target_link_libraries(pjrt_plugin_silicon PRIVATE
     ${METAL_FRAMEWORK}
     ${MPS_FRAMEWORK}
     ${MPSGRAPH_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
+    ${ACCELERATE_FRAMEWORK}
     ${STABLEHLO_LIBS}
     ${MLIR_LIBS}
     protobuf::libprotobuf

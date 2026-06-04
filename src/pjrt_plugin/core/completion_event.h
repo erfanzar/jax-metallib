@@ -14,11 +14,16 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -29,8 +34,7 @@ public:
     CompletionEventState() = default;
 
     bool IsReady() const {
-        std::scoped_lock lock(mu_);
-        return ready_;
+        return ready_.load(std::memory_order_acquire);
     }
 
     std::string Error() const {
@@ -39,8 +43,44 @@ public:
     }
 
     void Await() const {
+        // Fast path: already complete.
+        if (ready_.load(std::memory_order_acquire)) {
+            return;
+        }
+        // Spin for up to ~200us to avoid condvar wakeup latency (~15-20us).
+        // For typical GPU fences (100-200us), spinning catches completion
+        // without the kernel-level wakeup overhead of condition variables.
+        for (int i = 0; i < 100000; ++i) {
+            if (ready_.load(std::memory_order_acquire)) {
+                return;
+            }
+#if defined(__aarch64__) || defined(__arm64__)
+            __asm__ volatile("yield");
+#elif defined(__x86_64__)
+            __asm__ volatile("pause");
+#endif
+        }
+        // Slow path: condvar wait with timeout.
+        const auto timeout_ms = []() -> int {
+            const char* env = std::getenv("JAX_METALLIB_COMPLETION_TIMEOUT_MS");
+            if (env) {
+                try {
+                    int val = std::stoi(env);
+                    return val > 0 ? val : 30000;
+                } catch (...) {
+                    return 30000;
+                }
+            }
+            return 30000;
+        }();
+
         std::unique_lock lock(mu_);
-        cv_.wait(lock, [&] { return ready_; });
+        bool ready = cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                  [&] { return ready_.load(std::memory_order_relaxed); });
+        if (!ready) {
+            throw std::runtime_error("CompletionEvent::Await() timed out after " +
+                                     std::to_string(timeout_ms) + "ms");
+        }
     }
 
     void MarkReady() {
@@ -51,6 +91,23 @@ public:
         FinishWithError(std::move(error));
     }
 
+    // Reset a completed event for reuse (avoids heap allocation).
+    // Returns true only if the event was ready (safe to reuse).
+    bool TryReset() {
+        // Fast check without mutex — avoids lock overhead when not ready.
+        if (!ready_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::scoped_lock lock(mu_);
+        if (!ready_.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        ready_.store(false, std::memory_order_relaxed);
+        error_.clear();
+        callbacks_.clear();
+        return true;
+    }
+
     void AddReadyCallback(std::function<void()> cb) {
         if (!cb) {
             return;
@@ -58,7 +115,7 @@ public:
         bool run_now = false;
         {
             std::scoped_lock lock(mu_);
-            if (ready_) {
+            if (ready_.load(std::memory_order_relaxed)) {
                 run_now = true;
             } else {
                 callbacks_.push_back(std::move(cb));
@@ -74,10 +131,10 @@ private:
         std::vector<std::function<void()>> callbacks;
         {
             std::scoped_lock lock(mu_);
-            if (ready_) {
+            if (ready_.load(std::memory_order_relaxed)) {
                 return;
             }
-            ready_ = true;
+            ready_.store(true, std::memory_order_release);
             error_ = std::move(error);
             callbacks.swap(callbacks_);
         }
@@ -91,7 +148,7 @@ private:
 
     mutable std::mutex mu_;
     mutable std::condition_variable cv_;
-    bool ready_ = false;
+    std::atomic<bool> ready_{false};
     std::string error_;
     std::vector<std::function<void()>> callbacks_;
 };

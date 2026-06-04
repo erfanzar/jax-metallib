@@ -26,6 +26,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -68,12 +69,12 @@ struct HandlerContext {
     BlockProcessor processBlock;
 
     HandlerContext(MPSGraph* g, mlir::Operation* o, ValueMap& v)
-        : graph(g), op(o), values(v), variables(nullptr), in_control_flow(false),
-          module(nullptr), depth(0), processBlock(nullptr) {}
+        : graph(g), op(o), values(v), variables(nullptr), in_control_flow(false), module(nullptr), depth(0),
+          processBlock(nullptr) {}
 
     HandlerContext(MPSGraph* g, mlir::Operation* o, ValueMap& v, mlir::ModuleOp m, int d, BlockProcessor bp)
-        : graph(g), op(o), values(v), variables(nullptr), in_control_flow(false),
-          module(m), depth(d), processBlock(bp) {}
+        : graph(g), op(o), values(v), variables(nullptr), in_control_flow(false), module(m), depth(d),
+          processBlock(bp) {}
 
     bool isInControlFlow() const {
         return in_control_flow || InControlFlowContext();
@@ -114,19 +115,32 @@ struct OpHandler {
 };
 
 class OpRegistry {
+private:
+    static std::mutex& GetMutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+    static std::unordered_map<std::string, OpHandler>& GetMutableHandlers() {
+        static std::unordered_map<std::string, OpHandler> handlers;
+        return handlers;
+    }
+
 public:
     static bool Register(const char* name, OpHandler handler) {
+        std::lock_guard<std::mutex> lock(GetMutex());
         GetMutableHandlers()[name] = handler;
         return true;
     }
 
     static const OpHandler* Find(const std::string& name) {
+        std::lock_guard<std::mutex> lock(GetMutex());
         auto& handlers = GetMutableHandlers();
         auto it = handlers.find(name);
         return it != handlers.end() ? &it->second : nullptr;
     }
 
     static std::string ListRegistered() {
+        std::lock_guard<std::mutex> lock(GetMutex());
         auto& handlers = GetMutableHandlers();
         std::string result;
         bool first = true;
@@ -140,17 +154,12 @@ public:
     }
 
     static std::unordered_set<std::string> GetRegisteredOps() {
+        std::lock_guard<std::mutex> lock(GetMutex());
         std::unordered_set<std::string> ops;
         for (const auto& pair : GetMutableHandlers()) {
             ops.insert(pair.first);
         }
         return ops;
-    }
-
-private:
-    static std::unordered_map<std::string, OpHandler>& GetMutableHandlers() {
-        static std::unordered_map<std::string, OpHandler> handlers;
-        return handlers;
     }
 };
 

@@ -37,8 +37,8 @@ def main() -> None:
         any_rng |= bool(rec["has_stablehlo_rng"])
         any_rngbg |= bool(rec["has_stablehlo_rng_bit_generator"])
         print(
-            f'{rec["name"]}: stablehlo.rng={rec["has_stablehlo_rng"]} '
-            f'stablehlo.rng_bit_generator={rec["has_stablehlo_rng_bit_generator"]}'
+            f"{rec['name']}: stablehlo.rng={rec['has_stablehlo_rng']} "
+            f"stablehlo.rng_bit_generator={rec['has_stablehlo_rng_bit_generator']}"
         )
 
     print(f"any stablehlo.rng: {any_rng}")
@@ -47,4 +47,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

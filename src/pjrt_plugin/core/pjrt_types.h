@@ -105,6 +105,75 @@ struct PJRT_Error {
 
 PJRT_Error* MakeError(const std::string& msg, PJRT_Error_Code code = PJRT_Error_Code_INTERNAL);
 
+// Thread-local single-element pools for PJRT_Buffer and PJRT_Event.
+// Avoids heap allocation per Execute() call in steady-state benchmarks.
+struct TLPjrtPool {
+    PJRT_Buffer* buffer = nullptr;
+    PJRT_Event* event = nullptr;
+    PJRT_Event* event2 = nullptr; // Second slot for ReadyEvent path
+    ~TLPjrtPool() {
+        delete buffer;
+        delete event;
+        delete event2;
+    }
+};
+
+inline TLPjrtPool& GetTLPjrtPool() {
+    static thread_local TLPjrtPool pool;
+    return pool;
+}
+
+inline PJRT_Buffer* AcquirePjrtBuffer() {
+    auto& pool = GetTLPjrtPool();
+    if (pool.buffer) {
+        auto* buf = pool.buffer;
+        pool.buffer = nullptr;
+        return buf;
+    }
+    return new PJRT_Buffer();
+}
+
+inline void ReleasePjrtBuffer(PJRT_Buffer* buf) {
+    if (!buf) return;
+    auto& pool = GetTLPjrtPool();
+    if (!pool.buffer) {
+        buf->buffer.reset();
+        buf->client = nullptr;
+        pool.buffer = buf;
+    } else {
+        delete buf;
+    }
+}
+
+inline PJRT_Event* AcquirePjrtEvent() {
+    auto& pool = GetTLPjrtPool();
+    if (pool.event) {
+        auto* ev = pool.event;
+        pool.event = nullptr;
+        return ev;
+    }
+    if (pool.event2) {
+        auto* ev = pool.event2;
+        pool.event2 = nullptr;
+        return ev;
+    }
+    return new PJRT_Event();
+}
+
+inline void ReleasePjrtEvent(PJRT_Event* ev) {
+    if (!ev) return;
+    auto& pool = GetTLPjrtPool();
+    if (!pool.event) {
+        ev->completion.reset();
+        pool.event = ev;
+    } else if (!pool.event2) {
+        ev->completion.reset();
+        pool.event2 = ev;
+    } else {
+        delete ev;
+    }
+}
+
 PJRT_Client* GetOrCreateDefaultClient();
 PJRT_Client* GetClient(PJRT_Client* client);
 

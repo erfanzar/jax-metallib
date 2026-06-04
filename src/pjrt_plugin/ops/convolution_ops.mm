@@ -276,16 +276,22 @@ static ProcessResult HandleConvolution(HandlerContext& ctx) {
                                                  kernelSpatialDims[0], kernelSpatialDims[1],
                                                  kernelSpatialDims[2]};
 
-            MPSGraphTensor* mpsKernel = kernel;
-            NSArray<NSNumber*>* kernelPerm = computePermutation(kernelLayout, {0, 1, 2, 3, 4});
-            if (kernelPerm) {
-                mpsKernel = [g transposeTensor:kernel permutation:kernelPerm name:nil];
-            }
-
+            // Check if input is already in NDHWC layout
             NSArray<NSNumber*>* inputPerm = computePermutation(inputLayout, LAYOUT_NDHWC);
             MPSGraphTensor* convInput = input;
-            if (inputPerm) {
+            bool inputAlreadyNDHWC = (inputPerm == nil);
+
+            if (!inputAlreadyNDHWC) {
                 convInput = [g transposeTensor:input permutation:inputPerm name:nil];
+            }
+
+            // Check if kernel is already in OIDHW layout
+            NSArray<NSNumber*>* kernelPerm = computePermutation(kernelLayout, {0, 1, 2, 3, 4});
+            MPSGraphTensor* mpsKernel = kernel;
+            bool kernelAlreadyOIDHW = (kernelPerm == nil);
+
+            if (!kernelAlreadyOIDHW) {
+                mpsKernel = [g transposeTensor:kernel permutation:kernelPerm name:nil];
             }
 
             MPSGraphTensor* result = nil;
@@ -491,16 +497,24 @@ static ProcessResult HandleConvolution(HandlerContext& ctx) {
     std::vector<int64_t> inputLayout = {inBatch, inFeature, inSpatial0, inSpatial1};
     std::vector<int64_t> kernelLayout = {kOutput, kInput, kSpatial0, kSpatial1};
 
-    MPSGraphTensor* mpsKernel = kernel;
-    NSArray<NSNumber*>* kernelPerm = computePermutation(kernelLayout, {0, 1, 2, 3});
-    if (kernelPerm) {
-        mpsKernel = [g transposeTensor:kernel permutation:kernelPerm name:nil];
-    }
-
+    // Check if input is already in NHWC layout (N=batch, H=spatial0, W=spatial1, C=feature)
+    // LAYOUT_NHWC = {0, 3, 1, 2} means target layout is [batch, H, W, channels]
+    // where batch at pos 0, feature at pos 3, spatial0 at pos 1, spatial1 at pos 2
     NSArray<NSNumber*>* inputPerm = computePermutation(inputLayout, LAYOUT_NHWC);
     MPSGraphTensor* convInput = input;
-    if (inputPerm) {
+    bool inputAlreadyNHWC = (inputPerm == nil);
+
+    if (!inputAlreadyNHWC) {
         convInput = [g transposeTensor:input permutation:inputPerm name:nil];
+    }
+
+    // Check if kernel is already in OIHW layout (O=output_channels, I=input_channels, H, W)
+    NSArray<NSNumber*>* kernelPerm = computePermutation(kernelLayout, {0, 1, 2, 3});
+    MPSGraphTensor* mpsKernel = kernel;
+    bool kernelAlreadyOIHW = (kernelPerm == nil);
+
+    if (!kernelAlreadyOIHW) {
+        mpsKernel = [g transposeTensor:kernel permutation:kernelPerm name:nil];
     }
 
     MPSGraphTensor* result;
@@ -649,7 +663,6 @@ static ProcessResult HandleConvolution(HandlerContext& ctx) {
     if (is1D) {
         result = convert2DOutputTo1D(g, result, outputBatchDim, outputFeatureDim, output1DSpatialDim);
     } else {
-
         std::vector<int64_t> outputLayout = {outputBatchDim, outputFeatureDim, outSpatial0, outSpatial1};
         NSArray<NSNumber*>* outputPerm = computePermutation(LAYOUT_NHWC, outputLayout);
         if (outputPerm) {

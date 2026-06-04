@@ -7,96 +7,68 @@ from .util import OperationTestConfig, complex_standard_normal
 
 
 def make_unary_op_configs():
-    for complex in [False, True]:
-        with OperationTestConfig.module_name(
-            "unary-complex" if complex else "unary-real"
-        ):
+    for is_complex in [False, True]:
+        with OperationTestConfig.module_name("unary-complex" if is_complex else "unary-real"):
             yield from [
                 OperationTestConfig(
                     jnp.abs,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.cos,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.exp,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.negative,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.sign,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.sin,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.square,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.tan,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.tanh,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.real,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.imag,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.log,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.log1p,
-                    lambda rng, complex=complex: (
-                        0.5 * complex_standard_normal(rng, (17,), complex)
-                        if complex
+                    lambda rng, is_complex=is_complex: (
+                        0.5 * complex_standard_normal(rng, (17,), is_complex)
+                        if is_complex
                         else rng.gamma(5, size=(17,)) - 1
                     ),
                 ),
                 OperationTestConfig(
                     jnp.sqrt,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
             ]
     yield from [
@@ -108,9 +80,7 @@ def make_unary_op_configs():
     # Ops that don't trivially generalize across real/complex.
     yield from [
         OperationTestConfig(jnp.isfinite, numpy.asarray([0, jnp.nan, jnp.inf])),
-        OperationTestConfig(
-            jnp.isfinite, numpy.asarray([1, jnp.nan, 1 + 1j * jnp.inf, -jnp.inf + 1j])
-        ),
+        OperationTestConfig(jnp.isfinite, numpy.asarray([1, jnp.nan, 1 + 1j * jnp.inf, -jnp.inf + 1j])),
         OperationTestConfig(lax.rsqrt, lambda rng: rng.gamma(5, size=(17,))),
         OperationTestConfig(
             jnp.arcsin,
@@ -186,9 +156,7 @@ def make_unary_op_configs():
         ),
         OperationTestConfig(
             lax.population_count,
-            numpy.asarray(
-                [0, 1, 3, 7, 255, 256, 0x80000000, 0xFFFFFFFF], dtype=numpy.uint32
-            ),
+            numpy.asarray([0, 1, 3, 7, 255, 256, 0x80000000, 0xFFFFFFFF], dtype=numpy.uint32),
             differentiable_argnums=(),
         ),
         OperationTestConfig(

@@ -1,6 +1,7 @@
 import re
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from typing import Any, Callable, ClassVar, Sequence
+from typing import Any, ClassVar
 
 import jax
 import numpy
@@ -29,11 +30,9 @@ def get_device_placement(value):
     return device
 
 
-def complex_standard_normal(
-    rng: numpy.random.Generator, shape: tuple[int, ...], complex: bool
-) -> numpy.ndarray:
+def complex_standard_normal(rng: numpy.random.Generator, shape: tuple[int, ...], is_complex: bool) -> numpy.ndarray:
     """Generate random normal data, optionally complex-valued."""
-    if complex:
+    if is_complex:
         return rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
     else:
         return rng.standard_normal(shape)
@@ -55,7 +54,7 @@ class OperationTestConfig:
         name: Display name of the operation test config.
     """
 
-    EXERCISED_STABLEHLO_OPS: set[str] = {
+    EXERCISED_STABLEHLO_OPS: ClassVar[set[str]] = {
         # HACK: Register these ops as exercised because JAX doesn't seem to generate them.
         "stablehlo.broadcast",
         "stablehlo.dot",
@@ -77,9 +76,7 @@ class OperationTestConfig:
     @classmethod
     @contextmanager
     def module_name(cls, name: str):
-        assert cls.ACTIVE_MODULE_NAME is None, (
-            f"Module name '{cls.ACTIVE_MODULE_NAME}' is already active."
-        )
+        assert cls.ACTIVE_MODULE_NAME is None, f"Module name '{cls.ACTIVE_MODULE_NAME}' is already active."
         cls.ACTIVE_MODULE_NAME = name
         yield
         cls.ACTIVE_MODULE_NAME = None
@@ -101,13 +98,8 @@ class OperationTestConfig:
         self.grad_transform = grad_transform or jax.grad
         self.seed = seed
         # Wrap non-callables in lambdas that accept (and ignore) rng
-        self.args = [
-            arg if callable(arg) else (lambda rng, arg=arg: arg) for arg in args
-        ]
-        self.kwargs = {
-            key: arg if callable(arg) else (lambda rng, arg=arg: arg)
-            for key, arg in kwargs.items()
-        }
+        self.args = [arg if callable(arg) else (lambda rng, arg=arg: arg) for arg in args]
+        self.kwargs = {key: arg if callable(arg) else (lambda rng, arg=arg: arg) for key, arg in kwargs.items()}
 
         if name is None:
             name = self.func.__name__
@@ -141,7 +133,7 @@ class OperationTestConfig:
             if isinstance(arg, float):
                 differentiable_argnums.append(argnum)
             elif isinstance(arg, jnp.ndarray):
-                if arg.dtype == jnp.float32 or arg.dtype == jnp.complex64:
+                if arg.dtype == jnp.float32:
                     differentiable_argnums.append(argnum)
         return tuple(differentiable_argnums)
 
@@ -180,12 +172,10 @@ class OperationTestConfig:
         grad_vals = []
         for returnnum in range(num_return_values or 1):
 
-            def target(*args, **kwargs):
+            def target(*args, returnnum=returnnum, **kwargs):
                 result = func(*args, **kwargs)
                 if num_return_values is None:
-                    assert isinstance(result, jnp.ndarray), (
-                        f"Output of '{func}' is not a tensor."
-                    )
+                    assert isinstance(result, jnp.ndarray), f"Output of '{func}' is not a tensor."
                 else:
                     result = result[returnnum]
 
@@ -211,7 +201,5 @@ class OperationTestConfig:
             # Only mark ops as exercised if the operation succeeded on MPS.
             if lowered and get_device_placement(result) == MPS_DEVICE:
                 stablehlo_text = str(lowered.compiler_ir(dialect="stablehlo"))
-                self.EXERCISED_STABLEHLO_OPS.update(
-                    STABLEHLO_OP_RE.findall(stablehlo_text)
-                )
+                self.EXERCISED_STABLEHLO_OPS.update(STABLEHLO_OP_RE.findall(stablehlo_text))
         return tuple(grad_vals)

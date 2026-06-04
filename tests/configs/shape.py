@@ -1,44 +1,33 @@
-from jax import lax, numpy as jnp
+from jax import lax
+from jax import numpy as jnp
 
 from .util import OperationTestConfig, complex_standard_normal
 
 
 def make_shape_op_configs():
     # Flip and transpose ops for both real and complex inputs
-    for complex in [False, True]:
-        with OperationTestConfig.module_name(
-            "shape-complex" if complex else "shape-real"
-        ):
+    for is_complex in [False, True]:
+        with OperationTestConfig.module_name("shape-complex" if is_complex else "shape-real"):
             yield from [
                 OperationTestConfig(
                     jnp.flip,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.fliplr,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17, 13), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17, 13), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.flipud,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17, 13), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17, 13), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.transpose,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17, 8, 9), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17, 8, 9), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.transpose,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (17, 8, 9), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17, 8, 9), is_complex),
                     (1, 0, 2),
                     static_argnums=(1,),
                 ),
@@ -103,9 +92,7 @@ def make_shape_op_configs():
                 name="scatter_add_diag",
             ),
             OperationTestConfig(
-                lambda x, d: x.at[
-                    :, jnp.arange(x.shape[-1]), jnp.arange(x.shape[-1])
-                ].add(d),
+                lambda x, d: x.at[:, jnp.arange(x.shape[-1]), jnp.arange(x.shape[-1])].add(d),
                 lambda rng: rng.normal(size=(3, 4, 4)).astype("float32"),
                 lambda rng: rng.normal(size=(3, 4)).astype("float32"),
                 name="scatter_add_diag_batched",
@@ -151,9 +138,7 @@ def make_shape_op_configs():
             OperationTestConfig(
                 lambda x: lax.gather(
                     x,
-                    jnp.array(
-                        [[[0], [2], [4]], [[1], [3], [0]]], dtype=jnp.int32
-                    ),  # [B, N, 1]
+                    jnp.array([[[0], [2], [4]], [[1], [3], [0]]], dtype=jnp.int32),  # [B, N, 1]
                     dimension_numbers=lax.GatherDimensionNumbers(
                         offset_dims=(2,),
                         collapsed_slice_dims=(1,),

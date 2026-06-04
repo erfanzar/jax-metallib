@@ -200,15 +200,49 @@ static ProcessResult HandleSort(HandlerContext& ctx) {
 
         MPSGraphTensor* perm = nil;
         if (keyOperandIndices.size() == 1) {
+            // The combined `sortWithTensor:axis:descending:withValueTensor:andIndexTensor:`
+            // API does not exist on the on-disk MPSGraph SDK. Build the equivalent
+            // from the two single-purpose ops we do have:
+            //   - argSortWithTensor  -> permutation
+            //   - sortWithTensor     -> sorted values
+            //   - gatherAlongAxis    -> apply the permutation to other operands
             MPSGraphTensor* keyTensor = GetInputTensor(ctx, keyOperandIndices[0]);
             if (!keyTensor) {
                 return ProcessResult::Error("stablehlo.sort key tensor missing");
             }
-            perm = [ctx.graph argSortWithTensor:keyTensor axis:axis descending:descending name:nil];
-            if (!perm) {
-                return ProcessResult::Error("stablehlo.sort argSort lowering failed");
+            MPSGraphTensor* sortedKey = [ctx.graph sortWithTensor:keyTensor
+                                                              axis:axis
+                                                        descending:descending
+                                                              name:nil];
+            perm = [ctx.graph argSortWithTensor:keyTensor
+                                            axis:axis
+                                      descending:descending
+                                            name:nil];
+            if (!sortedKey || !perm) {
+                return ProcessResult::Error("stablehlo.sort lowering failed");
             }
             perm = EnsureInt32(ctx.graph, perm);
+            ctx.values[ctx.op->getResult(keyOperandIndices[0]).getAsOpaquePointer()] = sortedKey;
+
+            // Apply same permutation to all other operands in parallel
+            for (unsigned i = 0; i < ctx.op->getNumResults(); ++i) {
+                if (i == keyOperandIndices[0]) {
+                    continue;
+                }
+                MPSGraphTensor* operand = GetInputTensor(ctx, i);
+                if (!operand) {
+                    return ProcessResult::Error("stablehlo.sort operand tensor missing");
+                }
+                MPSGraphTensor* sorted = [ctx.graph gatherAlongAxis:axis
+                                                    withUpdatesTensor:operand
+                                                        indicesTensor:perm
+                                                                 name:nil];
+                if (!sorted) {
+                    return ProcessResult::Error("stablehlo.sort gather lowering failed");
+                }
+                ctx.values[ctx.op->getResult(i).getAsOpaquePointer()] = sorted;
+            }
+            return ProcessResult{};
         } else {
             MPSGraphTensor* base = GetInputTensor(ctx, keyOperandIndices[0]);
             if (!base) {

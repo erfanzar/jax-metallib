@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,13 @@ public:
 
     MpsBuffer(MpsDevice* device, void* metal_buffer, int dtype, const std::vector<int64_t>& dims,
               BufferReleaser releaser = {}, CompletionEvent producer_completion = nullptr);
+
+    // Strided (non-contiguous) buffer constructor.  byte_strides has one entry
+    // per dimension; storage_byte_size is the actual MTLBuffer length.
+    MpsBuffer(MpsDevice* device, void* metal_buffer, int dtype, const std::vector<int64_t>& dims,
+              const std::vector<int64_t>& byte_strides, size_t storage_byte_size,
+              BufferReleaser releaser = {}, CompletionEvent producer_completion = nullptr);
+
     ~MpsBuffer();
 
     MpsDevice* device() const {
@@ -49,11 +57,23 @@ public:
         return metal_buffer_;
     }
 
+    // Stride accessors.  byte_strides() always returns a valid vector; when the
+    // buffer is contiguous it computes row-major strides on the fly.
+    const std::vector<int64_t>& byte_strides() const;
+    bool is_contiguous() const {
+        return byte_strides_.empty();
+    }
+    // Actual backing MTLBuffer size (may differ from byte_size() for strided buffers).
+    size_t storage_byte_size() const;
+
     bool ToHostBuffer(void* dst, std::function<void()> on_done, std::string* error = nullptr);
 
     bool CopyRawToHost(void* dst, int64_t offset, int64_t transfer_size, std::string* error = nullptr);
 
     std::unique_ptr<MpsBuffer> Clone(std::string* error = nullptr) const;
+
+    // Materialize a contiguous copy of a non-contiguous buffer.
+    std::unique_ptr<MpsBuffer> MaterializeContiguous(std::string* error = nullptr) const;
 
     CompletionEvent producer_completion() const {
         return producer_completion_;
@@ -73,11 +93,17 @@ private:
     void* metal_buffer_;
     int dtype_;
     std::vector<int64_t> dims_;
+    std::vector<int64_t> byte_strides_;           // empty → contiguous row-major
+    mutable std::vector<int64_t> cached_strides_; // lazily computed for byte_strides()
+    size_t storage_byte_size_ = 0;                // 0 → use byte_size()
     BufferReleaser releaser_;
     CompletionEvent producer_completion_;
     bool is_deleted_ = false;
 };
 
 size_t DtypeByteSize(int dtype);
+
+// Compute row-major byte strides for a given shape and element size.
+std::vector<int64_t> ComputeRowMajorByteStrides(const std::vector<int64_t>& dims, size_t elem_size);
 
 } // namespace jax_metallib

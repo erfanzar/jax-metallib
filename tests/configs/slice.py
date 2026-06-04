@@ -7,7 +7,7 @@ from .util import OperationTestConfig
 
 def make_slice_op_configs():
     with OperationTestConfig.module_name("slice"):
-        return [
+        yield from [
             OperationTestConfig(
                 lambda x, idx: x[idx],
                 lambda rng: rng.normal(size=(4, 5)),

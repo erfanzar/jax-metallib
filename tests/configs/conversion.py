@@ -6,7 +6,7 @@ from .util import OperationTestConfig
 
 def make_conversion_op_configs():
     with OperationTestConfig.module_name("conversion"):
-        return [
+        yield from [
             OperationTestConfig(
                 lambda: jnp.arange(10, dtype=jnp.float32),
                 differentiable_argnums=(),

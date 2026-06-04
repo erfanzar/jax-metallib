@@ -236,7 +236,10 @@ PJRT_Error* MPS_LoadedExecutable_Execute(PJRT_LoadedExecutable_Execute_Args* arg
         return MakeError("No executable to execute");
     }
 
-    std::vector<jax_metallib::MpsBuffer*> inputs;
+    // Thread-local vector avoids heap allocation on the hot path.
+    thread_local std::vector<jax_metallib::MpsBuffer*> inputs;
+    inputs.clear();
+    inputs.reserve(args->num_args);
     for (size_t i = 0; i < args->num_args; i++) {
         if (args->argument_lists[0][i]) {
             inputs.push_back(args->argument_lists[0][i]->buffer.get());
@@ -266,7 +269,7 @@ PJRT_Error* MPS_LoadedExecutable_Execute(PJRT_LoadedExecutable_Execute_Args* arg
     }
 
     for (size_t i = 0; i < num_outputs; i++) {
-        auto* buffer = new PJRT_Buffer();
+        auto* buffer = AcquirePjrtBuffer();
         buffer->buffer = std::move(exec_result.buffers[i]);
         buffer->client = client;
         args->output_lists[0][i] = buffer;
@@ -275,7 +278,7 @@ PJRT_Error* MPS_LoadedExecutable_Execute(PJRT_LoadedExecutable_Execute_Args* arg
     }
 
     if (args->device_complete_events) {
-        auto* event = new PJRT_Event();
+        auto* event = AcquirePjrtEvent();
         event->completion =
             exec_result.completion ? exec_result.completion : jax_metallib::MakeReadyCompletionEvent();
         args->device_complete_events[0] = event;

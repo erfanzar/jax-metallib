@@ -1103,6 +1103,364 @@ kernel void reduce_mean_last_f32_lin(device const float* x [[buffer(0)]], device
     y[gid] = acc / (float)cols;
   }
 }
+// --- Axis-0 (column-wise) reduce kernels ---
+// For input [rows, cols], reduce across rows for each column → output [cols].
+// Each thread handles one column, looping over all rows (strided reads).
+kernel void reduce_sum_axis0_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
+                                 uint gid [[thread_position_in_grid]]) {
+  if (gid >= cols) return;
+  float acc = 0.0f;
+  for (uint r = 0; r < rows; r++) acc += x[r * cols + gid];
+  y[gid] = acc;
+}
+kernel void reduce_sum_axis0_f16(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
+                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
+                                 uint gid [[thread_position_in_grid]]) {
+  if (gid >= cols) return;
+  float acc = 0.0f;
+  for (uint r = 0; r < rows; r++) acc += (float)x[r * cols + gid];
+  y[gid] = (half)acc;
+}
+kernel void reduce_mean_axis0_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                                  constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
+                                  uint gid [[thread_position_in_grid]]) {
+  if (gid >= cols) return;
+  float acc = 0.0f;
+  for (uint r = 0; r < rows; r++) acc += x[r * cols + gid];
+  y[gid] = acc / (float)rows;
+}
+kernel void reduce_mean_axis0_f16(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
+                                  constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
+                                  uint gid [[thread_position_in_grid]]) {
+  if (gid >= cols) return;
+  float acc = 0.0f;
+  for (uint r = 0; r < rows; r++) acc += (float)x[r * cols + gid];
+  y[gid] = (half)(acc / (float)rows);
+}
+kernel void reduce_max_axis0_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
+                                 uint gid [[thread_position_in_grid]]) {
+  if (gid >= cols) return;
+  float acc = -INFINITY;
+  for (uint r = 0; r < rows; r++) acc = max(acc, x[r * cols + gid]);
+  y[gid] = acc;
+}
+kernel void reduce_max_axis0_f16(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
+                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
+                                 uint gid [[thread_position_in_grid]]) {
+  if (gid >= cols) return;
+  float acc = -INFINITY;
+  for (uint r = 0; r < rows; r++) acc = max(acc, (float)x[r * cols + gid]);
+  y[gid] = (half)acc;
+}
+kernel void reduce_min_axis0_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
+                                 uint gid [[thread_position_in_grid]]) {
+  if (gid >= cols) return;
+  float acc = INFINITY;
+  for (uint r = 0; r < rows; r++) acc = min(acc, x[r * cols + gid]);
+  y[gid] = acc;
+}
+kernel void reduce_min_axis0_f16(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
+                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
+                                 uint gid [[thread_position_in_grid]]) {
+  if (gid >= cols) return;
+  float acc = INFINITY;
+  for (uint r = 0; r < rows; r++) acc = min(acc, (float)x[r * cols + gid]);
+  y[gid] = (half)acc;
+}
+// --- Bitonic sort kernel (single threadgroup, in-place) ---
+// Sorts up to padded_n elements in threadgroup memory using bitonic merge.
+// Input: n actual elements, padded to next power-of-2 with +INF.
+// Output: sorted n elements written back to device memory.
+kernel void bitonic_sort_asc_f32(device const float* input [[buffer(0)]],
+                                 device float* output [[buffer(1)]],
+                                 constant uint& n [[buffer(2)]],
+                                 constant uint& padded_n [[buffer(3)]],
+                                 threadgroup float* shared [[threadgroup(0)]],
+                                 uint tid [[thread_index_in_threadgroup]],
+                                 uint tg_size [[threads_per_threadgroup]]) {
+  // Load input into threadgroup memory, pad with +INF
+  for (uint i = tid; i < padded_n; i += tg_size) {
+    shared[i] = (i < n) ? input[i] : INFINITY;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  uint half_n = padded_n >> 1;
+  // Bitonic sort with bitwise operations (no integer division)
+  for (uint size = 2; size <= padded_n; size <<= 1) {
+    for (uint stride = size >> 1; stride >= 1; stride >>= 1) {
+      uint stride_mask = stride - 1;
+      for (uint i = tid; i < half_n; i += tg_size) {
+        uint left = ((i & ~stride_mask) << 1) | (i & stride_mask);
+        uint right = left + stride;
+        bool ascending = (left & size) == 0;
+        float lv = shared[left], rv = shared[right];
+        if (ascending ? (lv > rv) : (lv < rv)) {
+          shared[left] = rv;
+          shared[right] = lv;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+
+  // Write back sorted results (only first n elements)
+  for (uint i = tid; i < n; i += tg_size) {
+    output[i] = shared[i];
+  }
+}
+// --- Bitonic sort kernel for 2D row-wise sort ---
+// Each threadgroup sorts one row. row index = threadgroup_position_in_grid.x
+// row_stride = number of columns (elements per row in memory)
+// Uses bitwise operations instead of integer division (stride/size are power-of-2).
+kernel void bitonic_sort_rows_asc_f32(device const float* input [[buffer(0)]],
+                                       device float* output [[buffer(1)]],
+                                       constant uint& n [[buffer(2)]],
+                                       constant uint& padded_n [[buffer(3)]],
+                                       constant uint& row_stride [[buffer(4)]],
+                                       threadgroup float* shared [[threadgroup(0)]],
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint tg_size [[threads_per_threadgroup]],
+                                       uint row [[threadgroup_position_in_grid]]) {
+  uint base = row * row_stride;
+  // Load row into threadgroup memory, pad with +INF
+  for (uint i = tid; i < padded_n; i += tg_size) {
+    shared[i] = (i < n) ? input[base + i] : INFINITY;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  uint half_n = padded_n >> 1;
+  // Bitonic sort with bitwise operations (no integer division)
+  for (uint size = 2; size <= padded_n; size <<= 1) {
+    for (uint stride = size >> 1; stride >= 1; stride >>= 1) {
+      uint stride_mask = stride - 1;
+      for (uint i = tid; i < half_n; i += tg_size) {
+        // Insert a 0-bit at the stride position: left = ((i & ~mask) << 1) | (i & mask)
+        uint left = ((i & ~stride_mask) << 1) | (i & stride_mask);
+        uint right = left + stride;
+        // ascending = ((left / size) & 1) == 0, but size is power-of-2:
+        bool ascending = (left & size) == 0;
+        float lv = shared[left], rv = shared[right];
+        if (ascending ? (lv > rv) : (lv < rv)) {
+          shared[left] = rv;
+          shared[right] = lv;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+
+  // Write back sorted row (only first n elements)
+  for (uint i = tid; i < n; i += tg_size) {
+    output[base + i] = shared[i];
+  }
+}
+
+// --- Radix sort for 2D row-wise sort (n ≤ 1024, ascending, f32) ---
+// Uses 4-bit radix (16 bins), 8 passes over 32-bit float keys.
+// Fewer total operations than bitonic sort for n >= 64.
+// tg_size should be >= n (1 element per thread for scatter).
+kernel void radix_sort_rows_asc_f32(device const float* input [[buffer(0)]],
+                                     device float* output [[buffer(1)]],
+                                     constant uint& n [[buffer(2)]],
+                                     constant uint& padded_n_unused [[buffer(3)]],
+                                     constant uint& row_stride [[buffer(4)]],
+                                     threadgroup uint* scratch [[threadgroup(0)]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint tg_size [[threads_per_threadgroup]],
+                                     uint row [[threadgroup_position_in_grid]]) {
+  // scratch layout: [0..padded-1] = keys, [padded..2*padded-1] = alt_keys, [2*padded..+15] = histogram
+  uint padded = tg_size; // tg_size is set to next power of 2 >= n
+  threadgroup uint* keys_a = scratch;
+  threadgroup uint* keys_b = scratch + padded;
+  threadgroup uint* hist = scratch + 2 * padded;
+
+  uint base = row * row_stride;
+
+  // Load and transform float bits for radix sort ordering.
+  // IEEE 754 trick: flip sign bit for positives, flip all bits for negatives.
+  // This gives correct ascending sort order on the uint representation.
+  uint bits = 0xFFFFFFFF; // +INF representation after transform (padding)
+  if (tid < n) {
+    uint raw = as_type<uint>(input[base + tid]);
+    uint mask = -int(raw >> 31) | 0x80000000u;
+    bits = raw ^ mask;
+  }
+  keys_a[tid] = bits;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  threadgroup uint* src = keys_a;
+  threadgroup uint* dst = keys_b;
+
+  // 8 passes of 4-bit radix (processes all 32 bits)
+  for (uint pass = 0; pass < 8; pass++) {
+    uint shift = pass * 4;
+    uint digit = (src[tid] >> shift) & 0xF;
+
+    // Clear histogram
+    if (tid < 16) hist[tid] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Count digits using atomic add
+    // For small n, use sequential counting by thread 0 for simplicity
+    // For larger n, each thread atomically increments its digit count
+    threadgroup atomic_uint* ahist = (threadgroup atomic_uint*)hist;
+    if (tid < n) {
+      atomic_fetch_add_explicit(&ahist[digit], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Exclusive prefix sum over histogram (thread 0 does it, only 16 bins)
+    if (tid == 0) {
+      uint total = 0;
+      for (uint i = 0; i < 16; i++) {
+        uint count = hist[i];
+        hist[i] = total;
+        total += count;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Scatter: each thread finds its output position.
+    // To get a stable sort, threads with the same digit need deterministic ordering.
+    // Use a simple approach: each thread with digit d atomically claims a position.
+    if (tid < n) {
+      uint pos = atomic_fetch_add_explicit(&ahist[digit], 1u, memory_order_relaxed);
+      dst[pos] = src[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Swap src/dst
+    threadgroup uint* tmp = src;
+    src = dst;
+    dst = tmp;
+  }
+
+  // Write back (transform bits back to float)
+  if (tid < n) {
+    uint sorted_bits = src[tid];
+    // Reverse the IEEE 754 transform
+    uint mask = ((sorted_bits >> 31) - 1) | 0x80000000u;
+    sorted_bits ^= mask;
+    output[base + tid] = as_type<float>(sorted_bits);
+  }
+}
+
+// --- Register-based bitonic sort for 2D row-wise sort (n ≤ 256, tg=32) ---
+// Each thread holds up to 8 elements in registers. Uses simd_shuffle_xor for
+// cross-thread comparisons (strides < 32) and local register swaps for
+// intra-thread comparisons (strides ≥ 32). No threadgroup memory needed.
+// This eliminates all shared memory latency from the sort hot path.
+kernel void bitonic_sort_rows_reg_f32(device const float* input [[buffer(0)]],
+                                       device float* output [[buffer(1)]],
+                                       constant uint& n [[buffer(2)]],
+                                       constant uint& padded_n [[buffer(3)]],
+                                       constant uint& row_stride [[buffer(4)]],
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint row [[threadgroup_position_in_grid]]) {
+  // Thread t owns elements at positions: t, t+32, t+64, ..., t+224
+  // reg[k] = element at global position (row * row_stride + tid + k*32)
+  uint base = row * row_stride;
+  uint elems = padded_n >> 5; // elements per thread = padded_n / 32
+  float reg[8]; // max 8 elements per thread (256 / 32)
+  // Load with padding
+  for (uint k = 0; k < elems; ++k) {
+    uint pos = tid + k * 32;
+    reg[k] = (pos < n) ? input[base + pos] : INFINITY;
+  }
+
+  // Bitonic sort network — all passes done in registers + simd_shuffle
+  for (uint size = 2; size <= padded_n; size <<= 1) {
+    for (uint stride = size >> 1; stride >= 1; stride >>= 1) {
+      if (stride >= 32) {
+        // Intra-thread: compare elements within this thread's register array.
+        // stride/32 = distance between register indices.
+        uint reg_stride = stride >> 5;
+        for (uint k = 0; k < elems; ++k) {
+          uint global_pos = tid + k * 32;
+          // Only process "left" elements (where the stride-th bit is 0)
+          if ((global_pos & stride) == 0) {
+            uint partner_k = k + reg_stride;
+            if (partner_k < elems) {
+              bool ascending = (global_pos & size) == 0;
+              float lv = reg[k], rv = reg[partner_k];
+              if (ascending ? (lv > rv) : (lv < rv)) {
+                reg[k] = rv;
+                reg[partner_k] = lv;
+              }
+            }
+          }
+        }
+      } else {
+        // Cross-thread: use simd_shuffle_xor to exchange with partner lane.
+        // For stride s < 32, the partner thread is tid ^ s.
+        for (uint k = 0; k < elems; ++k) {
+          uint global_pos = tid + k * 32;
+          float my_val = reg[k];
+          float partner_val = simd_shuffle_xor(my_val, (ushort)stride);
+          // Determine if this thread holds the "left" or "right" of the pair
+          bool is_left = (tid & stride) == 0;
+          bool ascending = (global_pos & size) == 0;
+          // For left: keep min if ascending, keep max if descending
+          // For right: keep max if ascending, keep min if descending
+          bool should_swap = is_left ? (ascending ? (my_val > partner_val) : (my_val < partner_val))
+                                     : (ascending ? (my_val < partner_val) : (my_val > partner_val));
+          if (should_swap) {
+            reg[k] = partner_val;
+          }
+        }
+      }
+    }
+  }
+
+  // Write back sorted results (only first n elements)
+  for (uint k = 0; k < elems; ++k) {
+    uint pos = tid + k * 32;
+    if (pos < n) {
+      output[base + pos] = reg[k];
+    }
+  }
+}
+
+// --- Tiled 2D transpose kernel ---
+// Transposes the last two dims of a batched tensor: [..., rows, cols] → [..., cols, rows]
+// Uses 32×32 threadgroup tiles with +1 padding to avoid bank conflicts.
+// Grid: (ceil(cols/32), ceil(rows/32), batch), TG: (32, 8, 1) = 256 threads
+kernel void transpose2d_f32(device const float* input [[buffer(0)]],
+                            device float* output [[buffer(1)]],
+                            constant uint& rows [[buffer(2)]],
+                            constant uint& cols [[buffer(3)]],
+                            threadgroup float* tile [[threadgroup(0)]],
+                            uint3 tgid [[threadgroup_position_in_grid]],
+                            uint3 tid3 [[thread_position_in_threadgroup]]) {
+  constexpr uint TILE = 32;
+  constexpr uint TILE_PAD = 33; // +1 to avoid bank conflicts
+  uint batch_offset_in = tgid.z * rows * cols;
+  uint batch_offset_out = tgid.z * cols * rows;
+  uint tile_col = tgid.x * TILE; // column start in input
+  uint tile_row = tgid.y * TILE; // row start in input
+  // Load tile: each of 256 threads (32×8) loads 4 rows
+  for (uint i = 0; i < TILE; i += 8) {
+    uint r = tile_row + tid3.y + i;
+    uint c = tile_col + tid3.x;
+    if (r < rows && c < cols) {
+      tile[(tid3.y + i) * TILE_PAD + tid3.x] = input[batch_offset_in + r * cols + c];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Write transposed: output row = input col, output col = input row
+  uint out_tile_col = tgid.y * TILE; // swapped: input row → output col
+  uint out_tile_row = tgid.x * TILE; // swapped: input col → output row
+  for (uint i = 0; i < TILE; i += 8) {
+    uint r = out_tile_row + tid3.y + i;
+    uint c = out_tile_col + tid3.x;
+    if (r < cols && c < rows) {
+      output[batch_offset_out + r * rows + c] = tile[tid3.x * TILE_PAD + tid3.y + i];
+    }
+  }
+}
 kernel void softmax_pass1_f32_tg(device const float* x [[buffer(0)]],
                                  device float* maxsum [[buffer(1)]],
                                  constant uint& rows [[buffer(2)]],
@@ -1249,6 +1607,97 @@ kernel void softmax_pass2_f16(device const half* x [[buffer(0)]],
   float m = maxsum[row * 2];
   float s = maxsum[row * 2 + 1];
   y[gid] = (half)(exp((float)x[gid] - m) / s);
+}
+
+// --- Fused softmax numerator: exp(x - max(x, axis=-1, keepdims=True)) ---
+// Single kernel: reads each row once into threadgroup memory, finds max,
+// then computes exp(x - max) and writes output. Memory traffic = 1R + 1W
+// instead of 2R + 1W for separate reduce_max + exp(x-max) passes.
+// Requires threadgroup memory >= cols * sizeof(float).
+kernel void softmax_numerator_f32_tg(device const float* x [[buffer(0)]],
+                                      device float* y [[buffer(1)]],
+                                      constant uint& rows [[buffer(2)]],
+                                      constant uint& cols [[buffer(3)]],
+                                      threadgroup float* shared [[threadgroup(0)]],
+                                      uint tid [[thread_index_in_threadgroup]],
+                                      uint row [[threadgroup_position_in_grid]],
+                                      uint lane [[thread_index_in_simdgroup]],
+                                      uint simd_group [[simdgroup_index_in_threadgroup]],
+                                      uint tg_size [[threads_per_threadgroup]]) {
+  if (row >= rows) return;
+  uint base = row * cols;
+
+  // Phase 1: Load row into threadgroup memory AND find partial max.
+  float local_max = -INFINITY;
+  for (uint i = tid; i < cols; i += tg_size) {
+    float v = x[base + i];
+    shared[i] = v;
+    local_max = max(local_max, v);
+  }
+
+  // Reduce max across SIMD group
+  float simd_max_val = simd_max(local_max);
+  constexpr uint kMaxSimdGroups = 32;
+  threadgroup float partial_max[kMaxSimdGroups];
+  if (lane == 0) partial_max[simd_group] = simd_max_val;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Final reduce (first SIMD group)
+  float row_max;
+  if (simd_group == 0) {
+    uint num_simd = (tg_size + 31) >> 5;
+    float m = (lane < num_simd) ? partial_max[lane] : -INFINITY;
+    m = simd_max(m);
+    if (lane == 0) partial_max[0] = m; // broadcast via shared memory
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  row_max = partial_max[0];
+
+  // Phase 2: Read from threadgroup memory (free!) and write exp(x - max).
+  for (uint i = tid; i < cols; i += tg_size) {
+    y[base + i] = exp(shared[i] - row_max);
+  }
+}
+
+kernel void softmax_numerator_f16_tg(device const half* x [[buffer(0)]],
+                                      device half* y [[buffer(1)]],
+                                      constant uint& rows [[buffer(2)]],
+                                      constant uint& cols [[buffer(3)]],
+                                      threadgroup float* shared [[threadgroup(0)]],
+                                      uint tid [[thread_index_in_threadgroup]],
+                                      uint row [[threadgroup_position_in_grid]],
+                                      uint lane [[thread_index_in_simdgroup]],
+                                      uint simd_group [[simdgroup_index_in_threadgroup]],
+                                      uint tg_size [[threads_per_threadgroup]]) {
+  if (row >= rows) return;
+  uint base = row * cols;
+
+  float local_max = -INFINITY;
+  for (uint i = tid; i < cols; i += tg_size) {
+    float v = (float)x[base + i];
+    shared[i] = v;
+    local_max = max(local_max, v);
+  }
+
+  float simd_max_val = simd_max(local_max);
+  constexpr uint kMaxSimdGroups = 32;
+  threadgroup float partial_max[kMaxSimdGroups];
+  if (lane == 0) partial_max[simd_group] = simd_max_val;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float row_max;
+  if (simd_group == 0) {
+    uint num_simd = (tg_size + 31) >> 5;
+    float m = (lane < num_simd) ? partial_max[lane] : -INFINITY;
+    m = simd_max(m);
+    if (lane == 0) partial_max[0] = m;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  row_max = partial_max[0];
+
+  for (uint i = tid; i < cols; i += tg_size) {
+    y[base + i] = (half)exp(shared[i] - row_max);
+  }
 }
 
 // --- LayerNorm 2-pass fused kernels ---
@@ -1418,6 +1867,59 @@ kernel void gather_rows_f16(device const half* operand [[buffer(0)]],
     output[gid] = (half)0.0f;
   }
 }
+
+// --- Coalesced gather: float4 reads, shared indices, 2D dispatch ---
+// Each threadgroup handles ROWS_PER_TG rows. Thread.y iterates over float4 columns.
+// Eliminates integer division and redundant index reads.
+kernel void gather_rows_coalesced_f32(device const float4* operand [[buffer(0)]],
+                                       device const int* indices [[buffer(1)]],
+                                       device float4* output [[buffer(2)]],
+                                       constant uint& num_indices [[buffer(3)]],
+                                       constant uint& cols4 [[buffer(4)]],
+                                       constant uint& table_rows [[buffer(5)]],
+                                       uint2 tgid [[threadgroup_position_in_grid]],
+                                       uint2 tid [[thread_position_in_threadgroup]],
+                                       uint2 tg_size [[threads_per_threadgroup]]) {
+    uint row = tgid.x * tg_size.x + tid.x;
+    if (row >= num_indices) return;
+    int src_row = indices[row];
+    if (src_row < 0 || (uint)src_row >= table_rows) {
+        for (uint c = tid.y; c < cols4; c += tg_size.y) {
+            output[row * cols4 + c] = float4(0.0f);
+        }
+        return;
+    }
+    uint src_base = (uint)src_row * cols4;
+    uint dst_base = row * cols4;
+    for (uint c = tid.y; c < cols4; c += tg_size.y) {
+        output[dst_base + c] = operand[src_base + c];
+    }
+}
+kernel void gather_rows_coalesced_f16(device const half4* operand [[buffer(0)]],
+                                       device const int* indices [[buffer(1)]],
+                                       device half4* output [[buffer(2)]],
+                                       constant uint& num_indices [[buffer(3)]],
+                                       constant uint& cols4 [[buffer(4)]],
+                                       constant uint& table_rows [[buffer(5)]],
+                                       uint2 tgid [[threadgroup_position_in_grid]],
+                                       uint2 tid [[thread_position_in_threadgroup]],
+                                       uint2 tg_size [[threads_per_threadgroup]]) {
+    uint row = tgid.x * tg_size.x + tid.x;
+    if (row >= num_indices) return;
+    int src_row = indices[row];
+    if (src_row < 0 || (uint)src_row >= table_rows) {
+        for (uint c = tid.y; c < cols4; c += tg_size.y) {
+            output[row * cols4 + c] = half4(0.0h);
+        }
+        return;
+    }
+    uint src_base = (uint)src_row * cols4;
+    uint dst_base = row * cols4;
+    for (uint c = tid.y; c < cols4; c += tg_size.y) {
+        output[dst_base + c] = operand[src_base + c];
+    }
+}
+
 // --- Scatter variants (mul, max, min) ---
 kernel void scatter_mul_rows_f32(device float* out [[buffer(0)]],
                                  device const int* indices [[buffer(1)]],
@@ -1652,6 +2154,43 @@ kernel void convert_f32_to_f16_vec4(device const float4* x [[buffer(0)]], device
                                     constant uint& n4 [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
   if (gid < n4) y[gid] = half4(x[gid]);
 }
+// --- Naive GEMM for small/unaligned matrices ---
+// Each thread computes one output element: C[b][r][c] = sum_k(A[b][r][k] * B[b][k][c])
+// gid.z = batch index (1 for unbatched)
+kernel void gemm_naive_f32(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
+                           device float* C [[buffer(2)]],
+                           constant uint& M [[buffer(3)]], constant uint& N [[buffer(4)]],
+                           constant uint& K [[buffer(5)]],
+                           uint3 gid [[thread_position_in_grid]]) {
+  uint c = gid.x;
+  uint r = gid.y;
+  if (r >= M || c >= N) return;
+  uint batch_off_a = gid.z * M * K;
+  uint batch_off_b = gid.z * K * N;
+  uint batch_off_c = gid.z * M * N;
+  float acc = 0.0f;
+  for (uint k = 0; k < K; k++) {
+    acc += A[batch_off_a + r * K + k] * B[batch_off_b + k * N + c];
+  }
+  C[batch_off_c + r * N + c] = acc;
+}
+kernel void gemm_naive_f16(device const half* A [[buffer(0)]], device const half* B [[buffer(1)]],
+                           device half* C [[buffer(2)]],
+                           constant uint& M [[buffer(3)]], constant uint& N [[buffer(4)]],
+                           constant uint& K [[buffer(5)]],
+                           uint3 gid [[thread_position_in_grid]]) {
+  uint c = gid.x;
+  uint r = gid.y;
+  if (r >= M || c >= N) return;
+  uint batch_off_a = gid.z * M * K;
+  uint batch_off_b = gid.z * K * N;
+  uint batch_off_c = gid.z * M * N;
+  float acc = 0.0f;
+  for (uint k = 0; k < K; k++) {
+    acc += (float)A[batch_off_a + r * K + k] * (float)B[batch_off_b + k * N + c];
+  }
+  C[batch_off_c + r * N + c] = (half)acc;
+}
 
 )METAL";
     // --- GEMM kernel code generator (MLX Steel-inspired) ---
@@ -1663,8 +2202,8 @@ kernel void convert_f32_to_f16_vec4(device const float4* x [[buffer(0)]], device
     //   5. Fixed thread layout (no div/mod per element) — compile-time address mapping
 
     struct GemmConfig {
-        int bm, bn, bk;        // tile sizes
-        int wm, wn;            // simdgroup grid (wm x wn simdgroups)
+        int bm, bn, bk;         // tile sizes
+        int wm, wn;             // simdgroup grid (wm x wn simdgroups)
         int acc_rows, acc_cols; // 8x8 accumulators per simdgroup
     };
     static const GemmConfig configs[] = {
@@ -1678,48 +2217,53 @@ kernel void convert_f32_to_f16_vec4(device const float4* x [[buffer(0)]], device
         {64, 32, 32, 2, 2, 4, 2},
     };
 
-    auto generateGemmKernel = [](const GemmConfig& cfg, const char* dtype,
-                                  const char* sg_type, const char* zero_val) -> std::string {
+    auto generateGemmKernel = [](const GemmConfig& cfg, const char* dtype, const char* sg_type,
+                                 const char* zero_val) -> std::string {
         char name[128];
-        snprintf(name, sizeof(name), "gemm_nn_%s_bm%d_bn%d_bk%d",
-                 dtype, cfg.bm, cfg.bn, cfg.bk);
+        snprintf(name, sizeof(name), "gemm_nn_%s_bm%d_bn%d_bk%d", dtype, cfg.bm, cfg.bn, cfg.bk);
         int num_sg = cfg.wm * cfg.wn;
         int num_threads = num_sg * 32;
         bool is_f16 = (strcmp(dtype, "f16") == 0);
         const char* elem_type = is_f16 ? "half" : "float";
         int elem_bytes = is_f16 ? 2 : 4;
-        int tg_pad = 16 / elem_bytes;  // 4 for float, 8 for half
+        int tg_pad = 16 / elem_bytes; // 4 for float, 8 for half
 
         // Padded leading dimensions for threadgroup memory
-        int a_ld = cfg.bk + tg_pad;  // A is BM x BK, stored row-major
-        int b_ld = cfg.bn + tg_pad;  // B is BK x BN, stored row-major
+        int a_ld = cfg.bk + tg_pad; // A is BM x BK, stored row-major
+        int b_ld = cfg.bn + tg_pad; // B is BK x BN, stored row-major
         int a_tg_size = cfg.bm * a_ld;
         int b_tg_size = cfg.bk * b_ld;
 
         // Vectorized load parameters for A tile (BM x BK)
         // Each thread loads vec_a elements contiguously along K dimension
         int a_total = cfg.bm * cfg.bk;
-        int a_vec = a_total / num_threads;  // elements per thread
+        int a_vec = a_total / num_threads; // elements per thread
         // Clamp vec to valid Metal vector sizes (1,2,4)
-        if (a_vec > 4) a_vec = 4;
-        int a_tcols = cfg.bk / a_vec;       // threads across K
-        int a_trows = num_threads / a_tcols; // threads across M
+        if (a_vec > 4)
+            a_vec = 4;
+        int a_tcols = cfg.bk / a_vec;                   // threads across K
+        int a_trows = num_threads / a_tcols;            // threads across M
         int a_nrows = (cfg.bm + a_trows - 1) / a_trows; // iterations per thread
 
         // Vectorized load parameters for B tile (BK x BN)
         int b_total = cfg.bk * cfg.bn;
         int b_vec = b_total / num_threads;
-        if (b_vec > 4) b_vec = 4;
+        if (b_vec > 4)
+            b_vec = 4;
         int b_tcols = cfg.bn / b_vec;
         int b_trows = num_threads / b_tcols;
         int b_nrows = (cfg.bk + b_trows - 1) / b_trows;
 
         // Vector type names
         char a_vec_type[32], b_vec_type[32];
-        if (a_vec == 1) snprintf(a_vec_type, sizeof(a_vec_type), "%s", elem_type);
-        else snprintf(a_vec_type, sizeof(a_vec_type), "%s%d", elem_type, a_vec);
-        if (b_vec == 1) snprintf(b_vec_type, sizeof(b_vec_type), "%s", elem_type);
-        else snprintf(b_vec_type, sizeof(b_vec_type), "%s%d", elem_type, b_vec);
+        if (a_vec == 1)
+            snprintf(a_vec_type, sizeof(a_vec_type), "%s", elem_type);
+        else
+            snprintf(a_vec_type, sizeof(a_vec_type), "%s%d", elem_type, a_vec);
+        if (b_vec == 1)
+            snprintf(b_vec_type, sizeof(b_vec_type), "%s", elem_type);
+        else
+            snprintf(b_vec_type, sizeof(b_vec_type), "%s%d", elem_type, b_vec);
 
         std::string s;
         s.reserve(8192);
@@ -1727,71 +2271,70 @@ kernel void convert_f32_to_f16_vec4(device const float4* x [[buffer(0)]], device
 
         // Kernel signature
         snprintf(buf, sizeof(buf),
-            "kernel void %s(device const %s* A [[buffer(0)]],\n"
-            "    device const %s* B [[buffer(1)]],\n"
-            "    device %s* C [[buffer(2)]],\n"
-            "    constant uint& M [[buffer(3)]],\n"
-            "    constant uint& N [[buffer(4)]],\n"
-            "    constant uint& K [[buffer(5)]],\n"
-            "    uint3 tgid [[threadgroup_position_in_grid]],\n"
-            "    uint sgid  [[simdgroup_index_in_threadgroup]],\n"
-            "    uint tid   [[thread_index_in_threadgroup]]) {\n",
-            name, elem_type, elem_type, elem_type);
+                 "kernel void %s(device const %s* A [[buffer(0)]],\n"
+                 "    device const %s* B [[buffer(1)]],\n"
+                 "    device %s* C [[buffer(2)]],\n"
+                 "    constant uint& M [[buffer(3)]],\n"
+                 "    constant uint& N [[buffer(4)]],\n"
+                 "    constant uint& K [[buffer(5)]],\n"
+                 "    uint3 tgid [[threadgroup_position_in_grid]],\n"
+                 "    uint sgid  [[simdgroup_index_in_threadgroup]],\n"
+                 "    uint tid   [[thread_index_in_threadgroup]]) {\n",
+                 name, elem_type, elem_type, elem_type);
         s += buf;
+
+        // Batch offset via tgid.z (1 for unbatched)
+        s += "  uint batch_z = tgid.z;\n";
 
         // Threadgroup tile position (no swizzle — tested, doesn't help on M5)
         snprintf(buf, sizeof(buf),
-            "  uint bm = tgid.x * %du;\n"
-            "  uint bn = tgid.y * %du;\n",
-            cfg.bm, cfg.bn);
+                 "  uint bm = tgid.x * %du;\n"
+                 "  uint bn = tgid.y * %du;\n",
+                 cfg.bm, cfg.bn);
         s += buf;
 
         // Simdgroup layout (WM x WN grid)
         snprintf(buf, sizeof(buf),
-            "  uint sg_row = sgid / %du;\n"
-            "  uint sg_col = sgid %% %du;\n",
-            cfg.wn, cfg.wn);
+                 "  uint sg_row = sgid / %du;\n"
+                 "  uint sg_col = sgid %% %du;\n",
+                 cfg.wn, cfg.wn);
         s += buf;
 
         // Accumulators
         snprintf(buf, sizeof(buf),
-            "  %s acc[%d][%d];\n"
-            "  for (uint i = 0; i < %du; i++)\n"
-            "    for (uint j = 0; j < %du; j++)\n"
-            "      acc[i][j] = %s;\n",
-            sg_type, cfg.acc_rows, cfg.acc_cols,
-            cfg.acc_rows, cfg.acc_cols, zero_val);
+                 "  %s acc[%d][%d];\n"
+                 "  for (uint i = 0; i < %du; i++)\n"
+                 "    for (uint j = 0; j < %du; j++)\n"
+                 "      acc[i][j] = %s;\n",
+                 sg_type, cfg.acc_rows, cfg.acc_cols, cfg.acc_rows, cfg.acc_cols, zero_val);
         s += buf;
 
         // Threadgroup memory with padding
         snprintf(buf, sizeof(buf),
-            "  threadgroup %s As[%d];\n"
-            "  threadgroup %s Bs[%d];\n",
-            elem_type, a_tg_size,
-            elem_type, b_tg_size);
+                 "  threadgroup %s As[%d];\n"
+                 "  threadgroup %s Bs[%d];\n",
+                 elem_type, a_tg_size, elem_type, b_tg_size);
         s += buf;
 
         // Precompute loader positions (fixed per thread, no div/mod in loop)
         snprintf(buf, sizeof(buf),
-            "  uint a_row = tid / %du;\n"
-            "  uint a_col = (tid %% %du) * %du;\n"
-            "  uint b_row = tid / %du;\n"
-            "  uint b_col = (tid %% %du) * %du;\n",
-            a_tcols, a_tcols, a_vec,
-            b_tcols, b_tcols, b_vec);
+                 "  uint a_row = tid / %du;\n"
+                 "  uint a_col = (tid %% %du) * %du;\n"
+                 "  uint b_row = tid / %du;\n"
+                 "  uint b_col = (tid %% %du) * %du;\n",
+                 a_tcols, a_tcols, a_vec, b_tcols, b_tcols, b_vec);
         s += buf;
 
-        // Device memory pointers for A and B (will be advanced each K iteration)
+        // Device memory pointers for A and B (with batch offset, advanced each K iteration)
         s += "  device const ";
         s += elem_type;
-        s += "* Aptr = A + bm * K;\n";
+        s += "* Aptr = A + batch_z * M * K + bm * K;\n";
         s += "  device const ";
         s += elem_type;
-        s += "* Bptr = B + bn;\n";
+        s += "* Bptr = B + batch_z * K * N + bn;\n";
 
         // K-loop
-        snprintf(buf, sizeof(buf),
-            "  for (uint kb = 0; kb < K; kb += %du) {\n", cfg.bk);
+        snprintf(buf, sizeof(buf), "  for (uint kb = 0; kb < K; kb += %du) {\n", cfg.bk);
         s += buf;
 
         // Load A tile: BM x BK -> As[BM x (BK+pad)]
@@ -1799,29 +2342,29 @@ kernel void convert_f32_to_f16_vec4(device const float4* x [[buffer(0)]], device
         s += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
         if (a_nrows == 1) {
             if (a_vec == 1) {
-                snprintf(buf, sizeof(buf),
-                    "    As[a_row * %d + a_col] = Aptr[a_row * K + kb + a_col];\n",
-                    a_ld);
+                snprintf(buf, sizeof(buf), "    As[a_row * %d + a_col] = Aptr[a_row * K + kb + a_col];\n",
+                         a_ld);
             } else {
                 snprintf(buf, sizeof(buf),
-                    "    *(threadgroup %s*)(As + a_row * %d + a_col) = *(device const %s*)(Aptr + a_row * K + kb + a_col);\n",
-                    a_vec_type, a_ld, a_vec_type);
+                         "    *(threadgroup %s*)(As + a_row * %d + a_col) = *(device const %s*)(Aptr + a_row "
+                         "* K + kb + a_col);\n",
+                         a_vec_type, a_ld, a_vec_type);
             }
             s += buf;
         } else {
             snprintf(buf, sizeof(buf),
-                "    for (uint ar = 0; ar < %du; ar++) {\n"
-                "      uint row = a_row + ar * %du;\n",
-                a_nrows, a_trows);
+                     "    for (uint ar = 0; ar < %du; ar++) {\n"
+                     "      uint row = a_row + ar * %du;\n",
+                     a_nrows, a_trows);
             s += buf;
             if (a_vec == 1) {
-                snprintf(buf, sizeof(buf),
-                    "      As[row * %d + a_col] = Aptr[row * K + kb + a_col];\n",
-                    a_ld);
+                snprintf(buf, sizeof(buf), "      As[row * %d + a_col] = Aptr[row * K + kb + a_col];\n",
+                         a_ld);
             } else {
                 snprintf(buf, sizeof(buf),
-                    "      *(threadgroup %s*)(As + row * %d + a_col) = *(device const %s*)(Aptr + row * K + kb + a_col);\n",
-                    a_vec_type, a_ld, a_vec_type);
+                         "      *(threadgroup %s*)(As + row * %d + a_col) = *(device const %s*)(Aptr + row * "
+                         "K + kb + a_col);\n",
+                         a_vec_type, a_ld, a_vec_type);
             }
             s += buf;
             s += "    }\n";
@@ -1830,29 +2373,29 @@ kernel void convert_f32_to_f16_vec4(device const float4* x [[buffer(0)]], device
         // Load B tile: BK x BN -> Bs[BK x (BN+pad)]
         if (b_nrows == 1) {
             if (b_vec == 1) {
-                snprintf(buf, sizeof(buf),
-                    "    Bs[b_row * %d + b_col] = Bptr[(kb + b_row) * N + b_col];\n",
-                    b_ld);
+                snprintf(buf, sizeof(buf), "    Bs[b_row * %d + b_col] = Bptr[(kb + b_row) * N + b_col];\n",
+                         b_ld);
             } else {
                 snprintf(buf, sizeof(buf),
-                    "    *(threadgroup %s*)(Bs + b_row * %d + b_col) = *(device const %s*)(Bptr + (kb + b_row) * N + b_col);\n",
-                    b_vec_type, b_ld, b_vec_type);
+                         "    *(threadgroup %s*)(Bs + b_row * %d + b_col) = *(device const %s*)(Bptr + (kb + "
+                         "b_row) * N + b_col);\n",
+                         b_vec_type, b_ld, b_vec_type);
             }
             s += buf;
         } else {
             snprintf(buf, sizeof(buf),
-                "    for (uint br = 0; br < %du; br++) {\n"
-                "      uint row = b_row + br * %du;\n",
-                b_nrows, b_trows);
+                     "    for (uint br = 0; br < %du; br++) {\n"
+                     "      uint row = b_row + br * %du;\n",
+                     b_nrows, b_trows);
             s += buf;
             if (b_vec == 1) {
-                snprintf(buf, sizeof(buf),
-                    "      Bs[row * %d + b_col] = Bptr[(kb + row) * N + b_col];\n",
-                    b_ld);
+                snprintf(buf, sizeof(buf), "      Bs[row * %d + b_col] = Bptr[(kb + row) * N + b_col];\n",
+                         b_ld);
             } else {
                 snprintf(buf, sizeof(buf),
-                    "      *(threadgroup %s*)(Bs + row * %d + b_col) = *(device const %s*)(Bptr + (kb + row) * N + b_col);\n",
-                    b_vec_type, b_ld, b_vec_type);
+                         "      *(threadgroup %s*)(Bs + row * %d + b_col) = *(device const %s*)(Bptr + (kb + "
+                         "row) * N + b_col);\n",
+                         b_vec_type, b_ld, b_vec_type);
             }
             s += buf;
             s += "    }\n";
@@ -1862,31 +2405,30 @@ kernel void convert_f32_to_f16_vec4(device const float4* x [[buffer(0)]], device
 
         // Per-simdgroup base in threadgroup memory
         snprintf(buf, sizeof(buf),
-            "    uint base_m = sg_row * %du;\n"
-            "    uint base_n = sg_col * %du;\n",
-            cfg.acc_rows * 8, cfg.acc_cols * 8);
+                 "    uint base_m = sg_row * %du;\n"
+                 "    uint base_n = sg_col * %du;\n",
+                 cfg.acc_rows * 8, cfg.acc_cols * 8);
         s += buf;
 
         // Inner k-loop over 8x8 tiles with serpentine MMA
-        snprintf(buf, sizeof(buf),
-            "    for (uint kk = 0; kk < %du; kk += 8) {\n", cfg.bk);
+        snprintf(buf, sizeof(buf), "    for (uint kk = 0; kk < %du; kk += 8) {\n", cfg.bk);
         s += buf;
 
         // Load A sub-tiles from threadgroup (padded stride)
         for (int ai = 0; ai < cfg.acc_rows; ai++) {
             snprintf(buf, sizeof(buf),
-                "      %s a%d;\n"
-                "      simdgroup_load(a%d, As + (base_m + %du) * %d + kk, %d);\n",
-                sg_type, ai, ai, ai * 8, a_ld, a_ld);
+                     "      %s a%d;\n"
+                     "      simdgroup_load(a%d, As + (base_m + %du) * %d + kk, %d);\n",
+                     sg_type, ai, ai, ai * 8, a_ld, a_ld);
             s += buf;
         }
 
         // Load B sub-tiles from threadgroup (padded stride)
         for (int bj = 0; bj < cfg.acc_cols; bj++) {
             snprintf(buf, sizeof(buf),
-                "      %s b%d;\n"
-                "      simdgroup_load(b%d, Bs + kk * %d + base_n + %du, %d);\n",
-                sg_type, bj, bj, b_ld, bj * 8, b_ld);
+                     "      %s b%d;\n"
+                     "      simdgroup_load(b%d, Bs + kk * %d + base_n + %du, %d);\n",
+                     sg_type, bj, bj, b_ld, bj * 8, b_ld);
             s += buf;
         }
 
@@ -1896,21 +2438,22 @@ kernel void convert_f32_to_f16_vec4(device const float4* x [[buffer(0)]], device
                 // Serpentine: reverse N direction on odd M rows
                 int bj = (ai % 2 == 0) ? bj_raw : (cfg.acc_cols - 1 - bj_raw);
                 snprintf(buf, sizeof(buf),
-                    "      simdgroup_multiply_accumulate(acc[%d][%d], a%d, b%d, acc[%d][%d]);\n",
-                    ai, bj, ai, bj, ai, bj);
+                         "      simdgroup_multiply_accumulate(acc[%d][%d], a%d, b%d, acc[%d][%d]);\n", ai, bj,
+                         ai, bj, ai, bj);
                 s += buf;
             }
         }
 
-        s += "    }\n";  // end kk loop
-        s += "  }\n";  // end kb loop
+        s += "    }\n"; // end kk loop
+        s += "  }\n";   // end kb loop
 
-        // Store results to device memory
+        // Store results to device memory (with batch offset)
         for (int ai = 0; ai < cfg.acc_rows; ai++) {
             for (int bj = 0; bj < cfg.acc_cols; bj++) {
                 snprintf(buf, sizeof(buf),
-                    "  simdgroup_store(acc[%d][%d], C + (bm + sg_row * %du + %du) * N + bn + sg_col * %du + %du, N);\n",
-                    ai, bj, cfg.acc_rows * 8, ai * 8, cfg.acc_cols * 8, bj * 8);
+                         "  simdgroup_store(acc[%d][%d], C + batch_z * M * N + (bm + sg_row * %du + %du) * N + bn + sg_col * "
+                         "%du + %du, N);\n",
+                         ai, bj, cfg.acc_rows * 8, ai * 8, cfg.acc_cols * 8, bj * 8);
                 s += buf;
             }
         }
@@ -1923,17 +2466,15 @@ kernel void convert_f32_to_f16_vec4(device const float4* x [[buffer(0)]], device
     static NSString* source = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        std::string combined(kSource);
-        // Generate all GEMM variants for both f32 and f16
-        for (const auto& cfg : configs) {
-            combined += generateGemmKernel(cfg, "f32",
-                "simdgroup_float8x8",
-                "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)");
-            combined += generateGemmKernel(cfg, "f16",
-                "simdgroup_half8x8",
-                "make_filled_simdgroup_matrix<half, 8, 8>((half)0.0h)");
-        }
-        source = [[NSString alloc] initWithUTF8String:combined.c_str()];
+      std::string combined(kSource);
+      // Generate all GEMM variants for both f32 and f16
+      for (const auto& cfg : configs) {
+          combined += generateGemmKernel(cfg, "f32", "simdgroup_float8x8",
+                                         "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)");
+          combined += generateGemmKernel(cfg, "f16", "simdgroup_half8x8",
+                                         "make_filled_simdgroup_matrix<half, 8, 8>((half)0.0h)");
+      }
+      source = [[NSString alloc] initWithUTF8String:combined.c_str()];
     });
     return source;
 }
@@ -1956,26 +2497,23 @@ kernel void gemm_mpp_f32(device float* A_ptr [[buffer(0)]],
                           constant uint& M [[buffer(3)]],
                           constant uint& N [[buffer(4)]],
                           constant uint& K [[buffer(5)]],
-                          uint2 tgid [[threadgroup_position_in_grid]]) {
-    // Construct inline 2D tensors from raw device pointers.
-    // Row-major data: A[M×K], B[K×N], C[M×N].
-    // Metal tensor convention: extents are (dim0=inner/col, dim1=outer/row)
-    // for row-major, dim0 = num_cols (stride=1), dim1 = num_rows (stride=cols)
-    // Indexing: tensor[col, row] for row-major data.
-    auto A = tensor(A_ptr, extents<int32_t, dynamic_extent, dynamic_extent>(K, M));
-    auto B = tensor(B_ptr, extents<int32_t, dynamic_extent, dynamic_extent>(N, K));
-    auto C_t = tensor(C_ptr, extents<int32_t, dynamic_extent, dynamic_extent>(N, M));
+                          uint3 tgid [[threadgroup_position_in_grid]]) {
+    // Batch offset via tgid.z
+    device float* A_batch = A_ptr + tgid.z * M * K;
+    device float* B_batch = B_ptr + tgid.z * K * N;
+    device float* C_batch = C_ptr + tgid.z * M * N;
+
+    auto A = tensor(A_batch, extents<int32_t, dynamic_extent, dynamic_extent>(K, M));
+    auto B = tensor(B_batch, extents<int32_t, dynamic_extent, dynamic_extent>(N, K));
+    auto C_t = tensor(C_batch, extents<int32_t, dynamic_extent, dynamic_extent>(N, M));
 
     constexpr auto desc = matmul2d_descriptor(64, 64,
         static_cast<int>(dynamic_extent), false, false, false);
     matmul2d<desc, execution_simdgroups<4>> matmulOp;
 
-    // slice(dim0_offset, dim1_offset) with col-major convention:
-    // dim0=col offset, dim1=row offset
-    // For C[M×N]: row tile = tgid.y*64, col tile = tgid.x*64
-    auto mA = A.slice(0, tgid.y * 64);            // A: shift rows by tgid.y*64
-    auto mB = B.slice(tgid.x * 64, 0);            // B: shift cols by tgid.x*64
-    auto mC = C_t.slice(tgid.x * 64, tgid.y * 64); // C: shift cols+rows
+    auto mA = A.slice(0, tgid.y * 64);
+    auto mB = B.slice(tgid.x * 64, 0);
+    auto mC = C_t.slice(tgid.x * 64, tgid.y * 64);
     matmulOp.run(mA, mB, mC);
 }
 
@@ -1985,10 +2523,15 @@ kernel void gemm_mpp_f16(device half* A_ptr [[buffer(0)]],
                           constant uint& M [[buffer(3)]],
                           constant uint& N [[buffer(4)]],
                           constant uint& K [[buffer(5)]],
-                          uint2 tgid [[threadgroup_position_in_grid]]) {
-    auto A = tensor(A_ptr, extents<int32_t, dynamic_extent, dynamic_extent>(K, M));
-    auto B = tensor(B_ptr, extents<int32_t, dynamic_extent, dynamic_extent>(N, K));
-    auto C_t = tensor(C_ptr, extents<int32_t, dynamic_extent, dynamic_extent>(N, M));
+                          uint3 tgid [[threadgroup_position_in_grid]]) {
+    // Batch offset via tgid.z
+    device half* A_batch = A_ptr + tgid.z * M * K;
+    device half* B_batch = B_ptr + tgid.z * K * N;
+    device half* C_batch = C_ptr + tgid.z * M * N;
+
+    auto A = tensor(A_batch, extents<int32_t, dynamic_extent, dynamic_extent>(K, M));
+    auto B = tensor(B_batch, extents<int32_t, dynamic_extent, dynamic_extent>(N, K));
+    auto C_t = tensor(C_batch, extents<int32_t, dynamic_extent, dynamic_extent>(N, M));
 
     constexpr auto desc = matmul2d_descriptor(64, 64,
         static_cast<int>(dynamic_extent), false, false, true);
@@ -2001,6 +2544,576 @@ kernel void gemm_mpp_f16(device half* A_ptr [[buffer(0)]],
 }
 )METAL";
     return [NSString stringWithUTF8String:kMppSource];
+}
+
+NSString* MxQuantizedKernelSource() {
+    static const char* kSource = R"METAL(
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+// ═══════════════════════════════════════════════════════════════════
+// MX Microscaling Format Types (OCP Standard + NVIDIA Extension)
+// ═══════════════════════════════════════════════════════════════════
+
+// FP4 E2M1: 4-bit float with 1 sign, 2 exponent, 1 mantissa bits.
+// Representable values: ±{0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
+struct fp4_e2m1 {
+    uint8_t bits;
+
+    // Quantize float → 4-bit E2M1 with nearest-even rounding
+    fp4_e2m1() thread = default;
+    fp4_e2m1(float f) {
+        if (isnan(f)) { bits = 0x7; return; }
+        uint8_t sign = signbit(f) ? 0x8 : 0x0;
+        float a = abs(f);
+        uint8_t mag;
+        // Nearest-even rounding boundaries
+        if      (a >= 5.0f)  mag = 0x7; // 6.0
+        else if (a >= 3.5f)  mag = 0x6; // 4.0
+        else if (a >= 2.5f)  mag = 0x5; // 3.0
+        else if (a >= 1.75f) mag = 0x4; // 2.0
+        else if (a >= 1.25f) mag = 0x3; // 1.5
+        else if (a >= 0.75f) mag = 0x2; // 1.0
+        else if (a >= 0.25f) mag = 0x1; // 0.5
+        else                 mag = 0x0; // 0.0
+        bits = sign | mag;
+    }
+
+    // Dequantize 4-bit E2M1 → half → float
+    operator half() const {
+        // Bit trick: shift mantissa to half format position and scale
+        uint16_t v = (uint16_t)(bits & 0x7) << 9;
+        half converted = as_type<half>(v);
+        converted *= 16384.0h; // 2^14 to adjust exponent
+        return (bits & 0x8) ? -converted : converted;
+    }
+    operator float() const { return (float)(half)(*this); }
+};
+
+// FP8 E4M3: 8-bit float, max representable = 448.
+struct fp8_e4m3 {
+    uint8_t bits;
+
+    fp8_e4m3() thread = default;
+    fp8_e4m3(float f) {
+        // From PyTorch E4M3FN conversion
+        uint32_t fp8_max = 543u << 21;
+        uint32_t denorm_mask = 141u << 23;
+        uint32_t f_bits = as_type<uint32_t>(f);
+        uint32_t sign = f_bits & 0x80000000u;
+        f_bits ^= sign;
+        if (f_bits >= fp8_max) {
+            bits = 0x7E; // saturate
+        } else if (f_bits < (121u << 23)) {
+            f_bits = as_type<uint32_t>(as_type<float>(f_bits) + as_type<float>(denorm_mask));
+            bits = (uint8_t)(f_bits - denorm_mask);
+        } else {
+            uint8_t mant_odd = (f_bits >> 20) & 1;
+            f_bits += ((uint32_t)(7 - 127) << 23) + 0x7FFFFu;
+            f_bits += mant_odd;
+            bits = (uint8_t)(f_bits >> 20);
+        }
+        bits |= (uint8_t)(sign >> 24);
+    }
+
+    operator half() const {
+        uint16_t v = (uint16_t)(bits & 127) << 7;
+        half converted = as_type<half>(v);
+        converted *= 256.0h;
+        return (bits & 128) ? -converted : converted;
+    }
+    operator float() const { return (float)(half)(*this); }
+};
+
+// FP8 E8M0: pure power-of-two scale (8 exponent bits, no mantissa).
+// Represents 2^(bits - 127). Range: 2^-127 to 2^127.
+struct fp8_e8m0 {
+    uint8_t bits;
+
+    fp8_e8m0() thread = default;
+    fp8_e8m0(float x) {
+        if (!isfinite(x)) { bits = 0xFF; return; }
+        if (x <= 0.0f) { bits = 0x00; return; }
+        float le = log2(x);
+        int n = (int)rint(le);
+        n = clamp(n, -127, 127);
+        bits = (uint8_t)(n + 127);
+    }
+
+    operator float() const {
+        // Reconstruct: place exponent byte directly into IEEE 754 exponent field
+        uint32_t out = (bits == 0) ? 0x00400000u : ((uint32_t)bits << 23);
+        return as_type<float>(out);
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// Dequantize helpers
+// ═══════════════════════════════════════════════════════════════════
+
+// Dequantize scale byte based on group size (compile-time selection).
+// group_size==16 → NVFP4 (E4M3 scale), group_size==32 → MX (E8M0 scale)
+template <int group_size>
+inline float dequantize_scale(uint8_t s) {
+    if (group_size == 16) {
+        fp8_e4m3 sc; sc.bits = s;
+        return (float)sc;
+    } else {
+        fp8_e8m0 sc; sc.bits = s;
+        return (float)sc;
+    }
+}
+
+// Dequantize a single 4-bit element
+inline float dequant_fp4(uint8_t nibble) {
+    fp4_e2m1 v; v.bits = nibble & 0xF;
+    return (float)v;
+}
+
+// Dequantize a single 8-bit E4M3 element
+inline float dequant_fp8(uint8_t byte) {
+    fp8_e4m3 v; v.bits = byte;
+    return (float)v;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Quantize kernels
+// ═══════════════════════════════════════════════════════════════════
+
+// Generic MX quantize: f32 → packed uint8 + scale bytes.
+// Each SIMD group (32 threads) processes one group for MX modes,
+// or two groups (16 threads each) for NV mode.
+// Launch as 1D grid: one thread per element.
+
+kernel void mx_quantize_f32(device const float* w       [[buffer(0)]],
+                            device uint8_t* out          [[buffer(1)]],
+                            device uint8_t* scales       [[buffer(2)]],
+                            constant uint& numel         [[buffer(3)]],
+                            constant uint& group_size    [[buffer(4)]],
+                            constant uint& bits          [[buffer(5)]],
+                            uint gid [[thread_position_in_grid]],
+                            uint simd_lid [[thread_index_in_simdgroup]]) {
+    if (gid >= numel) return;
+
+    float val = w[gid];
+    float aval = abs(val);
+
+    // Compute per-group max using SIMD reduction
+    float group_max;
+    if (group_size == 32) {
+        group_max = simd_max(aval);
+    } else {
+        // NV mode: group_size=16, split SIMD into two halves
+        float left_max  = simd_max(simd_lid < 16 ? aval : 0.0f);
+        float right_max = simd_max(simd_lid >= 16 ? aval : 0.0f);
+        group_max = (simd_lid < 16) ? left_max : right_max;
+    }
+
+    // Normalize by max representable value of element type
+    float max_repr = (bits == 4) ? 6.0f : 448.0f;
+    float raw_scale = group_max / max_repr;
+
+    // Quantize scale
+    uint8_t q_scale;
+    float scale;
+    if (group_size == 32) {
+        // MX mode: E8M0 scale
+        fp8_e8m0 s(raw_scale);
+        q_scale = s.bits;
+        scale = (float)s;
+    } else {
+        // NV mode: E4M3 scale
+        fp8_e4m3 s(raw_scale);
+        q_scale = s.bits;
+        scale = (float)s;
+    }
+
+    // Write scale (first thread in group writes)
+    uint group_idx = gid / group_size;
+    if (gid % group_size == 0) {
+        scales[group_idx] = q_scale;
+    }
+
+    // Quantize element
+    float normalized = (scale == 0.0f) ? 0.0f : val / scale;
+    uint8_t quantized;
+    if (bits == 4) {
+        fp4_e2m1 q(normalized);
+        quantized = q.bits;
+    } else {
+        fp8_e4m3 q(normalized);
+        quantized = q.bits;
+    }
+
+    // Pack FP4: two elements per byte
+    if (bits == 4) {
+        uint8_t neighbor = simd_shuffle_down(quantized, 1);
+        quantized |= (neighbor << 4);
+        if (gid % 2 == 0) {
+            out[gid / 2] = quantized;
+        }
+    } else {
+        out[gid] = quantized;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Dequantize kernels
+// ═══════════════════════════════════════════════════════════════════
+
+kernel void mx_dequantize_f32(device const uint8_t* packed  [[buffer(0)]],
+                              device const uint8_t* scales   [[buffer(1)]],
+                              device float* out              [[buffer(2)]],
+                              constant uint& numel           [[buffer(3)]],
+                              constant uint& group_size      [[buffer(4)]],
+                              constant uint& bits            [[buffer(5)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= numel) return;
+
+    uint group_idx = gid / group_size;
+
+    // Dequantize scale
+    float scale;
+    if (group_size == 32) {
+        fp8_e8m0 s; s.bits = scales[group_idx];
+        scale = (float)s;
+    } else {
+        fp8_e4m3 s; s.bits = scales[group_idx];
+        scale = (float)s;
+    }
+
+    // Dequantize element
+    float val;
+    if (bits == 4) {
+        uint8_t byte = packed[gid / 2];
+        uint8_t nibble = (gid % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+        val = dequant_fp4(nibble);
+    } else {
+        val = dequant_fp8(packed[gid]);
+    }
+
+    out[gid] = scale * val;
+}
+
+kernel void mx_dequantize_f16(device const uint8_t* packed  [[buffer(0)]],
+                              device const uint8_t* scales   [[buffer(1)]],
+                              device half* out               [[buffer(2)]],
+                              constant uint& numel           [[buffer(3)]],
+                              constant uint& group_size      [[buffer(4)]],
+                              constant uint& bits            [[buffer(5)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= numel) return;
+
+    uint group_idx = gid / group_size;
+    float scale;
+    if (group_size == 32) {
+        fp8_e8m0 s; s.bits = scales[group_idx];
+        scale = (float)s;
+    } else {
+        fp8_e4m3 s; s.bits = scales[group_idx];
+        scale = (float)s;
+    }
+
+    float val;
+    if (bits == 4) {
+        uint8_t byte = packed[gid / 2];
+        uint8_t nibble = (gid % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+        val = dequant_fp4(nibble);
+    } else {
+        val = dequant_fp8(packed[gid]);
+    }
+
+    out[gid] = (half)(scale * val);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Quantized GEMM: C[M,N] = A[M,K] @ dequant(B_packed[N,K/pack], B_scales[N,K/gs])^T
+// Weights B are stored transposed and packed. Each row of B_packed is one output neuron.
+// This is the standard inference layout: activations × weight^T.
+//
+// Strategy: each thread computes one output element by iterating over K
+// with on-the-fly dequantization. Simple but effective for moderate sizes.
+// ═══════════════════════════════════════════════════════════════════
+
+// --- Quantized matrix-vector multiply (batch of rows) ---
+// Each SIMD group handles one output row. Threads cooperatively reduce over K.
+
+kernel void mx_qgemm_mxfp4_f32(
+    device const float* A          [[buffer(0)]],  // [M, K]
+    device const uint8_t* B_packed [[buffer(1)]],  // [N, K/2] packed FP4
+    device const uint8_t* B_scales [[buffer(2)]],  // [N, K/32] E8M0 scales
+    device float* C                [[buffer(3)]],  // [M, N]
+    constant uint& M               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_idx [[simdgroup_index_in_threadgroup]]) {
+
+    // Each threadgroup handles a tile of output: TILE_M rows × TILE_N cols
+    // With 128 threads = 4 SIMD groups, each SIMD handles one (row, col) pair
+    const uint TILE_M = 4;  // rows per threadgroup
+    const uint TILE_N = 1;  // cols per threadgroup (1 SIMD per output)
+    const uint GROUP_SIZE = 32;
+
+    uint row = tgid.y * TILE_M + simd_idx;
+    uint col = tgid.x;
+    if (row >= M || col >= N) return;
+
+    // Pointers
+    device const float* a_row = A + row * K;
+    device const uint8_t* b_row = B_packed + col * (K / 2);   // K/2 bytes for FP4
+    device const uint8_t* s_row = B_scales + col * (K / GROUP_SIZE);
+
+    float acc = 0.0f;
+
+    // Process K in groups of 32 (one scale per group)
+    uint num_groups = K / GROUP_SIZE;
+    for (uint g = 0; g < num_groups; g++) {
+        // Dequantize scale for this group
+        fp8_e8m0 sc; sc.bits = s_row[g];
+        float scale = (float)sc;
+
+        // Each lane processes 1 element within the group (32 lanes = 32 elements)
+        // But we need all 32 elements, so each lane handles its own element
+        uint k_base = g * GROUP_SIZE;
+        uint k = k_base + lane;
+
+        // Load activation
+        float a_val = a_row[k];
+
+        // Load and dequantize weight (FP4 packed: 2 per byte)
+        uint byte_idx = k / 2;
+        uint8_t packed_byte = b_row[byte_idx];
+        uint8_t nibble = (k % 2 == 0) ? (packed_byte & 0x0F) : (packed_byte >> 4);
+        float w_val = scale * dequant_fp4(nibble);
+
+        // Multiply and reduce across SIMD
+        float prod = a_val * w_val;
+        acc += simd_sum(prod);
+    }
+
+    // Write output (only lane 0 writes)
+    if (lane == 0) {
+        C[row * N + col] = acc;
+    }
+}
+
+kernel void mx_qgemm_mxfp4_f16(
+    device const half* A           [[buffer(0)]],
+    device const uint8_t* B_packed [[buffer(1)]],
+    device const uint8_t* B_scales [[buffer(2)]],
+    device half* C                 [[buffer(3)]],
+    constant uint& M               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_idx [[simdgroup_index_in_threadgroup]]) {
+
+    const uint TILE_M = 4;
+    const uint GROUP_SIZE = 32;
+
+    uint row = tgid.y * TILE_M + simd_idx;
+    uint col = tgid.x;
+    if (row >= M || col >= N) return;
+
+    device const half* a_row = A + row * K;
+    device const uint8_t* b_row = B_packed + col * (K / 2);
+    device const uint8_t* s_row = B_scales + col * (K / GROUP_SIZE);
+
+    float acc = 0.0f;
+    uint num_groups = K / GROUP_SIZE;
+    for (uint g = 0; g < num_groups; g++) {
+        fp8_e8m0 sc; sc.bits = s_row[g];
+        float scale = (float)sc;
+        uint k = g * GROUP_SIZE + lane;
+        float a_val = (float)a_row[k];
+        uint8_t packed_byte = b_row[k / 2];
+        uint8_t nibble = (k % 2 == 0) ? (packed_byte & 0x0F) : (packed_byte >> 4);
+        float w_val = scale * dequant_fp4(nibble);
+        acc += simd_sum(a_val * w_val);
+    }
+    if (lane == 0) {
+        C[row * N + col] = (half)acc;
+    }
+}
+
+kernel void mx_qgemm_mxfp8_f32(
+    device const float* A          [[buffer(0)]],
+    device const uint8_t* B_packed [[buffer(1)]],  // [N, K] raw E4M3 bytes
+    device const uint8_t* B_scales [[buffer(2)]],  // [N, K/32] E8M0 scales
+    device float* C                [[buffer(3)]],
+    constant uint& M               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_idx [[simdgroup_index_in_threadgroup]]) {
+
+    const uint TILE_M = 4;
+    const uint GROUP_SIZE = 32;
+
+    uint row = tgid.y * TILE_M + simd_idx;
+    uint col = tgid.x;
+    if (row >= M || col >= N) return;
+
+    device const float* a_row = A + row * K;
+    device const uint8_t* b_row = B_packed + col * K;
+    device const uint8_t* s_row = B_scales + col * (K / GROUP_SIZE);
+
+    float acc = 0.0f;
+    uint num_groups = K / GROUP_SIZE;
+    for (uint g = 0; g < num_groups; g++) {
+        fp8_e8m0 sc; sc.bits = s_row[g];
+        float scale = (float)sc;
+        uint k = g * GROUP_SIZE + lane;
+        float a_val = a_row[k];
+        float w_val = scale * dequant_fp8(b_row[k]);
+        acc += simd_sum(a_val * w_val);
+    }
+    if (lane == 0) {
+        C[row * N + col] = acc;
+    }
+}
+
+kernel void mx_qgemm_mxfp8_f16(
+    device const half* A           [[buffer(0)]],
+    device const uint8_t* B_packed [[buffer(1)]],
+    device const uint8_t* B_scales [[buffer(2)]],
+    device half* C                 [[buffer(3)]],
+    constant uint& M               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_idx [[simdgroup_index_in_threadgroup]]) {
+
+    const uint TILE_M = 4;
+    const uint GROUP_SIZE = 32;
+
+    uint row = tgid.y * TILE_M + simd_idx;
+    uint col = tgid.x;
+    if (row >= M || col >= N) return;
+
+    device const half* a_row = A + row * K;
+    device const uint8_t* b_row = B_packed + col * K;
+    device const uint8_t* s_row = B_scales + col * (K / GROUP_SIZE);
+
+    float acc = 0.0f;
+    uint num_groups = K / GROUP_SIZE;
+    for (uint g = 0; g < num_groups; g++) {
+        fp8_e8m0 sc; sc.bits = s_row[g];
+        float scale = (float)sc;
+        uint k = g * GROUP_SIZE + lane;
+        float a_val = (float)a_row[k];
+        float w_val = scale * dequant_fp8(b_row[k]);
+        acc += simd_sum(a_val * w_val);
+    }
+    if (lane == 0) {
+        C[row * N + col] = (half)acc;
+    }
+}
+
+kernel void mx_qgemm_nvfp4_f32(
+    device const float* A          [[buffer(0)]],
+    device const uint8_t* B_packed [[buffer(1)]],  // [N, K/2] packed FP4
+    device const uint8_t* B_scales [[buffer(2)]],  // [N, K/16] E4M3 scales
+    device float* C                [[buffer(3)]],
+    constant uint& M               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_idx [[simdgroup_index_in_threadgroup]]) {
+
+    const uint TILE_M = 4;
+    const uint GROUP_SIZE = 16;
+
+    uint row = tgid.y * TILE_M + simd_idx;
+    uint col = tgid.x;
+    if (row >= M || col >= N) return;
+
+    device const float* a_row = A + row * K;
+    device const uint8_t* b_row = B_packed + col * (K / 2);
+    device const uint8_t* s_row = B_scales + col * (K / GROUP_SIZE);
+
+    float acc = 0.0f;
+    uint num_groups = K / GROUP_SIZE;
+    for (uint g = 0; g < num_groups; g++) {
+        fp8_e4m3 sc; sc.bits = s_row[g];
+        float scale = (float)sc;
+        // NV mode: group_size=16, only first 16 lanes active per group
+        uint k = g * GROUP_SIZE + (lane % 16);
+        if (lane < 16) {
+            float a_val = a_row[k];
+            uint8_t packed_byte = b_row[k / 2];
+            uint8_t nibble = (k % 2 == 0) ? (packed_byte & 0x0F) : (packed_byte >> 4);
+            float w_val = scale * dequant_fp4(nibble);
+            acc += simd_sum(a_val * w_val);
+        } else {
+            // Upper 16 lanes contribute 0 to the simd_sum
+            acc += simd_sum(0.0f);
+        }
+    }
+    if (lane == 0) {
+        C[row * N + col] = acc;
+    }
+}
+
+kernel void mx_qgemm_nvfp4_f16(
+    device const half* A           [[buffer(0)]],
+    device const uint8_t* B_packed [[buffer(1)]],
+    device const uint8_t* B_scales [[buffer(2)]],
+    device half* C                 [[buffer(3)]],
+    constant uint& M               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_idx [[simdgroup_index_in_threadgroup]]) {
+
+    const uint TILE_M = 4;
+    const uint GROUP_SIZE = 16;
+
+    uint row = tgid.y * TILE_M + simd_idx;
+    uint col = tgid.x;
+    if (row >= M || col >= N) return;
+
+    device const half* a_row = A + row * K;
+    device const uint8_t* b_row = B_packed + col * (K / 2);
+    device const uint8_t* s_row = B_scales + col * (K / GROUP_SIZE);
+
+    float acc = 0.0f;
+    uint num_groups = K / GROUP_SIZE;
+    for (uint g = 0; g < num_groups; g++) {
+        fp8_e4m3 sc; sc.bits = s_row[g];
+        float scale = (float)sc;
+        uint k = g * GROUP_SIZE + (lane % 16);
+        if (lane < 16) {
+            float a_val = (float)a_row[k];
+            uint8_t packed_byte = b_row[k / 2];
+            uint8_t nibble = (k % 2 == 0) ? (packed_byte & 0x0F) : (packed_byte >> 4);
+            float w_val = scale * dequant_fp4(nibble);
+            acc += simd_sum(a_val * w_val);
+        } else {
+            acc += simd_sum(0.0f);
+        }
+    }
+    if (lane == 0) {
+        C[row * N + col] = (half)acc;
+    }
+}
+
+)METAL";
+    return [NSString stringWithUTF8String:kSource];
 }
 
 } // namespace jax_metallib

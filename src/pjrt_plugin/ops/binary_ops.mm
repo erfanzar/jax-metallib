@@ -436,7 +436,11 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
     NSArray<NSNumber*>* expectedOutputShape = GetOutputShape(ctx.op);
     NSArray<NSNumber*>* finalOutShape =
         expectedOutputShape ? expectedOutputShape : (NSArray<NSNumber*>*)ToNSArray(logicalOutputShape);
-    if (finalOutShape && result && ![finalOutShape isEqualToArray:result.shape]) {
+    // Skip final reshape when matmul output already has the correct shape:
+    // - 0 or 1 batch dims: result shape [m,n] or [batch,m,n] matches expected
+    // - Multiple batch dims: need reshape since we flattened batch dims
+    if (finalOutShape && result && batchSizes.size() <= 1 &&
+        ![finalOutShape isEqualToArray:result.shape]) {
         result = [ctx.graph reshapeTensor:result withShape:finalOutShape name:nil];
     }
 

@@ -7,9 +7,7 @@ def make_random_op_configs():
     with OperationTestConfig.module_name("random"):
         for shape in [(), (3,), (7, 8)]:
             yield from [
-                OperationTestConfig(
-                    random.normal, random.key(17), shape, static_argnums=(1,)
-                ),
+                OperationTestConfig(random.normal, random.key(17), shape, static_argnums=(1,)),
                 OperationTestConfig(
                     random.truncated_normal,
                     random.key(17),
@@ -28,7 +26,5 @@ def make_random_op_configs():
                     static_argnums=(1,),
                 ),
                 OperationTestConfig(random.split, random.key(18)),
-                OperationTestConfig(
-                    random.split, random.key(18), 5, static_argnums=(1,)
-                ),
+                OperationTestConfig(random.split, random.key(18), 5, static_argnums=(1,)),
             ]

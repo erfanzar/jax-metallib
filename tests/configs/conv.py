@@ -6,7 +6,7 @@ from .util import OperationTestConfig
 
 def make_conv_op_configs():
     with OperationTestConfig.module_name("conv"):
-        return [
+        yield from [
             OperationTestConfig(
                 lambda x, kernel: lax.conv_general_dilated(
                     x,

@@ -14,6 +14,8 @@
 
 #import "pjrt_plugin/core/mps_executable.h"
 
+#import <Metal/Metal.h>
+
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #import "pjrt_plugin/core/issue_url.h"
@@ -24,8 +26,11 @@
 #import "pjrt_plugin/ops/registry.h"
 #import "pjrt_plugin/runtime/metal_kernels.h"
 #include "stablehlo/dialect/Serialization.h"
+#include "stablehlo/dialect/StablehloOps.h"
 #include "stablehlo/dialect/Version.h"
 
+#import <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
@@ -33,11 +38,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <sys/stat.h>
 #include <limits>
 #include <map>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -58,23 +63,31 @@ struct IntermediateCacheSet {
 
     explicit IntermediateCacheSet(size_t n) : bufs(n, nil), tensor_datas(n, nil), tensor_data_bufs(n, nil) {}
 
-    ~IntermediateCacheSet() {
+    // Synchronously release all owned resources. Caller is responsible for
+    // ensuring the GPU is no longer using any of the MTLBuffers referenced
+    // here (typically by holding a CompletionEvent fence).
+    void ReleaseAll() {
         for (MPSGraphTensorData* td : tensor_datas) {
             if (td) {
                 [td release];
             }
         }
+        tensor_datas.clear();
         for (id<MTLBuffer> buf : tensor_data_bufs) {
             if (buf) {
                 CFRelease((__bridge CFTypeRef)buf);
             }
         }
+        tensor_data_bufs.clear();
         for (id<MTLBuffer> buf : bufs) {
             if (buf) {
                 CFRelease((__bridge CFTypeRef)buf);
             }
         }
+        bufs.clear();
     }
+
+    ~IntermediateCacheSet() { ReleaseAll(); }
 };
 
 struct GraphStep {
@@ -106,8 +119,14 @@ struct NativeStep {
         kPad2D,
         kScatterAddRows,
         kReshapeAlias,
+        kTransposeAlias,
         kConstant,
         kGEMM,
+        kCpuBLAS,
+        kSort,
+        kTranspose2D,
+        kCpuSort,
+        kCpuCholesky,
     };
 
     NativeOpHandler handler;
@@ -161,7 +180,7 @@ struct NativeStep {
 
     // LayerNorm fields (2-pass, reuses baked_rows/baked_cols from reduce)
     id<MTLComputePipelineState> baked_layernorm_pass2_pipeline = nil;
-    id<MTLBuffer> baked_layernorm_stats = nil;  // [rows × 2] floats: [mean, inv_std]
+    id<MTLBuffer> baked_layernorm_stats = nil; // [rows × 2] floats: [mean, inv_std]
     MTLSize baked_layernorm_pass2_grid = MTLSizeMake(1, 1, 1);
     MTLSize baked_layernorm_pass2_tg = MTLSizeMake(1, 1, 1);
     float baked_layernorm_eps = 1e-5f;
@@ -175,7 +194,21 @@ struct NativeStep {
     uint32_t baked_gemm_n = 0;
     uint32_t baked_gemm_k = 0;
     uint32_t baked_gemm_batch = 0;
-    int baked_gemm_variant = 0;  // kMppGemmVariant (-1) for MPP path
+    int baked_gemm_variant = 0; // kMppGemmVariant (-1) for MPP path
+
+    // Transpose fields (last-2-dims swap)
+    uint32_t baked_transpose_rows = 0;
+    uint32_t baked_transpose_cols = 0;
+    uint32_t baked_transpose_batch = 1;
+
+    // Sort fields
+    uint32_t baked_sort_n = 0;          // elements per row (or total for 1D)
+    uint32_t baked_sort_padded_n = 0;
+    uint32_t baked_sort_num_rows = 1;   // 1 for 1D sort, >1 for 2D row-wise sort
+
+    // CPU Cholesky fields
+    uint32_t baked_cholesky_n = 0;
+    bool baked_cholesky_lower = true;
 
     std::unique_ptr<FusedElementwiseInfo> fused_info;
 };
@@ -202,6 +235,10 @@ struct ExecutionPlan {
         int pjrt_dtype;
         std::vector<int64_t> dims;
         size_t byte_size;
+        // For transpose-alias outputs: the permutation and the input shape so
+        // we can compute the correct byte_strides at output buffer creation.
+        std::vector<int64_t> transpose_perm; // empty → contiguous output
+        std::vector<int64_t> transpose_input_dims;
     };
     std::vector<OutputMeta> output_meta;
 
@@ -266,13 +303,13 @@ static id<MTLBuffer> NativeIntrinsicScatterAddRowsHandler(id<MTLDevice> device,
                                                           mlir::Operation* op,
                                                           const std::vector<id<MTLBuffer>>& inputs);
 static id<MTLBuffer> NativeIntrinsicGatherRowsHandler(id<MTLDevice> device,
-                                                       id<MTLCommandBuffer> commandBuffer,
-                                                       mlir::Operation* op,
-                                                       const std::vector<id<MTLBuffer>>& inputs);
+                                                      id<MTLCommandBuffer> commandBuffer, mlir::Operation* op,
+                                                      const std::vector<id<MTLBuffer>>& inputs);
 
 enum class IntrinsicNativeKind {
     kNone,
     kReshapeAlias,
+    kTransposeAlias,
     kConstantScalar,
     kIota1D,
     kPad2DNoInterior,
@@ -303,7 +340,13 @@ enum class IntrinsicNativeKind {
     kReduceMaxLastAxis,
     kReduceMinLastAxis,
     kReduceMeanLastAxis,
+    kReduceSumAxis0,
+    kReduceMaxAxis0,
+    kReduceMinAxis0,
+    kReduceMeanAxis0,
+    kSortAsc,
     kSoftmaxLastAxis,
+    kSoftmaxNumeratorLastAxis,
     kLayerNormLastAxis,
     kGatherRows,
     kConvertFp16Fp32,
@@ -395,6 +438,9 @@ static IntrinsicNativeKind ClassifySimpleKind(mlir::Operation* op) {
     if (name == "stablehlo.reshape") {
         return IntrinsicNativeKind::kReshapeAlias;
     }
+    if (name == "stablehlo.transpose") {
+        return IntrinsicNativeKind::kTransposeAlias;
+    }
     if (name == "stablehlo.constant") {
         return IntrinsicNativeKind::kConstantScalar;
     }
@@ -411,6 +457,75 @@ static IntrinsicNativeKind ClassifySimpleKind(mlir::Operation* op) {
         return IntrinsicNativeKind::kGatherRows;
     }
     return IntrinsicNativeKind::kNone;
+}
+
+static bool IsEligibleTransposeAliasOp(mlir::Operation* op) {
+    if (!op || op->getNumOperands() != 1 || op->getNumResults() != 1) {
+        return false;
+    }
+    // Only alias transposes whose result goes directly to the function return
+    // (i.e., no downstream ops consume it within this computation).  Internal
+    // transposes must remain as graph ops because native steps expect contiguous
+    // data in slot buffers.
+    mlir::Value result = op->getResult(0);
+    for (auto& use : result.getUses()) {
+        mlir::Operation* user = use.getOwner();
+        if (!mlir::isa<mlir::func::ReturnOp>(user)) {
+            return false; // consumed by a non-return op → can't alias
+        }
+    }
+    uint64_t inNumel = 0;
+    uint64_t outNumel = 0;
+    MPSDataType inDtype = MPSDataTypeInvalid;
+    MPSDataType outDtype = MPSDataTypeInvalid;
+    if (!GetStaticTensorInfo(op->getOperand(0).getType(), nullptr, &inNumel, &inDtype) ||
+        !GetStaticTensorInfo(op->getResult(0).getType(), nullptr, &outNumel, &outDtype)) {
+        return false;
+    }
+    return inNumel == outNumel && inDtype == outDtype && inNumel > 0;
+}
+
+// Native transpose: handles transposes that swap only the last 2 dims on f32 tensors.
+// These are NOT eligible for alias (result consumed internally), but can use a fast Metal kernel.
+static bool IsEligibleTransposeNativeOp(mlir::Operation* op,
+                                         uint32_t* out_rows = nullptr,
+                                         uint32_t* out_cols = nullptr,
+                                         uint32_t* out_batch = nullptr) {
+    auto transposeOp = mlir::dyn_cast_or_null<mlir::stablehlo::TransposeOp>(op);
+    if (!transposeOp) {
+        return false;
+    }
+    if (op->getNumOperands() != 1 || op->getNumResults() != 1) {
+        return false;
+    }
+    std::vector<int64_t> inShape;
+    MPSDataType dtype = MPSDataTypeInvalid;
+    if (!GetStaticTensorInfo(op->getOperand(0).getType(), &inShape, nullptr, &dtype)) {
+        return false;
+    }
+    if (dtype != MPSDataTypeFloat32 || inShape.size() < 2) {
+        return false;
+    }
+    // Check permutation: only last 2 dims swapped, all others identity
+    auto perm = transposeOp.getPermutation();
+    int64_t rank = static_cast<int64_t>(inShape.size());
+    for (int64_t i = 0; i < rank - 2; ++i) {
+        if (perm[i] != i) return false;
+    }
+    if (perm[rank - 2] != rank - 1 || perm[rank - 1] != rank - 2) {
+        return false;
+    }
+    uint32_t rows = static_cast<uint32_t>(inShape[rank - 2]);
+    uint32_t cols = static_cast<uint32_t>(inShape[rank - 1]);
+    if (rows == 0 || cols == 0) return false;
+    uint32_t batch = 1;
+    for (int64_t i = 0; i < rank - 2; ++i) {
+        batch *= static_cast<uint32_t>(inShape[i]);
+    }
+    if (out_rows) *out_rows = rows;
+    if (out_cols) *out_cols = cols;
+    if (out_batch) *out_batch = batch;
+    return true;
 }
 
 static bool IsEligibleReshapeAliasOp(mlir::Operation* op) {
@@ -529,12 +644,17 @@ static bool IsEligiblePadNativeOp(mlir::Operation* op) {
 // Returns: "add", "mul", "max", "min", or "" for unsupported combiners.
 static std::string ClassifyScatterCombiner(mlir::stablehlo::ScatterOp scatterOp) {
     auto& region = scatterOp.getUpdateComputation();
-    if (region.empty()) return "";
+    if (region.empty())
+        return "";
     for (auto& inner : region.front()) {
-        if (mlir::isa<mlir::stablehlo::AddOp>(inner)) return "add";
-        if (mlir::isa<mlir::stablehlo::MulOp>(inner)) return "mul";
-        if (mlir::isa<mlir::stablehlo::MaxOp>(inner)) return "max";
-        if (mlir::isa<mlir::stablehlo::MinOp>(inner)) return "min";
+        if (mlir::isa<mlir::stablehlo::AddOp>(inner))
+            return "add";
+        if (mlir::isa<mlir::stablehlo::MulOp>(inner))
+            return "mul";
+        if (mlir::isa<mlir::stablehlo::MaxOp>(inner))
+            return "max";
+        if (mlir::isa<mlir::stablehlo::MinOp>(inner))
+            return "min";
     }
     return "";
 }
@@ -621,15 +741,14 @@ static bool IsEligibleGatherRowsNativeOp(mlir::Operation* op) {
     int64_t indexVectorDim = dnums.getIndexVectorDim();
 
     // Must be: offset_dims=[1], collapsed_slice_dims=[0], start_index_map=[0], index_vector_dim=1
-    if (offsetDims.size() != 1 || offsetDims[0] != 1 ||
-        collapsedDims.size() != 1 || collapsedDims[0] != 0 ||
-        startIndexMap.size() != 1 || startIndexMap[0] != 0 ||
-        indexVectorDim != 1) {
+    if (offsetDims.size() != 1 || offsetDims[0] != 1 || collapsedDims.size() != 1 || collapsedDims[0] != 0 ||
+        startIndexMap.size() != 1 || startIndexMap[0] != 0 || indexVectorDim != 1) {
         return false;
     }
 
     std::vector<int64_t> operandShape, indexShape, outShape;
-    MPSDataType operandDtype = MPSDataTypeInvalid, indexDtype = MPSDataTypeInvalid, outDtype = MPSDataTypeInvalid;
+    MPSDataType operandDtype = MPSDataTypeInvalid, indexDtype = MPSDataTypeInvalid,
+                outDtype = MPSDataTypeInvalid;
     if (!GetStaticTensorInfo(op->getOperand(0).getType(), &operandShape, nullptr, &operandDtype) ||
         !GetStaticTensorInfo(op->getOperand(1).getType(), &indexShape, nullptr, &indexDtype) ||
         !GetStaticTensorInfo(op->getResult(0).getType(), &outShape, nullptr, &outDtype)) {
@@ -642,17 +761,21 @@ static bool IsEligibleGatherRowsNativeOp(mlir::Operation* op) {
         return false;
     }
     // indexShape should be [num_indices, 1]
-    if (indexShape[1] != 1) return false;
+    if (indexShape[1] != 1)
+        return false;
     // slice_sizes should be [1, cols]
     auto sliceSizes = gatherOp.getSliceSizes();
     if (sliceSizes.size() != 2 || sliceSizes[0] != 1 || sliceSizes[1] != operandShape[1]) {
         return false;
     }
     // outShape should be [num_indices, cols]
-    if (outShape[0] != indexShape[0] || outShape[1] != operandShape[1]) return false;
-    if (operandShape[0] <= 0 || operandShape[1] <= 0 || indexShape[0] <= 0) return false;
+    if (outShape[0] != indexShape[0] || outShape[1] != operandShape[1])
+        return false;
+    if (operandShape[0] <= 0 || operandShape[1] <= 0 || indexShape[0] <= 0)
+        return false;
     uint64_t total = static_cast<uint64_t>(indexShape[0]) * static_cast<uint64_t>(operandShape[1]);
-    if (total > std::numeric_limits<uint32_t>::max()) return false;
+    if (total > std::numeric_limits<uint32_t>::max())
+        return false;
     return true;
 }
 
@@ -677,13 +800,16 @@ static bool IsNeutralReduceInit(mlir::Value init, IntrinsicNativeKind kind) {
         return false;
     }
     if (kind == IntrinsicNativeKind::kReduceSumLastAxis || kind == IntrinsicNativeKind::kReduceMeanLastAxis ||
+        kind == IntrinsicNativeKind::kReduceSumAxis0 || kind == IntrinsicNativeKind::kReduceMeanAxis0 ||
         kind == IntrinsicNativeKind::kLayerNormLastAxis) {
         return v == 0.0;
     }
-    if (kind == IntrinsicNativeKind::kReduceMaxLastAxis || kind == IntrinsicNativeKind::kSoftmaxLastAxis) {
+    if (kind == IntrinsicNativeKind::kReduceMaxLastAxis || kind == IntrinsicNativeKind::kReduceMaxAxis0 ||
+        kind == IntrinsicNativeKind::kSoftmaxLastAxis ||
+        kind == IntrinsicNativeKind::kSoftmaxNumeratorLastAxis) {
         return std::isinf(v) && v < 0.0;
     }
-    if (kind == IntrinsicNativeKind::kReduceMinLastAxis) {
+    if (kind == IntrinsicNativeKind::kReduceMinLastAxis || kind == IntrinsicNativeKind::kReduceMinAxis0) {
         return std::isinf(v) && v > 0.0;
     }
     return false;
@@ -726,6 +852,7 @@ static bool IsWidenedFp16ReducePattern(mlir::Operation* op) {
 }
 
 static bool IsEligibleReduceNativeOp(mlir::Operation* op, IntrinsicNativeKind kind);
+static bool IsEligibleSortNativeOp(mlir::Operation* op);
 
 static std::optional<double> TraceScalarConstant(mlir::Value value, int depth = 0) {
     if (!value) {
@@ -775,10 +902,16 @@ static bool IsReduceMeanPattern(mlir::Operation* reduceOp,
         return false;
     }
     auto dims = reduce.getDimensions();
-    if (dims.size() != 1 || dims[0] != inType.getRank() - 1) {
+    if (dims.size() != 1) {
         return false;
     }
-    int64_t cols = inType.getShape().back();
+    int64_t axis = dims[0];
+    int64_t rank = inType.getRank();
+    // Accept last-axis or axis-0 on rank-2 tensors
+    if (axis != rank - 1 && !(axis == 0 && rank == 2)) {
+        return false;
+    }
+    int64_t cols = inType.getShape()[axis]; // size of the reduction dimension
     if (cols <= 0) {
         return false;
     }
@@ -878,7 +1011,14 @@ static void FuseReduceMeanPatterns(mlir::Block& block) {
         if (!IsReduceMeanPattern(&operation, c.absorbed_ops, c.final_result)) {
             continue;
         }
-        if (!IsEligibleReduceNativeOp(&operation, IntrinsicNativeKind::kReduceMeanLastAxis)) {
+        // Determine correct kind based on reduce axis
+        auto dims = reduceOp.getDimensions();
+        auto inType = mlir::dyn_cast<mlir::RankedTensorType>(operation.getOperand(0).getType());
+        IntrinsicNativeKind meanKind = IntrinsicNativeKind::kReduceMeanLastAxis;
+        if (inType && dims.size() == 1 && dims[0] == 0 && inType.getRank() == 2) {
+            meanKind = IntrinsicNativeKind::kReduceMeanAxis0;
+        }
+        if (!IsEligibleReduceNativeOp(&operation, meanKind)) {
             continue;
         }
         candidates.push_back(std::move(c));
@@ -959,21 +1099,26 @@ static mlir::Value TraceBroadcastChain(mlir::Value start, llvm::SmallVectorImpl<
 //   reduce_sum(sq) → broadcast → divide_by_N  (var)
 //   add(var, eps) → sqrt → broadcast → divide(diff, sqrt_var_eps)
 static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
-                               llvm::SmallVectorImpl<mlir::Operation*>& absorbed_ops,
-                               mlir::Value& ln_input, mlir::Value& final_result,
-                               float& eps_value) {
+                               llvm::SmallVectorImpl<mlir::Operation*>& absorbed_ops, mlir::Value& ln_input,
+                               mlir::Value& final_result, float& eps_value) {
     auto reduce = mlir::dyn_cast_or_null<mlir::stablehlo::ReduceOp>(reduceSumOp);
-    if (!reduce) return false;
+    if (!reduce)
+        return false;
 
     std::string bodyOp = GetReduceBodyOpName(reduce);
-    if (bodyOp != "stablehlo.add") return false;
-    if (reduce->getNumOperands() < 1 || reduce->getNumResults() != 1) return false;
+    if (bodyOp != "stablehlo.add")
+        return false;
+    if (reduce->getNumOperands() < 1 || reduce->getNumResults() != 1)
+        return false;
 
     auto inType = mlir::dyn_cast<mlir::RankedTensorType>(reduce->getOperand(0).getType());
-    if (!inType || !inType.hasStaticShape() || inType.getRank() == 0) return false;
+    if (!inType || !inType.hasStaticShape() || inType.getRank() == 0)
+        return false;
     auto dims = reduce.getDimensions();
-    if (dims.size() != 1 || dims[0] != inType.getRank() - 1) return false;
-    if (!IsFloat16Or32(MlirTypeToMps(inType.getElementType()))) return false;
+    if (dims.size() != 1 || dims[0] != inType.getRank() - 1)
+        return false;
+    if (!IsFloat16Or32(MlirTypeToMps(inType.getElementType())))
+        return false;
 
     ln_input = reduce->getOperand(0);
     mlir::Value reduceResult = reduce->getResult(0);
@@ -992,12 +1137,14 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
             }
         }
     }
-    if (!meanDivOp) return false;
+    if (!meanDivOp)
+        return false;
 
     mlir::Value meanValue = meanDivOp.getResult();
 
     // Absorb the broadcast chain + constant divisor + div op
-    for (auto* op : meanBroadcastOps) absorbed_ops.push_back(op);
+    for (auto* op : meanBroadcastOps)
+        absorbed_ops.push_back(op);
     if (auto* constDef = meanDivOp.getRhs().getDefiningOp())
         absorbed_ops.push_back(constDef);
     absorbed_ops.push_back(meanDivOp.getOperation());
@@ -1005,7 +1152,8 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
     // mean may be broadcast before subtract
     llvm::SmallVector<mlir::Operation*, 8> meanBcast2;
     mlir::Value broadcastedMean = TraceBroadcastChain(meanValue, meanBcast2);
-    for (auto* op : meanBcast2) absorbed_ops.push_back(op);
+    for (auto* op : meanBcast2)
+        absorbed_ops.push_back(op);
 
     // Find subtract: x - mean (may appear multiple times)
     mlir::stablehlo::SubtractOp subOp1 = nullptr;
@@ -1013,12 +1161,15 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
     for (auto* user : broadcastedMean.getUsers()) {
         if (auto sub = mlir::dyn_cast<mlir::stablehlo::SubtractOp>(user)) {
             if (sub.getLhs() == ln_input && sub.getRhs() == broadcastedMean) {
-                if (!subOp1) subOp1 = sub;
-                else if (!subOp2) subOp2 = sub;
+                if (!subOp1)
+                    subOp1 = sub;
+                else if (!subOp2)
+                    subOp2 = sub;
             }
         }
     }
-    if (!subOp1) return false;
+    if (!subOp1)
+        return false;
 
     // One of the subtract results goes to multiply(diff, diff) for variance
     // The other goes to the final divide for normalization
@@ -1039,7 +1190,7 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
 
     if (checkVariancePath(subOp1)) {
         varSubOp = subOp1;
-        normSubOp = subOp2 ? subOp2 : subOp1;  // If only one subtract, it serves both
+        normSubOp = subOp2 ? subOp2 : subOp1; // If only one subtract, it serves both
     } else if (subOp2 && checkVariancePath(subOp2)) {
         varSubOp = subOp2;
         normSubOp = subOp1;
@@ -1063,7 +1214,8 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
             }
         }
     }
-    if (!squareOp) return false;
+    if (!squareOp)
+        return false;
     absorbed_ops.push_back(squareOp.getOperation());
 
     mlir::Value squareResult = squareOp.getResult();
@@ -1078,14 +1230,16 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
             }
         }
     }
-    if (!varReduceOp || varReduceOp->getNumResults() != 1) return false;
+    if (!varReduceOp || varReduceOp->getNumResults() != 1)
+        return false;
     absorbed_ops.push_back(varReduceOp.getOperation());
 
     // variance reduce → broadcast → divide (var = sum_sq / N)
     mlir::Value varReduceResult = varReduceOp->getResult(0);
     llvm::SmallVector<mlir::Operation*, 8> varBroadcastOps;
     mlir::Value broadcastedVarSum = TraceBroadcastChain(varReduceResult, varBroadcastOps);
-    for (auto* op : varBroadcastOps) absorbed_ops.push_back(op);
+    for (auto* op : varBroadcastOps)
+        absorbed_ops.push_back(op);
 
     mlir::stablehlo::DivOp varDivOp = nullptr;
     for (auto* user : broadcastedVarSum.getUsers()) {
@@ -1096,7 +1250,8 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
             }
         }
     }
-    if (!varDivOp) return false;
+    if (!varDivOp)
+        return false;
     if (auto* constDef = varDivOp.getRhs().getDefiningOp())
         absorbed_ops.push_back(constDef);
     absorbed_ops.push_back(varDivOp.getOperation());
@@ -1111,7 +1266,8 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
             break;
         }
     }
-    if (!epsAddOp) return false;
+    if (!epsAddOp)
+        return false;
 
     // Extract epsilon value
     mlir::Value epsOperand = (epsAddOp.getLhs() == variance) ? epsAddOp.getRhs() : epsAddOp.getLhs();
@@ -1120,7 +1276,8 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
         // eps might be broadcast from a constant
         if (auto* def = epsOperand.getDefiningOp()) {
             if (mlir::isa<mlir::stablehlo::BroadcastInDimOp>(def) && def->getNumOperands() >= 1) {
-                if (!GetScalarFloatConstant(def->getOperand(0), &epsDouble)) return false;
+                if (!GetScalarFloatConstant(def->getOperand(0), &epsDouble))
+                    return false;
                 absorbed_ops.push_back(def);
             } else {
                 return false;
@@ -1144,7 +1301,8 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
             break;
         }
     }
-    if (!sqrtOp) return false;
+    if (!sqrtOp)
+        return false;
     absorbed_ops.push_back(sqrtOp.getOperation());
 
     mlir::Value sqrtResult = sqrtOp.getResult();
@@ -1152,7 +1310,8 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
     // sqrt result broadcast
     llvm::SmallVector<mlir::Operation*, 8> sqrtBroadcastOps;
     mlir::Value broadcastedSqrt = TraceBroadcastChain(sqrtResult, sqrtBroadcastOps);
-    for (auto* op : sqrtBroadcastOps) absorbed_ops.push_back(op);
+    for (auto* op : sqrtBroadcastOps)
+        absorbed_ops.push_back(op);
 
     // final divide: (x - mean) / sqrt(var + eps)
     mlir::stablehlo::DivOp finalDivOp = nullptr;
@@ -1164,7 +1323,8 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
             }
         }
     }
-    if (!finalDivOp) return false;
+    if (!finalDivOp)
+        return false;
 
     // LHS of final divide should be (x - mean)
     mlir::Value normSubResult = normSubOp ? normSubOp.getResult() : varSubOp.getResult();
@@ -1172,8 +1332,10 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
         // Could be that the diff was broadcast
         llvm::SmallVector<mlir::Operation*, 4> diffBcast;
         mlir::Value bcastDiff = TraceBroadcastChain(normSubResult, diffBcast);
-        if (finalDivOp.getLhs() != bcastDiff) return false;
-        for (auto* op : diffBcast) absorbed_ops.push_back(op);
+        if (finalDivOp.getLhs() != bcastDiff)
+            return false;
+        for (auto* op : diffBcast)
+            absorbed_ops.push_back(op);
     }
 
     absorbed_ops.push_back(finalDivOp.getOperation());
@@ -1209,9 +1371,11 @@ static void FuseLayerNormPatterns(mlir::Block& block) {
 
     for (mlir::Operation& operation : block) {
         auto reduceOp = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(&operation);
-        if (!reduceOp) continue;
+        if (!reduceOp)
+            continue;
         std::string bodyOp = GetReduceBodyOpName(reduceOp);
-        if (bodyOp != "stablehlo.add") continue;
+        if (bodyOp != "stablehlo.add")
+            continue;
 
         Candidate c;
         c.reduceOp = reduceOp;
@@ -1232,26 +1396,34 @@ static void FuseLayerNormPatterns(mlir::Block& block) {
 
     for (auto& c : candidates) {
         llvm::SmallPtrSet<mlir::Operation*, 32> absorbedSet;
-        for (auto* op : c.absorbed_ops) absorbedSet.insert(op);
+        for (auto* op : c.absorbed_ops)
+            absorbedSet.insert(op);
         mlir::Operation* finalOp = c.final_result.getDefiningOp();
 
         // Check that absorbed ops don't have external users
         bool canFuse = true;
         for (auto* op : c.absorbed_ops) {
-            if (op == finalOp) continue;
+            if (op == finalOp)
+                continue;
             for (mlir::Value res : op->getResults()) {
                 for (mlir::Operation* user : res.getUsers()) {
-                    if (user == finalOp) continue;
-                    if (absorbedSet.count(user)) continue;
-                    if (user == c.reduceOp.getOperation()) continue;
+                    if (user == finalOp)
+                        continue;
+                    if (absorbedSet.count(user))
+                        continue;
+                    if (user == c.reduceOp.getOperation())
+                        continue;
                     canFuse = false;
                     break;
                 }
-                if (!canFuse) break;
+                if (!canFuse)
+                    break;
             }
-            if (!canFuse) break;
+            if (!canFuse)
+                break;
         }
-        if (!canFuse) continue;
+        if (!canFuse)
+            continue;
 
         MPS_LOG_INFO("layernorm fusion: fusing reduce_sum + var + sqrt + div (eps=%g)\n", c.eps);
 
@@ -1263,12 +1435,12 @@ static void FuseLayerNormPatterns(mlir::Block& block) {
         mlir::OpBuilder builder(c.reduceOp);
         c.reduceOp->setAttr("__layernorm_fused", builder.getUnitAttr());
         // Store eps as a float attribute
-        c.reduceOp->setAttr("__layernorm_eps",
-                            builder.getF32FloatAttr(c.eps));
+        c.reduceOp->setAttr("__layernorm_eps", builder.getF32FloatAttr(c.eps));
 
         // Erase absorbed ops
         llvm::SmallPtrSet<mlir::Operation*, 32> eraseSet;
-        for (auto* op : c.absorbed_ops) eraseSet.insert(op);
+        for (auto* op : c.absorbed_ops)
+            eraseSet.insert(op);
         bool progress = true;
         while (progress) {
             progress = false;
@@ -1282,7 +1454,8 @@ static void FuseLayerNormPatterns(mlir::Block& block) {
                 }
             }
             eraseSet.clear();
-            for (auto* op : remaining) eraseSet.insert(op);
+            for (auto* op : remaining)
+                eraseSet.insert(op);
         }
     }
 }
@@ -1437,10 +1610,152 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
         }
         uint64_t inputNumel = 0;
         if (!GetStaticTensorInfo(c.softmax_input.getType(), nullptr, &inputNumel, nullptr) ||
-            inputNumel < (uint64_t)EnvIntValue("JAX_METALLIB_SOFTMAX_FUSION_MIN_ELEMENTS", 524288)) {
+            inputNumel < (uint64_t)EnvIntValue("JAX_METALLIB_SOFTMAX_FUSION_MIN_ELEMENTS", 1024)) {
             continue;
         }
         candidates.push_back(std::move(c));
+    }
+
+    // --- Softmax numerator pattern: reduce_max → broadcast → sub → exp (final output) ---
+    // This matches exp(x - max(x, axis=-1, keepdims=True)) where exp is the return value.
+    if (candidates.empty()) {
+        struct NumCandidate {
+            mlir::stablehlo::ReduceOp reduceMaxOp;
+            llvm::SmallVector<mlir::Operation*, 8> absorbed_ops;
+            mlir::Value softmax_input;
+            mlir::Value exp_result;
+        };
+        llvm::SmallVector<NumCandidate, 4> num_candidates;
+
+        for (mlir::Operation& operation : block) {
+            auto reduceOp = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(&operation);
+            if (!reduceOp)
+                continue;
+            std::string bodyOp = GetReduceBodyOpName(reduceOp);
+            if (bodyOp != "stablehlo.maximum")
+                continue;
+            if (!IsEligibleReduceNativeOp(&operation, IntrinsicNativeKind::kReduceMaxLastAxis))
+                continue;
+
+            // Check: reduce_max result has one use (broadcast_in_dim)
+            mlir::Value reduceResult = operation.getResult(0);
+            if (!reduceResult.hasOneUse())
+                continue;
+            mlir::Operation* broadcastUser = *reduceResult.getUsers().begin();
+            auto broadcastOp =
+                mlir::dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(broadcastUser);
+            if (!broadcastOp)
+                continue;
+
+            mlir::Value broadcastedMax = broadcastOp.getResult();
+            // Follow chain of broadcast_in_dim ops (keepdims may produce multiple)
+            llvm::SmallVector<mlir::Operation*, 4> extraBroadcasts;
+            while (broadcastedMax.hasOneUse()) {
+                mlir::Operation* user = *broadcastedMax.getUsers().begin();
+                auto nextBroadcast =
+                    mlir::dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(user);
+                if (!nextBroadcast)
+                    break;
+                extraBroadcasts.push_back(nextBroadcast);
+                broadcastedMax = nextBroadcast.getResult();
+            }
+            if (!broadcastedMax.hasOneUse())
+                continue;
+
+            // Check: subtract x - broadcast(max)
+            mlir::Operation* subUser = *broadcastedMax.getUsers().begin();
+            auto subOp = mlir::dyn_cast_or_null<mlir::stablehlo::SubtractOp>(subUser);
+            if (!subOp)
+                continue;
+
+            // Identify the softmax input: lhs of subtract
+            mlir::Value softmax_input = subOp.getLhs();
+            if (subOp.getRhs() != broadcastedMax)
+                continue;
+
+            mlir::Value subResult = subOp.getResult();
+            if (!subResult.hasOneUse())
+                continue;
+
+            // Check: exp(sub_result)
+            mlir::Operation* expUser = *subResult.getUsers().begin();
+            auto expOp = mlir::dyn_cast_or_null<mlir::stablehlo::ExpOp>(expUser);
+            if (!expOp)
+                continue;
+
+            mlir::Value expResult = expOp.getResult();
+            // exp result must have EXACTLY 1 use, and that use must be a
+            // return/func_return op. This prevents matching partial softmax
+            // patterns where exp feeds into reduce_sum.
+            int expUseCount = 0;
+            for ([[maybe_unused]] auto& u : expResult.getUses())
+                expUseCount++;
+            if (expUseCount != 1)
+                continue;
+            // Verify the single use is a return-like op
+            mlir::Operation* expSingleUser = *expResult.getUsers().begin();
+            if (!mlir::isa<mlir::func::ReturnOp>(expSingleUser) &&
+                !mlir::isa<mlir::stablehlo::ReturnOp>(expSingleUser)) {
+                // Not a direct return — could be part of a larger pattern
+                continue;
+            }
+
+            // Also check: the reduce input (operand 0 of reduceOp) comes from softmax_input
+            if (operation.getOperand(0) != softmax_input)
+                continue;
+
+            uint64_t inputNumel = 0;
+            if (!GetStaticTensorInfo(softmax_input.getType(), nullptr, &inputNumel, nullptr) ||
+                inputNumel <
+                    (uint64_t)EnvIntValue("JAX_METALLIB_SOFTMAX_FUSION_MIN_ELEMENTS", 1024))
+                continue;
+
+            NumCandidate nc;
+            nc.reduceMaxOp = reduceOp;
+            nc.softmax_input = softmax_input;
+            nc.exp_result = expResult;
+            // Absorb: broadcasts, sub, exp, and their init value ops
+            nc.absorbed_ops.push_back(broadcastOp);
+            for (auto* eb : extraBroadcasts)
+                nc.absorbed_ops.push_back(eb);
+            nc.absorbed_ops.push_back(subOp);
+            nc.absorbed_ops.push_back(expOp);
+            if (auto* initDef = reduceOp->getOperand(1).getDefiningOp()) {
+                nc.absorbed_ops.push_back(initDef);
+            }
+            num_candidates.push_back(std::move(nc));
+        }
+
+        for (auto& nc : num_candidates) {
+            MPS_LOG_INFO("softmax_numerator fusion: fusing reduce_max + sub + exp\n");
+
+            mlir::Value reduceResult = nc.reduceMaxOp->getResult(0);
+            reduceResult.setType(nc.exp_result.getType());
+            nc.exp_result.replaceAllUsesWith(reduceResult);
+
+            mlir::OpBuilder builder(nc.reduceMaxOp);
+            nc.reduceMaxOp->setAttr("__softmax_numerator_fused", builder.getUnitAttr());
+
+            llvm::SmallPtrSet<mlir::Operation*, 8> eraseSet;
+            for (auto* op : nc.absorbed_ops)
+                eraseSet.insert(op);
+            bool progress = true;
+            while (progress) {
+                progress = false;
+                llvm::SmallVector<mlir::Operation*, 8> remaining;
+                for (auto* op : eraseSet) {
+                    if (op->use_empty()) {
+                        op->erase();
+                        progress = true;
+                    } else {
+                        remaining.push_back(op);
+                    }
+                }
+                eraseSet.clear();
+                for (auto* op : remaining)
+                    eraseSet.insert(op);
+            }
+        }
     }
 
     for (auto& c : candidates) {
@@ -1582,19 +1897,25 @@ static IntrinsicNativeKind ClassifyReduceKind(mlir::Operation* op) {
     if (op->hasAttr("__softmax_fused")) {
         return IntrinsicNativeKind::kSoftmaxLastAxis;
     }
+    if (op->hasAttr("__softmax_numerator_fused")) {
+        return IntrinsicNativeKind::kSoftmaxNumeratorLastAxis;
+    }
     if (op->hasAttr("__layernorm_fused")) {
         return IntrinsicNativeKind::kLayerNormLastAxis;
     }
     if (op->hasAttr("__mean_fused")) {
+        auto dims = reduceOp.getDimensions();
+        auto inType = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType());
+        if (inType && dims.size() == 1 && dims[0] == 0 && inType.getRank() == 2) {
+            return IntrinsicNativeKind::kReduceMeanAxis0;
+        }
         return IntrinsicNativeKind::kReduceMeanLastAxis;
     }
-    std::string bodyOp = GetReduceBodyOpName(reduceOp);
-    if (bodyOp == "stablehlo.add")
-        return IntrinsicNativeKind::kReduceSumLastAxis;
-    if (bodyOp == "stablehlo.maximum")
-        return IntrinsicNativeKind::kReduceMaxLastAxis;
-    if (bodyOp == "stablehlo.minimum")
-        return IntrinsicNativeKind::kReduceMinLastAxis;
+    // Plain reduce ops route to MPSGraph: the graph path fuses the entire
+    // reduce into a single MPSGraphExecutable dispatch, avoiding the separate
+    // command-buffer overhead of the native-only path.  Fused patterns
+    // (softmax, layernorm, mean-fused) stay native because their multi-pass
+    // kernels outperform the graph path.
     return IntrinsicNativeKind::kNone;
 }
 
@@ -1709,18 +2030,28 @@ static bool IsEligibleReduceNativeOp(mlir::Operation* op, IntrinsicNativeKind ki
 
     int64_t axis = dims[0];
     int64_t rank = static_cast<int64_t>(inShape.size());
-    if (axis != rank - 1) {
+    bool is_axis0_kind = (kind == IntrinsicNativeKind::kReduceSumAxis0 ||
+                          kind == IntrinsicNativeKind::kReduceMaxAxis0 ||
+                          kind == IntrinsicNativeKind::kReduceMinAxis0 ||
+                          kind == IntrinsicNativeKind::kReduceMeanAxis0);
+    if (is_axis0_kind) {
+        if (axis != 0 || rank != 2) {
+            return false;
+        }
+    } else {
+        if (axis != rank - 1) {
+            return false;
+        }
+    }
+    int64_t reduce_dim_size = inShape[axis];
+    if (reduce_dim_size <= 0 || reduce_dim_size > std::numeric_limits<uint32_t>::max()) {
         return false;
     }
-    int64_t cols = inShape.back();
-    if (cols <= 0 || cols > std::numeric_limits<uint32_t>::max()) {
-        return false;
-    }
-    if (kind == IntrinsicNativeKind::kSoftmaxLastAxis ||
-        kind == IntrinsicNativeKind::kLayerNormLastAxis) {
+    if (kind == IntrinsicNativeKind::kSoftmaxLastAxis || kind == IntrinsicNativeKind::kLayerNormLastAxis ||
+        kind == IntrinsicNativeKind::kSoftmaxNumeratorLastAxis) {
         return outNumel == inNumel && IsNeutralReduceInit(reduceOp.getInitValues()[0], kind);
     }
-    if (outNumel * static_cast<uint64_t>(cols) != inNumel) {
+    if (outNumel * static_cast<uint64_t>(reduce_dim_size) != inNumel) {
         return false;
     }
     return IsNeutralReduceInit(reduceOp.getInitValues()[0], kind);
@@ -1775,9 +2106,9 @@ static bool ClassifyDotGeneralNN(mlir::Operation* op, uint32_t* out_m, uint32_t*
     if (name != "stablehlo.dot_general") {
         return false;
     }
-    if (!EnvFlagEnabled("JAX_METALLIB_ENABLE_NATIVE_GEMM")) {
-        return false;
-    }
+    // Batched dot_general bypass: check batch dims early to skip env flag gate
+    // for batched cases where native GEMM with grid.z dispatch is much faster
+    // than MPSGraph (which dispatches batch-many separate graph evaluations).
     auto dotOp = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op);
     if (!dotOp) {
         return false;
@@ -1805,32 +2136,76 @@ static bool ClassifyDotGeneralNN(mlir::Operation* op, uint32_t* out_m, uint32_t*
 
     uint32_t M = 0, N = 0, K = 0, batch = 1;
 
-    if (lhsShape.size() == 2 && rhsShape.size() == 2 && lhsBatchDims.empty()) {
+    const int64_t lhs_rank = static_cast<int64_t>(lhsShape.size());
+    const int64_t rhs_rank = static_cast<int64_t>(rhsShape.size());
+    if (lhs_rank != rhs_rank || lhs_rank < 2) {
+        return false;
+    }
+    if (lhsBatchDims.size() != rhsBatchDims.size()) {
+        return false;
+    }
+
+    if (lhs_rank == 2) {
+        if (!lhsBatchDims.empty()) {
+            return false;
+        }
         if (lhsContractingDims[0] != 1 || rhsContractingDims[0] != 0) {
+            return false;
+        }
+        if (lhsShape[1] != rhsShape[0]) {
             return false;
         }
         M = static_cast<uint32_t>(lhsShape[0]);
         K = static_cast<uint32_t>(lhsShape[1]);
         N = static_cast<uint32_t>(rhsShape[1]);
-    } else if (lhsShape.size() == 3 && rhsShape.size() == 3 && lhsBatchDims.size() == 1) {
-        if (lhsBatchDims[0] != 0 || rhsBatchDims[0] != 0) {
-            return false;
-        }
-        if (lhsContractingDims[0] != 2 || rhsContractingDims[0] != 1) {
-            return false;
-        }
-        if (lhsShape[0] != rhsShape[0]) {
-            return false;
-        }
-        batch = static_cast<uint32_t>(lhsShape[0]);
-        M = static_cast<uint32_t>(lhsShape[1]);
-        K = static_cast<uint32_t>(lhsShape[2]);
-        N = static_cast<uint32_t>(rhsShape[2]);
     } else {
-        return false;
+        // Canonical batched matmul: [..., M, K] x [..., K, N] -> [..., M, N]
+        const int64_t expected_batch_dims = lhs_rank - 2;
+        if (static_cast<int64_t>(lhsBatchDims.size()) != expected_batch_dims) {
+            return false;
+        }
+        if (lhsContractingDims[0] != lhs_rank - 1 || rhsContractingDims[0] != rhs_rank - 2) {
+            return false;
+        }
+
+        uint64_t batch64 = 1;
+        for (int64_t i = 0; i < expected_batch_dims; ++i) {
+            if (lhsBatchDims[i] != i || rhsBatchDims[i] != i) {
+                return false;
+            }
+            if (lhsShape[i] != rhsShape[i] || lhsShape[i] <= 0) {
+                return false;
+            }
+            batch64 *= static_cast<uint64_t>(lhsShape[i]);
+            if (batch64 > std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+        }
+
+        const int64_t m_dim = lhs_rank - 2;
+        const int64_t k_lhs_dim = lhs_rank - 1;
+        const int64_t k_rhs_dim = rhs_rank - 2;
+        const int64_t n_dim = rhs_rank - 1;
+        if (lhsShape[k_lhs_dim] != rhsShape[k_rhs_dim]) {
+            return false;
+        }
+        if (lhsShape[m_dim] <= 0 || lhsShape[k_lhs_dim] <= 0 || rhsShape[n_dim] <= 0) {
+            return false;
+        }
+
+        batch = static_cast<uint32_t>(batch64);
+        M = static_cast<uint32_t>(lhsShape[m_dim]);
+        K = static_cast<uint32_t>(lhsShape[k_lhs_dim]);
+        N = static_cast<uint32_t>(rhsShape[n_dim]);
     }
 
     if (M == 0 || N == 0 || K == 0) {
+        return false;
+    }
+    // For non-batched GEMM, require the env flag gate.
+    // For batched GEMM (batch > 1), always use native kernels — grid.z dispatch
+    // is dramatically faster than MPSGraph which runs batch-many separate evaluations.
+    if (batch <= 1 && !EnvFlagEnabled("JAX_METALLIB_ENABLE_NATIVE_GEMM")) {
         return false;
     }
     // Minimum alignment across all GEMM variants: M%32, N%32, K%16.
@@ -1865,7 +2240,7 @@ static bool ClassifyDotGeneralNN(mlir::Operation* op, uint32_t* out_m, uint32_t*
         if (!mpp_likely_available || mpp_disabled) {
             static const int f16_threshold = EnvIntValue("JAX_METALLIB_GEMM_F16_THRESHOLD", 5120);
             if (M <= (uint32_t)f16_threshold && N <= (uint32_t)f16_threshold) {
-                return false;  // Let MPSGraph handle small/medium f16 (faster hardware path)
+                return false; // Let MPSGraph handle small/medium f16 (faster hardware path)
             }
         }
         // With MPP available: intercept all f16 sizes
@@ -1885,11 +2260,107 @@ static bool ClassifyDotGeneralNN(mlir::Operation* op, uint32_t* out_m, uint32_t*
                 int vi = AutotuneGemm(dev, dtypeIdx, M, N, K);
                 [dev release];
                 if (vi == kMpsGraphGemmVariant) {
-                    return false;  // MPSGraph is faster — don't intercept
+                    return false; // MPSGraph is faster — don't intercept
                 }
             }
         }
     }
+
+    if (out_m)
+        *out_m = M;
+    if (out_n)
+        *out_n = N;
+    if (out_k)
+        *out_k = K;
+    if (out_batch)
+        *out_batch = batch;
+    return true;
+}
+
+static const int kNaiveGemmVariant = -3; // Special index: use naive per-element GEMM
+
+// Classify small/unaligned dot_general that fails ClassifyDotGeneralNN's alignment checks.
+// Returns true for M*N <= 8192 (small enough that one-thread-per-element is efficient).
+static bool ClassifyDotGeneralSmall(mlir::Operation* op, uint32_t* out_m, uint32_t* out_n, uint32_t* out_k,
+                                    uint32_t* out_batch) {
+    if (!op || op->getNumOperands() != 2 || op->getNumResults() != 1) {
+        return false;
+    }
+    llvm::StringRef name = op->getName().getStringRef();
+    if (name != "stablehlo.dot_general") {
+        return false;
+    }
+    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_NAIVE_GEMM")) {
+        return false;
+    }
+    auto dotOp = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op);
+    if (!dotOp) {
+        return false;
+    }
+
+    std::vector<int64_t> lhsShape, rhsShape;
+    MPSDataType lhsDtype = MPSDataTypeInvalid;
+    if (!GetStaticTensorInfo(op->getOperand(0).getType(), &lhsShape, nullptr, &lhsDtype) ||
+        !GetStaticTensorInfo(op->getOperand(1).getType(), &rhsShape, nullptr, nullptr)) {
+        return false;
+    }
+    if (lhsDtype != MPSDataTypeFloat32 && lhsDtype != MPSDataTypeFloat16) {
+        return false;
+    }
+
+    auto dimNumbers = dotOp.getDotDimensionNumbers();
+    auto lhsContractingDims = dimNumbers.getLhsContractingDimensions();
+    auto rhsContractingDims = dimNumbers.getRhsContractingDimensions();
+    auto lhsBatchDims = dimNumbers.getLhsBatchingDimensions();
+    auto rhsBatchDims = dimNumbers.getRhsBatchingDimensions();
+
+    if (lhsContractingDims.size() != 1 || rhsContractingDims.size() != 1) {
+        return false;
+    }
+
+    uint32_t M = 0, N = 0, K = 0, batch = 1;
+    const int64_t lhs_rank = static_cast<int64_t>(lhsShape.size());
+    const int64_t rhs_rank = static_cast<int64_t>(rhsShape.size());
+    if (lhs_rank != rhs_rank || lhs_rank < 2) {
+        return false;
+    }
+    if (lhsBatchDims.size() != rhsBatchDims.size()) {
+        return false;
+    }
+
+    if (lhs_rank == 2) {
+        if (!lhsBatchDims.empty()) return false;
+        if (lhsContractingDims[0] != 1 || rhsContractingDims[0] != 0) return false;
+        if (lhsShape[1] != rhsShape[0]) return false;
+        M = static_cast<uint32_t>(lhsShape[0]);
+        K = static_cast<uint32_t>(lhsShape[1]);
+        N = static_cast<uint32_t>(rhsShape[1]);
+    } else {
+        const int64_t expected_batch_dims = lhs_rank - 2;
+        if (static_cast<int64_t>(lhsBatchDims.size()) != expected_batch_dims) return false;
+        if (lhsContractingDims[0] != lhs_rank - 1 || rhsContractingDims[0] != rhs_rank - 2) return false;
+        uint64_t batch64 = 1;
+        for (int64_t i = 0; i < expected_batch_dims; ++i) {
+            if (lhsBatchDims[i] != i || rhsBatchDims[i] != i) return false;
+            if (lhsShape[i] != rhsShape[i] || lhsShape[i] <= 0) return false;
+            batch64 *= static_cast<uint64_t>(lhsShape[i]);
+            if (batch64 > std::numeric_limits<uint32_t>::max()) return false;
+        }
+        const int64_t m_dim = lhs_rank - 2;
+        const int64_t k_lhs_dim = lhs_rank - 1;
+        const int64_t k_rhs_dim = rhs_rank - 2;
+        const int64_t n_dim = rhs_rank - 1;
+        if (lhsShape[k_lhs_dim] != rhsShape[k_rhs_dim]) return false;
+        batch = static_cast<uint32_t>(batch64);
+        M = static_cast<uint32_t>(lhsShape[m_dim]);
+        K = static_cast<uint32_t>(lhsShape[k_lhs_dim]);
+        N = static_cast<uint32_t>(rhsShape[n_dim]);
+    }
+
+    if (M == 0 || N == 0 || K == 0) return false;
+    // Only handle small matrices where naive one-thread-per-element is efficient.
+    // Keep threshold low to avoid intercepting medium matrices (e.g. 64x64).
+    if (static_cast<uint64_t>(M) * N > 2048) return false;
 
     if (out_m) *out_m = M;
     if (out_n) *out_n = N;
@@ -1905,9 +2376,8 @@ static std::unordered_map<uintptr_t, std::unordered_map<std::string, id<MTLCompu
 // --- MPP (MetalPerformancePrimitives) GEMM Pipeline ---
 // Compiled with Metal 3.1+ language version for tensor type support.
 // Returns nil if tensor types are not supported (pre-M3 hardware or older macOS).
-static id<MTLComputePipelineState> GetMppGemmPipeline(id<MTLDevice> device,
-                                                       const std::string& functionName,
-                                                       uint32_t num_simdgroups) {
+static id<MTLComputePipelineState> GetMppGemmPipeline(id<MTLDevice> device, const std::string& functionName,
+                                                      uint32_t num_simdgroups) {
     static std::mutex mu;
     static std::unordered_map<uintptr_t, FastNativeKernelCacheEntry> cache;
     static bool mpp_available_checked = false;
@@ -2058,6 +2528,47 @@ static id<MTLComputePipelineState> GetFastNativePipeline(id<MTLDevice> device,
     return pipeline;
 }
 
+// --- MX Quantized Kernel Pipeline Cache ---
+static id<MTLComputePipelineState> GetMxQuantizedPipeline(id<MTLDevice> device,
+                                                           const std::string& functionName) {
+    static std::mutex mu;
+    static std::unordered_map<uintptr_t, FastNativeKernelCacheEntry> cache;
+
+    std::lock_guard<std::mutex> lock(mu);
+    auto& entry = cache[(uintptr_t)device];
+    if (!entry.library) {
+        NSError* error = nil;
+        entry.library = [device newLibraryWithSource:MxQuantizedKernelSource() options:nil error:&error];
+        if (!entry.library) {
+            MPS_LOG_ERROR("mx-quantized: shader compile failed: %s\n",
+                          error.localizedDescription.UTF8String);
+            return nil;
+        }
+    }
+
+    auto it = entry.pipelines.find(functionName);
+    if (it != entry.pipelines.end()) {
+        return it->second;
+    }
+
+    NSString* fnName = [NSString stringWithUTF8String:functionName.c_str()];
+    id<MTLFunction> fn = [entry.library newFunctionWithName:fnName];
+    if (!fn) {
+        MPS_LOG_ERROR("mx-quantized: kernel not found: %s\n", functionName.c_str());
+        return nil;
+    }
+    NSError* error = nil;
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:fn error:&error];
+    [fn release];
+    if (!pipeline) {
+        MPS_LOG_ERROR("mx-quantized: pipeline creation failed for %s: %s\n",
+                      functionName.c_str(), error.localizedDescription.UTF8String);
+        return nil;
+    }
+    entry.pipelines.emplace(functionName, pipeline);
+    return pipeline;
+}
+
 // --- GEMM Autotuning ---
 
 struct GemmVariant {
@@ -2074,13 +2585,13 @@ static const GemmVariant kGemmVariants[] = {
     {64, 32, 32, 128, "gemm_nn_f32_bm64_bn32_bk32", "gemm_nn_f16_bm64_bn32_bk32"},
 };
 static const int kNumGemmVariants = sizeof(kGemmVariants) / sizeof(kGemmVariants[0]);
-static const int kDefaultGemmVariant = 1;  // BM=64, BN=64, BK=16 (MLX default)
-static const int kMppGemmVariant = -1;     // Special index: use MPP tensor ops path
+static const int kDefaultGemmVariant = 1; // BM=64, BN=64, BK=16 (MLX default)
+static const int kMppGemmVariant = -1;    // Special index: use MPP tensor ops path
 // kMpsGraphGemmVariant = -2 is forward-declared above ClassifyDotGeneralNN
 
 struct AutotuneKey {
     uintptr_t device_id;
-    int dtype;  // 0=f32, 1=f16
+    int dtype; // 0=f32, 1=f16
     uint32_t M, N, K;
     bool operator==(const AutotuneKey& o) const {
         return device_id == o.device_id && dtype == o.dtype && M == o.M && N == o.N && K == o.K;
@@ -2105,12 +2616,11 @@ static std::mutex g_autotune_mutex;
 // of the same arity share a cache entry since they have identical perf profiles.
 struct ElemAutotuneKey {
     uintptr_t device_id;
-    int is_binary;  // 0=unary, 1=binary
-    int dtype;      // 0=f32, 1=f16
+    int is_binary; // 0=unary, 1=binary
+    int dtype;     // 0=f32, 1=f16
     uint64_t numel;
     bool operator==(const ElemAutotuneKey& o) const {
-        return device_id == o.device_id && is_binary == o.is_binary
-            && dtype == o.dtype && numel == o.numel;
+        return device_id == o.device_id && is_binary == o.is_binary && dtype == o.dtype && numel == o.numel;
     }
 };
 
@@ -2137,7 +2647,8 @@ static std::string GetAutotuneCachePath() {
         dir = env;
     } else {
         const char* home = std::getenv("HOME");
-        if (!home) return "";
+        if (!home)
+            return "";
         dir = std::string(home) + "/.cache/jax-silicon";
     }
     // Ensure directory exists
@@ -2146,12 +2657,15 @@ static std::string GetAutotuneCachePath() {
 }
 
 static void SaveAutotuneCacheToDisk() {
-    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_AUTOTUNE_CACHE_PERSIST")) return;
+    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_AUTOTUNE_CACHE_PERSIST"))
+        return;
     std::string path = GetAutotuneCachePath();
-    if (path.empty()) return;
+    if (path.empty())
+        return;
 
     FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return;
+    if (!f)
+        return;
 
     // Write GEMM cache
     {
@@ -2184,43 +2698,61 @@ static void SaveAutotuneCacheToDisk() {
 }
 
 static void LoadAutotuneCacheFromDisk(uintptr_t device_id) {
-    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_AUTOTUNE_CACHE_PERSIST")) return;
+    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_AUTOTUNE_CACHE_PERSIST"))
+        return;
     std::string path = GetAutotuneCachePath();
-    if (path.empty()) return;
+    if (path.empty())
+        return;
 
     FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return;
+    if (!f)
+        return;
 
     // Read GEMM cache
     uint32_t gemm_count = 0;
-    if (fread(&gemm_count, sizeof(gemm_count), 1, f) != 1) { fclose(f); return; }
+    if (fread(&gemm_count, sizeof(gemm_count), 1, f) != 1) {
+        fclose(f);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(g_autotune_mutex);
         for (uint32_t i = 0; i < gemm_count && i < 10000; ++i) {
             AutotuneKey k;
             k.device_id = device_id;
             int v;
-            if (fread(&k.dtype, sizeof(k.dtype), 1, f) != 1) break;
-            if (fread(&k.M, sizeof(k.M), 1, f) != 1) break;
-            if (fread(&k.N, sizeof(k.N), 1, f) != 1) break;
-            if (fread(&k.K, sizeof(k.K), 1, f) != 1) break;
-            if (fread(&v, sizeof(v), 1, f) != 1) break;
+            if (fread(&k.dtype, sizeof(k.dtype), 1, f) != 1)
+                break;
+            if (fread(&k.M, sizeof(k.M), 1, f) != 1)
+                break;
+            if (fread(&k.N, sizeof(k.N), 1, f) != 1)
+                break;
+            if (fread(&k.K, sizeof(k.K), 1, f) != 1)
+                break;
+            if (fread(&v, sizeof(v), 1, f) != 1)
+                break;
             g_autotune_cache[k] = v;
         }
     }
     // Read elementwise cache
     uint32_t elem_count = 0;
-    if (fread(&elem_count, sizeof(elem_count), 1, f) != 1) { fclose(f); return; }
+    if (fread(&elem_count, sizeof(elem_count), 1, f) != 1) {
+        fclose(f);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(g_elem_autotune_mutex);
         for (uint32_t i = 0; i < elem_count && i < 10000; ++i) {
             ElemAutotuneKey k;
             k.device_id = device_id;
             uint8_t bv;
-            if (fread(&k.is_binary, sizeof(k.is_binary), 1, f) != 1) break;
-            if (fread(&k.dtype, sizeof(k.dtype), 1, f) != 1) break;
-            if (fread(&k.numel, sizeof(k.numel), 1, f) != 1) break;
-            if (fread(&bv, sizeof(bv), 1, f) != 1) break;
+            if (fread(&k.is_binary, sizeof(k.is_binary), 1, f) != 1)
+                break;
+            if (fread(&k.dtype, sizeof(k.dtype), 1, f) != 1)
+                break;
+            if (fread(&k.numel, sizeof(k.numel), 1, f) != 1)
+                break;
+            if (fread(&bv, sizeof(bv), 1, f) != 1)
+                break;
             g_elem_autotune_cache[k] = (bv != 0);
         }
     }
@@ -2236,13 +2768,10 @@ static bool GemmVariantFits(const GemmVariant& v, uint32_t M, uint32_t N, uint32
 }
 
 // Forward declaration for use in AutotuneGemm benchmark loop.
-static void DispatchMppGemm(id<MTLComputeCommandEncoder> enc,
-                             id<MTLComputePipelineState> pipeline,
-                             id<MTLBuffer> bufA, size_t offA,
-                             id<MTLBuffer> bufB, size_t offB,
-                             id<MTLBuffer> bufC, size_t offC,
-                             uint32_t M, uint32_t N, uint32_t K,
-                             bool isFloat16);
+static void DispatchMppGemm(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipeline,
+                            id<MTLBuffer> bufA, size_t offA, id<MTLBuffer> bufB, size_t offB,
+                            id<MTLBuffer> bufC, size_t offC, uint32_t M, uint32_t N, uint32_t K,
+                            bool isFloat16);
 
 // Find the best GEMM variant for a given shape via GPU benchmarking.
 // Returns variant index: kMppGemmVariant (-1) for MPP path, or 0..kNumGemmVariants-1 for simdgroup path.
@@ -2281,7 +2810,8 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
                     g_autotune_cache[key] = kMppGemmVariant;
                     return kMppGemmVariant;
                 }
-            } else if (forced >= 0 && forced < kNumGemmVariants && GemmVariantFits(kGemmVariants[forced], M, N, K)) {
+            } else if (forced >= 0 && forced < kNumGemmVariants &&
+                       GemmVariantFits(kGemmVariants[forced], M, N, K)) {
                 std::lock_guard<std::mutex> lock(g_autotune_mutex);
                 g_autotune_cache[key] = forced;
                 return forced;
@@ -2329,7 +2859,7 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
     static const int warmup_iters = EnvIntValue("JAX_METALLIB_GEMM_AUTOTUNE_WARMUP", 5);
     static const int bench_iters = EnvIntValue("JAX_METALLIB_GEMM_AUTOTUNE_ITERS", 10);
 
-    size_t elem_size = (dtype == 1) ? 2 : 4;  // f16 : f32
+    size_t elem_size = (dtype == 1) ? 2 : 4; // f16 : f32
     size_t a_bytes = (size_t)M * K * elem_size;
     size_t b_bytes = (size_t)K * N * elem_size;
     size_t c_bytes = (size_t)M * N * elem_size;
@@ -2345,11 +2875,13 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
 
     for (int vi = 0; vi < kNumGemmVariants; ++vi) {
         const auto& v = kGemmVariants[vi];
-        if (!GemmVariantFits(v, M, N, K)) continue;
+        if (!GemmVariantFits(v, M, N, K))
+            continue;
 
         const char* kname = (dtype == 1) ? v.f16_name : v.f32_name;
         id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kname);
-        if (!pipeline) continue;
+        if (!pipeline)
+            continue;
 
         uint32_t grid_x = M / v.bm;
         uint32_t grid_y = N / v.bn;
@@ -2394,8 +2926,8 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
         double avg_time = total_time / bench_iters;
 
         double tflops = (2.0 * M * N * K) / (avg_time * 1e12);
-        MPS_LOG_WARN("autotune-gemm: simdgroup v%d (%s) M=%u N=%u K=%u time=%.3fms (%.2f TFLOPS)\n",
-                      vi, kname, M, N, K, avg_time * 1000.0, tflops);
+        MPS_LOG_WARN("autotune-gemm: simdgroup v%d (%s) M=%u N=%u K=%u time=%.3fms (%.2f TFLOPS)\n", vi,
+                     kname, M, N, K, avg_time * 1000.0, tflops);
 
         if (avg_time < best_time) {
             best_time = avg_time;
@@ -2412,8 +2944,7 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
             for (int w = 0; w < warmup_iters; ++w) {
                 id<MTLCommandBuffer> cb = [queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                DispatchMppGemm(enc, mppPipeline, tmpA, 0, tmpB, 0, tmpC, 0,
-                                M, N, K, dtype == 1);
+                DispatchMppGemm(enc, mppPipeline, tmpA, 0, tmpB, 0, tmpC, 0, M, N, K, dtype == 1);
                 [enc endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
@@ -2424,8 +2955,7 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
             for (int it = 0; it < bench_iters; ++it) {
                 id<MTLCommandBuffer> cb = [queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                DispatchMppGemm(enc, mppPipeline, tmpA, 0, tmpB, 0, tmpC, 0,
-                                M, N, K, dtype == 1);
+                DispatchMppGemm(enc, mppPipeline, tmpA, 0, tmpB, 0, tmpC, 0, M, N, K, dtype == 1);
                 [enc endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
@@ -2434,8 +2964,8 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
             double mpp_avg = mpp_total_time / bench_iters;
 
             double mpp_tflops = (2.0 * M * N * K) / (mpp_avg * 1e12);
-            MPS_LOG_WARN("autotune-gemm: MPP (%s) M=%u N=%u K=%u time=%.3fms (%.2f TFLOPS)\n",
-                          mpp_kname, M, N, K, mpp_avg * 1000.0, mpp_tflops);
+            MPS_LOG_WARN("autotune-gemm: MPP (%s) M=%u N=%u K=%u time=%.3fms (%.2f TFLOPS)\n", mpp_kname, M,
+                         N, K, mpp_avg * 1000.0, mpp_tflops);
 
             if (mpp_avg < best_time) {
                 best_time = mpp_avg;
@@ -2455,7 +2985,8 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
             MPSGraphTensor* tA = [graph placeholderWithShape:shapeA dataType:mpsdt name:@"A"];
             MPSGraphTensor* tB = [graph placeholderWithShape:shapeB dataType:mpsdt name:@"B"];
             MPSGraphTensor* tC = [graph matrixMultiplicationWithPrimaryTensor:tA
-                                                             secondaryTensor:tB name:@"C"];
+                                                              secondaryTensor:tB
+                                                                         name:@"C"];
 
             MPSGraphDevice* gdev = [MPSGraphDevice deviceWithMTLDevice:device];
             MPSGraphShapedType* stA = [[MPSGraphShapedType alloc] initWithShape:shapeA dataType:mpsdt];
@@ -2469,18 +3000,21 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
 
             if (exec) {
                 MPSGraphTensorData* dataA = [[MPSGraphTensorData alloc] initWithMTLBuffer:tmpA
-                                                                                    shape:shapeA dataType:mpsdt];
+                                                                                    shape:shapeA
+                                                                                 dataType:mpsdt];
                 MPSGraphTensorData* dataB = [[MPSGraphTensorData alloc] initWithMTLBuffer:tmpB
-                                                                                    shape:shapeB dataType:mpsdt];
+                                                                                    shape:shapeB
+                                                                                 dataType:mpsdt];
                 MPSGraphTensorData* dataC = [[MPSGraphTensorData alloc] initWithMTLBuffer:tmpC
-                                                                                    shape:@[@(M), @(N)] dataType:mpsdt];
+                                                                                    shape:@[@(M), @(N)]
+                                                                                 dataType:mpsdt];
 
                 // Warmup
                 for (int w = 0; w < warmup_iters; ++w) {
                     [exec runWithMTLCommandQueue:queue
-                                   inputsArray:@[dataA, dataB]
-                                  resultsArray:@[dataC]
-                           executionDescriptor:nil];
+                                     inputsArray:@[dataA, dataB]
+                                    resultsArray:@[dataC]
+                             executionDescriptor:nil];
                 }
 
                 // Benchmark — wall-clock (MPSGraph manages its own command buffers internally)
@@ -2488,16 +3022,16 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
                 for (int it = 0; it < bench_iters; ++it) {
                     auto t0 = std::chrono::high_resolution_clock::now();
                     [exec runWithMTLCommandQueue:queue
-                                   inputsArray:@[dataA, dataB]
-                                  resultsArray:@[dataC]
-                           executionDescriptor:nil];
+                                     inputsArray:@[dataA, dataB]
+                                    resultsArray:@[dataC]
+                             executionDescriptor:nil];
                     auto t1 = std::chrono::high_resolution_clock::now();
                     graph_total_time += std::chrono::duration<double>(t1 - t0).count();
                 }
                 double graph_avg = graph_total_time / bench_iters;
                 double graph_tflops = (2.0 * M * N * K) / (graph_avg * 1e12);
-                MPS_LOG_WARN("autotune-gemm: MPSGraph M=%u N=%u K=%u time=%.3fms (%.2f TFLOPS)\n",
-                              M, N, K, graph_avg * 1000.0, graph_tflops);
+                MPS_LOG_WARN("autotune-gemm: MPSGraph M=%u N=%u K=%u time=%.3fms (%.2f TFLOPS)\n", M, N, K,
+                             graph_avg * 1000.0, graph_tflops);
 
                 if (graph_avg < best_time) {
                     best_time = graph_avg;
@@ -2514,10 +3048,11 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
 
     {
         double sel_tflops = (2.0 * M * N * K) / (best_time * 1e12);
-        const char* variant_name = (best_variant == kMppGemmVariant) ? " (MPP)" :
-                                   (best_variant == kMpsGraphGemmVariant) ? " (MPSGraph)" : " (simdgroup)";
+        const char* variant_name = (best_variant == kMppGemmVariant)        ? " (MPP)"
+                                   : (best_variant == kMpsGraphGemmVariant) ? " (MPSGraph)"
+                                                                            : " (simdgroup)";
         MPS_LOG_WARN("autotune-gemm: >>> selected variant %d%s for M=%u N=%u K=%u (%.3fms, %.2f TFLOPS)\n",
-                      best_variant, variant_name, M, N, K, best_time * 1000.0, sel_tflops);
+                     best_variant, variant_name, M, N, K, best_time * 1000.0, sel_tflops);
     }
 
     {
@@ -2537,8 +3072,8 @@ static uint32_t ComputeStrideGridSize(uint32_t n4);
 // Returns true if native kernel wins, false if MPSGraph is faster.
 // Compute-bound ops (exp, tanh, sin, etc.) always return true (native wins).
 // Bandwidth-bound ops are benchmarked with representative kernels.
-static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind,
-                                 MPSDataType dtype, uint64_t numel) {
+static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind, MPSDataType dtype,
+                                uint64_t numel) {
     // Load persistent cache on first call
     if (!g_autotune_cache_loaded) {
         g_autotune_cache_loaded = true;
@@ -2570,7 +3105,7 @@ static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind,
     }();
     if (autotune_disabled) {
         std::lock_guard<std::mutex> lock(g_elem_autotune_mutex);
-        g_elem_autotune_cache[key] = true;  // default: keep native
+        g_elem_autotune_cache[key] = true; // default: keep native
         return true;
     }
 
@@ -2581,7 +3116,8 @@ static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind,
     size_t buf_bytes = numel * elem_size;
 
     id<MTLBuffer> tmpA = [device newBufferWithLength:buf_bytes options:MTLResourceStorageModePrivate];
-    id<MTLBuffer> tmpB = is_binary ? [device newBufferWithLength:buf_bytes options:MTLResourceStorageModePrivate] : nil;
+    id<MTLBuffer> tmpB =
+        is_binary ? [device newBufferWithLength:buf_bytes options:MTLResourceStorageModePrivate] : nil;
     id<MTLBuffer> tmpC = [device newBufferWithLength:buf_bytes options:MTLResourceStorageModePrivate];
     id<MTLCommandQueue> queue = [device newCommandQueue];
 
@@ -2590,37 +3126,45 @@ static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind,
     const char* native_kname = nullptr;
     // Select the best vec mode: stride > vec8 > vec4 > scalar
     static const bool stride_disabled = EnvFlagEnabled("JAX_METALLIB_DISABLE_STRIDE_KERNELS");
-    static const uint64_t stride_min = static_cast<uint64_t>(
-        EnvIntValue("JAX_METALLIB_STRIDE_MIN_NUMEL", 1048576));
+    static const uint64_t stride_min =
+        static_cast<uint64_t>(EnvIntValue("JAX_METALLIB_STRIDE_MIN_NUMEL", 1048576));
     bool use_stride = !stride_disabled && (numel % 4 == 0) && numel >= stride_min;
     bool use_vec8 = !use_stride && (numel % 8 == 0) && (dtype == MPSDataTypeFloat16 || numel >= 262144);
     bool use_vec4 = !use_stride && !use_vec8 && (numel % 4 == 0);
-    uint32_t dispatch_n = use_stride ? (uint32_t)(numel / 4) :
-                          use_vec8 ? (uint32_t)(numel / 8) :
-                          use_vec4 ? (uint32_t)(numel / 4) : (uint32_t)numel;
+    uint32_t dispatch_n = use_stride ? (uint32_t)(numel / 4)
+                          : use_vec8 ? (uint32_t)(numel / 8)
+                          : use_vec4 ? (uint32_t)(numel / 4)
+                                     : (uint32_t)numel;
 
     if (is_binary) {
-        if (use_stride) native_kname = (dtype_idx == 1) ? "binary_add_stride_f16" : "binary_add_stride_f32";
-        else if (use_vec8) native_kname = (dtype_idx == 1) ? "binary_add_vec8_f16" : "binary_add_vec8_f32";
-        else if (use_vec4) native_kname = (dtype_idx == 1) ? "binary_add_vec4_f16" : "binary_add_vec4_f32";
-        else native_kname = (dtype_idx == 1) ? "binary_add_f16" : "binary_add_f32";
+        if (use_stride)
+            native_kname = (dtype_idx == 1) ? "binary_add_stride_f16" : "binary_add_stride_f32";
+        else if (use_vec8)
+            native_kname = (dtype_idx == 1) ? "binary_add_vec8_f16" : "binary_add_vec8_f32";
+        else if (use_vec4)
+            native_kname = (dtype_idx == 1) ? "binary_add_vec4_f16" : "binary_add_vec4_f32";
+        else
+            native_kname = (dtype_idx == 1) ? "binary_add_f16" : "binary_add_f32";
     } else {
-        if (use_stride) native_kname = (dtype_idx == 1) ? "unary_abs_stride_f16" : "unary_abs_stride_f32";
-        else if (use_vec8) native_kname = (dtype_idx == 1) ? "unary_abs_vec8_f16" : "unary_abs_vec8_f32";
-        else native_kname = (dtype_idx == 1) ? "unary_abs_f16" : "unary_abs_f32";
+        if (use_stride)
+            native_kname = (dtype_idx == 1) ? "unary_abs_stride_f16" : "unary_abs_stride_f32";
+        else if (use_vec8)
+            native_kname = (dtype_idx == 1) ? "unary_abs_vec8_f16" : "unary_abs_vec8_f32";
+        else
+            native_kname = (dtype_idx == 1) ? "unary_abs_f16" : "unary_abs_f32";
     }
 
     id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, native_kname);
     double native_avg = 1e30;
     if (pipeline) {
         NSUInteger tg_size = [pipeline maxTotalThreadsPerThreadgroup];
-        if (tg_size > 256) tg_size = 256;
+        if (tg_size > 256)
+            tg_size = 256;
         uint32_t grid_threads = use_stride ? ComputeStrideGridSize(dispatch_n) : dispatch_n;
         MTLSize tg = MTLSizeMake(tg_size, 1, 1);
         // For stride: use dispatchThreadgroups (lower overhead); for others: dispatchThreads
         NSUInteger tg_count = ((NSUInteger)grid_threads + tg_size - 1) / tg_size;
-        MTLSize grid = use_stride ? MTLSizeMake(tg_count, 1, 1)
-                                  : MTLSizeMake(grid_threads, 1, 1);
+        MTLSize grid = use_stride ? MTLSizeMake(tg_count, 1, 1) : MTLSizeMake(grid_threads, 1, 1);
 
         // Warmup
         for (int w = 0; w < warmup_iters; ++w) {
@@ -2699,26 +3243,29 @@ static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind,
                                               compilationDescriptor:nil];
                 if (exec) {
                     MPSGraphTensorData* dA = [[MPSGraphTensorData alloc] initWithMTLBuffer:tmpA
-                                                                                     shape:shape dataType:mpsdt];
+                                                                                     shape:shape
+                                                                                  dataType:mpsdt];
                     MPSGraphTensorData* dB = [[MPSGraphTensorData alloc] initWithMTLBuffer:tmpB
-                                                                                     shape:shape dataType:mpsdt];
+                                                                                     shape:shape
+                                                                                  dataType:mpsdt];
                     MPSGraphTensorData* dC = [[MPSGraphTensorData alloc] initWithMTLBuffer:tmpC
-                                                                                     shape:shape dataType:mpsdt];
+                                                                                     shape:shape
+                                                                                  dataType:mpsdt];
                     // Warmup
                     for (int w = 0; w < warmup_iters; ++w) {
                         [exec runWithMTLCommandQueue:queue
-                                       inputsArray:@[dA, dB]
-                                      resultsArray:@[dC]
-                               executionDescriptor:nil];
+                                         inputsArray:@[dA, dB]
+                                        resultsArray:@[dC]
+                                 executionDescriptor:nil];
                     }
                     // Benchmark
                     double graph_total = 0.0;
                     for (int it = 0; it < bench_iters; ++it) {
                         auto t0 = std::chrono::high_resolution_clock::now();
                         [exec runWithMTLCommandQueue:queue
-                                       inputsArray:@[dA, dB]
-                                      resultsArray:@[dC]
-                               executionDescriptor:nil];
+                                         inputsArray:@[dA, dB]
+                                        resultsArray:@[dC]
+                                 executionDescriptor:nil];
                         auto t1 = std::chrono::high_resolution_clock::now();
                         graph_total += std::chrono::duration<double>(t1 - t0).count();
                     }
@@ -2737,24 +3284,26 @@ static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind,
                                               compilationDescriptor:nil];
                 if (exec) {
                     MPSGraphTensorData* dA = [[MPSGraphTensorData alloc] initWithMTLBuffer:tmpA
-                                                                                     shape:shape dataType:mpsdt];
+                                                                                     shape:shape
+                                                                                  dataType:mpsdt];
                     MPSGraphTensorData* dC = [[MPSGraphTensorData alloc] initWithMTLBuffer:tmpC
-                                                                                     shape:shape dataType:mpsdt];
+                                                                                     shape:shape
+                                                                                  dataType:mpsdt];
                     // Warmup
                     for (int w = 0; w < warmup_iters; ++w) {
                         [exec runWithMTLCommandQueue:queue
-                                       inputsArray:@[dA]
-                                      resultsArray:@[dC]
-                               executionDescriptor:nil];
+                                         inputsArray:@[dA]
+                                        resultsArray:@[dC]
+                                 executionDescriptor:nil];
                     }
                     // Benchmark
                     double graph_total = 0.0;
                     for (int it = 0; it < bench_iters; ++it) {
                         auto t0 = std::chrono::high_resolution_clock::now();
                         [exec runWithMTLCommandQueue:queue
-                                       inputsArray:@[dA]
-                                      resultsArray:@[dC]
-                               executionDescriptor:nil];
+                                         inputsArray:@[dA]
+                                        resultsArray:@[dC]
+                                 executionDescriptor:nil];
                         auto t1 = std::chrono::high_resolution_clock::now();
                         graph_total += std::chrono::duration<double>(t1 - t0).count();
                     }
@@ -2765,20 +3314,20 @@ static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind,
     }
 
     [tmpA release];
-    if (tmpB) [tmpB release];
+    if (tmpB)
+        [tmpB release];
     [tmpC release];
     [queue release];
 
-    // Hysteresis: keep native unless MPSGraph is >10% faster.
-    // This avoids noise-driven demotions that break fusion opportunities.
+    // Hysteresis: keep native unless MPSGraph is >margin% faster.
+    // Default 10% margin avoids noise-driven demotions that break fusion opportunities.
     static const double margin = 1.0 + EnvIntValue("JAX_METALLIB_ELEMWISE_AUTOTUNE_MARGIN_PCT", 10) / 100.0;
     bool native_wins = (native_avg <= graph_avg * margin);
     const char* dtype_str = (dtype_idx == 1) ? "f16" : "f32";
-    MPS_LOG_WARN("autotune-elemwise: native %s (%s) numel=%llu time=%.3fms | MPSGraph time=%.3fms (margin=%.0f%%) → %s\n",
-                  native_kname, dtype_str, (unsigned long long)numel,
-                  native_avg * 1000.0, graph_avg * 1000.0,
-                  (margin - 1.0) * 100.0,
-                  native_wins ? "native" : "MPSGraph");
+    MPS_LOG_WARN("autotune-elemwise: native %s (%s) numel=%llu time=%.3fms | MPSGraph time=%.3fms "
+                 "(margin=%.0f%%) → %s\n",
+                 native_kname, dtype_str, (unsigned long long)numel, native_avg * 1000.0, graph_avg * 1000.0,
+                 (margin - 1.0) * 100.0, native_wins ? "native" : "MPSGraph");
 
     {
         std::lock_guard<std::mutex> lock(g_elem_autotune_mutex);
@@ -2791,13 +3340,10 @@ static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind,
 // Helper: dispatch MPP GEMM for one batch slice.
 // The kernel takes raw device pointers + M,N,K dimensions and constructs
 // tensor views internally via make_tensor().
-static void DispatchMppGemm(id<MTLComputeCommandEncoder> enc,
-                             id<MTLComputePipelineState> pipeline,
-                             id<MTLBuffer> bufA, size_t offA,
-                             id<MTLBuffer> bufB, size_t offB,
-                             id<MTLBuffer> bufC, size_t offC,
-                             uint32_t M, uint32_t N, uint32_t K,
-                             bool isFloat16) {
+static void DispatchMppGemm(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pipeline,
+                            id<MTLBuffer> bufA, size_t offA, id<MTLBuffer> bufB, size_t offB,
+                            id<MTLBuffer> bufC, size_t offC, uint32_t M, uint32_t N, uint32_t K,
+                            bool isFloat16) {
     // MPP kernel takes raw device pointers + M,N,K dimensions.
     // The kernel uses make_tensor() internally to construct tensor views.
     // Grid: ceil(N/64) x ceil(M/64) — tgid.x maps to N cols, tgid.y maps to M rows.
@@ -2817,8 +3363,8 @@ static void DispatchMppGemm(id<MTLComputeCommandEncoder> enc,
 }
 
 static id<MTLBuffer> NativeIntrinsicGEMMHandler(id<MTLDevice> device, id<MTLCommandBuffer> commandBuffer,
-                                                 mlir::Operation* op,
-                                                 const std::vector<id<MTLBuffer>>& inputs) {
+                                                mlir::Operation* op,
+                                                const std::vector<id<MTLBuffer>>& inputs) {
     if (!device || !commandBuffer || !op || inputs.size() < 2 || !inputs[0] || !inputs[1]) {
         return nil;
     }
@@ -2833,7 +3379,7 @@ static id<MTLBuffer> NativeIntrinsicGEMMHandler(id<MTLDevice> device, id<MTLComm
     int dtypeIdx = (dtype == MPSDataTypeFloat16) ? 1 : 0;
     int vi = AutotuneGemm(device, dtypeIdx, M, N, K);
     if (vi == kMpsGraphGemmVariant) {
-        return nil;  // Safety fallback: MPSGraph won, shouldn't reach here
+        return nil; // Safety fallback: MPSGraph won, shouldn't reach here
     }
 
     size_t outBytes = ByteSizeFromType(op->getResult(0).getType());
@@ -2854,7 +3400,7 @@ static id<MTLBuffer> NativeIntrinsicGEMMHandler(id<MTLDevice> device, id<MTLComm
     size_t elem_size = (dtype == MPSDataTypeFloat16) ? 2 : 4;
 
     if (vi == kMppGemmVariant) {
-        // MPP tensor ops path
+        // MPP tensor ops path — single dispatch with grid.z = batch
         const char* kernelName = (dtypeIdx == 1) ? "gemm_mpp_f16" : "gemm_mpp_f32";
         id<MTLComputePipelineState> pipeline = GetMppGemmPipeline(device, kernelName, 4);
         if (!pipeline) {
@@ -2862,15 +3408,20 @@ static id<MTLBuffer> NativeIntrinsicGEMMHandler(id<MTLDevice> device, id<MTLComm
             CFRelease((__bridge CFTypeRef)outBuf);
             return nil;
         }
-        // MPP default mode is multiply (C = A*B), no need to zero output.
-        for (uint32_t b = 0; b < batch; ++b) {
-            size_t a_off = (size_t)b * M * K * elem_size;
-            size_t b_off = (size_t)b * K * N * elem_size;
-            size_t c_off = (size_t)b * M * N * elem_size;
-            DispatchMppGemm(enc, pipeline, inputs[0], a_off, inputs[1], b_off, outBuf, c_off, M, N, K, dtypeIdx == 1);
-        }
+        uint32_t grid_m = (M + 63) / 64;
+        uint32_t grid_n = (N + 63) / 64;
+        uint32_t num_threads = [pipeline threadExecutionWidth] * 4;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:inputs[0] offset:0 atIndex:0];
+        [enc setBuffer:inputs[1] offset:0 atIndex:1];
+        [enc setBuffer:outBuf offset:0 atIndex:2];
+        [enc setBytes:&M length:sizeof(M) atIndex:3];
+        [enc setBytes:&N length:sizeof(N) atIndex:4];
+        [enc setBytes:&K length:sizeof(K) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(grid_n, grid_m, batch)
+            threadsPerThreadgroup:MTLSizeMake(num_threads, 1, 1)];
     } else {
-        // Simdgroup MMA path
+        // Simdgroup MMA path — single dispatch with grid.z = batch
         const auto& variant = kGemmVariants[vi];
         const char* kernelName = (dtypeIdx == 1) ? variant.f16_name : variant.f32_name;
         id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kernelName);
@@ -2883,21 +3434,15 @@ static id<MTLBuffer> NativeIntrinsicGEMMHandler(id<MTLDevice> device, id<MTLComm
         uint32_t grid_x = M / variant.bm;
         uint32_t grid_y = N / variant.bn;
 
-        for (uint32_t b = 0; b < batch; ++b) {
-            size_t a_off = (size_t)b * M * K * elem_size;
-            size_t b_off = (size_t)b * K * N * elem_size;
-            size_t c_off = (size_t)b * M * N * elem_size;
-
-            [enc setComputePipelineState:pipeline];
-            [enc setBuffer:inputs[0] offset:a_off atIndex:0];
-            [enc setBuffer:inputs[1] offset:b_off atIndex:1];
-            [enc setBuffer:outBuf offset:c_off atIndex:2];
-            [enc setBytes:&M length:sizeof(M) atIndex:3];
-            [enc setBytes:&N length:sizeof(N) atIndex:4];
-            [enc setBytes:&K length:sizeof(K) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
-                threadsPerThreadgroup:MTLSizeMake(variant.num_threads, 1, 1)];
-        }
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:inputs[0] offset:0 atIndex:0];
+        [enc setBuffer:inputs[1] offset:0 atIndex:1];
+        [enc setBuffer:outBuf offset:0 atIndex:2];
+        [enc setBytes:&M length:sizeof(M) atIndex:3];
+        [enc setBytes:&N length:sizeof(N) atIndex:4];
+        [enc setBytes:&K length:sizeof(K) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, batch)
+            threadsPerThreadgroup:MTLSizeMake(variant.num_threads, 1, 1)];
     }
 
     [enc endEncoding];
@@ -3090,8 +3635,7 @@ static std::string ElementwiseStrideKernelFunctionName(IntrinsicNativeKind kind,
 
 // Compute capped grid size for stride kernels
 static uint32_t ComputeStrideGridSize(uint32_t n4) {
-    static const uint32_t cap = static_cast<uint32_t>(
-        EnvIntValue("JAX_METALLIB_STRIDE_GRID_CAP", 65536));
+    static const uint32_t cap = static_cast<uint32_t>(EnvIntValue("JAX_METALLIB_STRIDE_GRID_CAP", 65536));
     return (n4 < cap) ? n4 : cap;
 }
 
@@ -3447,6 +3991,14 @@ static std::string ReduceKernelFunctionName(IntrinsicNativeKind kind, MPSDataTyp
             return f16 ? "reduce_mean_last_f16_tg" : "reduce_mean_last_f32_tg";
         }
         return f16 ? "reduce_mean_last_f16_lin" : "reduce_mean_last_f32_lin";
+    case IntrinsicNativeKind::kReduceSumAxis0:
+        return f16 ? "reduce_sum_axis0_f16" : "reduce_sum_axis0_f32";
+    case IntrinsicNativeKind::kReduceMaxAxis0:
+        return f16 ? "reduce_max_axis0_f16" : "reduce_max_axis0_f32";
+    case IntrinsicNativeKind::kReduceMinAxis0:
+        return f16 ? "reduce_min_axis0_f16" : "reduce_min_axis0_f32";
+    case IntrinsicNativeKind::kReduceMeanAxis0:
+        return f16 ? "reduce_mean_axis0_f16" : "reduce_mean_axis0_f32";
     default:
         return "";
     }
@@ -3602,12 +4154,11 @@ static id<MTLBuffer> NativeIntrinsicElementwiseHandler(id<MTLDevice> device,
 
     // Stride kernels: top tier for large tensors — grid-stride loop for high bandwidth utilization
     const bool stride_disabled = EnvFlagEnabled("JAX_METALLIB_DISABLE_STRIDE_KERNELS");
-    static const uint64_t stride_min_numel = static_cast<uint64_t>(
-        EnvIntValue("JAX_METALLIB_STRIDE_MIN_NUMEL",
-                     1048576));  // 1M elements default (~4MB f32)
-    const bool stride_candidate =
-        !stride_disabled && !vec_disabled && IsFloat16Or32(dtype) && (numel % 4 == 0) &&
-        numel >= stride_min_numel;
+    static const uint64_t stride_min_numel =
+        static_cast<uint64_t>(EnvIntValue("JAX_METALLIB_STRIDE_MIN_NUMEL",
+                                          1048576)); // 1M elements default (~4MB f32)
+    const bool stride_candidate = !stride_disabled && !vec_disabled && IsFloat16Or32(dtype) &&
+                                  (numel % 4 == 0) && numel >= stride_min_numel;
     std::string strideName = stride_candidate ? ElementwiseStrideKernelFunctionName(kind, dtype) : "";
     const bool use_stride = !strideName.empty();
 
@@ -3688,7 +4239,7 @@ static id<MTLBuffer> NativeIntrinsicElementwiseHandler(id<MTLDevice> device,
         NSUInteger tg = ResolveLinearThreadgroupSize(pipeline, dtype);
         NSUInteger tg_count = ((NSUInteger)grid_threads + tg - 1) / tg;
         [encoder dispatchThreadgroups:MTLSizeMake(tg_count, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     } else {
         EncodeLinearDispatch(encoder, pipeline, n, dtype);
     }
@@ -3723,15 +4274,29 @@ static id<MTLBuffer> NativeIntrinsicReduceHandler(id<MTLDevice> device, id<MTLCo
         outNumel > std::numeric_limits<uint32_t>::max()) {
         return nil;
     }
-    int64_t cols64 = inShape.back();
-    if (cols64 <= 0 || cols64 > std::numeric_limits<uint32_t>::max()) {
-        return nil;
+    bool is_axis0 = (kind == IntrinsicNativeKind::kReduceSumAxis0 ||
+                     kind == IntrinsicNativeKind::kReduceMaxAxis0 ||
+                     kind == IntrinsicNativeKind::kReduceMinAxis0 ||
+                     kind == IntrinsicNativeKind::kReduceMeanAxis0);
+
+    uint32_t rows, cols;
+    bool use_threadgroup;
+    if (is_axis0) {
+        // Axis-0 reduce on [R, C]: rows = reduce dim, cols = output dim
+        rows = static_cast<uint32_t>(inShape[0]);
+        cols = static_cast<uint32_t>(inShape[1]);
+        use_threadgroup = false;
+    } else {
+        int64_t cols64 = inShape.back();
+        if (cols64 <= 0 || cols64 > std::numeric_limits<uint32_t>::max()) {
+            return nil;
+        }
+        cols = static_cast<uint32_t>(cols64);
+        rows = static_cast<uint32_t>(outNumel);
+        const uint32_t tg_cols_threshold =
+            static_cast<uint32_t>(EnvIntValue("JAX_METALLIB_REDUCE_TG_COLS_THRESHOLD", 512));
+        use_threadgroup = cols >= tg_cols_threshold;
     }
-    uint32_t cols = static_cast<uint32_t>(cols64);
-    uint32_t rows = static_cast<uint32_t>(outNumel);
-    const uint32_t tg_cols_threshold =
-        static_cast<uint32_t>(EnvIntValue("JAX_METALLIB_REDUCE_TG_COLS_THRESHOLD", 512));
-    const bool use_threadgroup = cols >= tg_cols_threshold;
 
     std::string kernelName = ReduceKernelFunctionName(kind, dtype, use_threadgroup);
     if (kernelName.empty()) {
@@ -3760,7 +4325,8 @@ static id<MTLBuffer> NativeIntrinsicReduceHandler(id<MTLDevice> device, id<MTLCo
     if (use_threadgroup) {
         EncodeRowReduceDispatch(encoder, pipeline, rows, cols);
     } else {
-        EncodeLinearDispatch(encoder, pipeline, rows, dtype);
+        uint32_t dispatch_count = is_axis0 ? cols : rows;
+        EncodeLinearDispatch(encoder, pipeline, dispatch_count, dtype);
     }
     [encoder endEncoding];
     return out;
@@ -3897,6 +4463,9 @@ static bool WriteScalarConstantData(mlir::stablehlo::ConstantOp constOp, MPSData
     return false;
 }
 
+// Forward declarations for sort constants (used in BakeNativeStep, defined with IsEligibleSortNativeOp)
+static constexpr uint32_t kMaxNativeSortElements = 8192;
+
 static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
     if (!device || !ns || !ns->op) {
         return false;
@@ -3908,6 +4477,29 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
     if (simpleKind == IntrinsicNativeKind::kReshapeAlias && IsEligibleReshapeAliasOp(op)) {
         ns->baked_kind = NativeStep::BakedKind::kReshapeAlias;
         return true;
+    }
+    if (simpleKind == IntrinsicNativeKind::kTransposeAlias && IsEligibleTransposeAliasOp(op)) {
+        ns->baked_kind = NativeStep::BakedKind::kTransposeAlias;
+        return true;
+    }
+    // Native transpose: swap last 2 dims using a fast Metal kernel
+    if (simpleKind == IntrinsicNativeKind::kTransposeAlias) {
+        uint32_t rows = 0, cols = 0, batch = 1;
+        if (IsEligibleTransposeNativeOp(op, &rows, &cols, &batch)) {
+            id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, "transpose2d_f32");
+            if (pipeline) {
+                ns->baked_kind = NativeStep::BakedKind::kTranspose2D;
+                ns->baked_pipeline = pipeline;
+                ns->baked_transpose_rows = rows;
+                ns->baked_transpose_cols = cols;
+                ns->baked_transpose_batch = batch;
+                uint32_t grid_x = (cols + 31) / 32;
+                uint32_t grid_y = (rows + 31) / 32;
+                ns->baked_grid = MTLSizeMake(grid_x, grid_y, batch);
+                ns->baked_tg = MTLSizeMake(32, 8, 1);
+                return true;
+            }
+        }
     }
 
     if (simpleKind == IntrinsicNativeKind::kConstantScalar && IsEligibleConstantScalarOp(op)) {
@@ -3923,6 +4515,7 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
         if (outBytes == 0) {
             return false;
         }
+        // Constants need CPU write → use Shared storage.
         id<MTLBuffer> buf = [device newBufferWithLength:outBytes options:ComputeBufferResourceOptions()];
         if (!buf || !WriteScalarConstantData(constOp, dtype, [buf contents])) {
             if (buf) {
@@ -4084,24 +4677,20 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
 
         // Stride kernels: top tier for large tensors
         const bool stride_disabled = EnvFlagEnabled("JAX_METALLIB_DISABLE_STRIDE_KERNELS");
-        static const uint64_t stride_min_numel = static_cast<uint64_t>(
-            EnvIntValue("JAX_METALLIB_STRIDE_MIN_NUMEL", 1048576));
-        const bool stride_candidate =
-            !stride_disabled && !vec_disabled && IsFloat16Or32(dtype) && (numel % 4 == 0) &&
-            numel >= stride_min_numel;
-        std::string strideName =
-            stride_candidate ? ElementwiseStrideKernelFunctionName(elemKind, dtype) : "";
+        static const uint64_t stride_min_numel =
+            static_cast<uint64_t>(EnvIntValue("JAX_METALLIB_STRIDE_MIN_NUMEL", 1048576));
+        const bool stride_candidate = !stride_disabled && !vec_disabled && IsFloat16Or32(dtype) &&
+                                      (numel % 4 == 0) && numel >= stride_min_numel;
+        std::string strideName = stride_candidate ? ElementwiseStrideKernelFunctionName(elemKind, dtype) : "";
         const bool use_stride = !strideName.empty();
 
         const uint64_t vec8_min_numel = (dtype == MPSDataTypeFloat32) ? 262144u : 8u;
-        const bool vec8_candidate =
-            !use_stride && !vec_disabled && IsFloat16Or32(dtype) && (numel % 8 == 0) &&
-            numel >= vec8_min_numel;
+        const bool vec8_candidate = !use_stride && !vec_disabled && IsFloat16Or32(dtype) &&
+                                    (numel % 8 == 0) && numel >= vec8_min_numel;
         std::string vec8Name = vec8_candidate ? ElementwiseVec8KernelFunctionName(elemKind, dtype) : "";
         const bool use_vec8 = !vec8Name.empty();
-        const bool use_vec4 =
-            !use_vec8 && !use_stride && !vec_disabled && vec4_dtype_ok && supports_vec4_kind &&
-            (numel % 4 == 0);
+        const bool use_vec4 = !use_vec8 && !use_stride && !vec_disabled && vec4_dtype_ok &&
+                              supports_vec4_kind && (numel % 4 == 0);
         std::string kernelName;
         if (use_stride) {
             kernelName = std::move(strideName);
@@ -4182,6 +4771,29 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
             return true;
         }
 
+        if (reduceKind == IntrinsicNativeKind::kSoftmaxNumeratorLastAxis) {
+            // Fused softmax numerator: single kernel exp(x - max(x, axis=-1))
+            // Uses threadgroup memory to cache row data (1 global read + 1 global write).
+            const bool f16 = (dtype == MPSDataTypeFloat16);
+            // Only use TG kernel if cols fit in threadgroup memory (32KB max → 8K floats)
+            if (cols <= 8192) {
+                std::string kname = f16 ? "softmax_numerator_f16_tg" : "softmax_numerator_f32_tg";
+                id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kname);
+                if (pipeline) {
+                    ns->baked_kind = NativeStep::BakedKind::kSoftmax;
+                    ns->baked_pipeline = pipeline;
+                    ns->baked_softmax_pass2_pipeline = nil; // single-pass, no pass2
+                    ns->baked_softmax_maxsum = nil;
+                    ns->baked_rows = rows;
+                    ns->baked_cols = cols;
+                    ComputeRowReduceDispatchConfig(pipeline, rows, cols, &ns->baked_grid, &ns->baked_tg);
+                    return true;
+                }
+            }
+            // Fallback: let it go to graph
+            return false;
+        }
+
         if (reduceKind == IntrinsicNativeKind::kLayerNormLastAxis) {
             const bool f16 = (dtype == MPSDataTypeFloat16);
             std::string pass1Name = f16 ? "layernorm_pass1_f16_tg" : "layernorm_pass1_f32_tg";
@@ -4195,7 +4807,8 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
             size_t statsBytes = (size_t)rows * 2 * sizeof(float);
             id<MTLBuffer> statsBuf = [device newBufferWithLength:statsBytes
                                                          options:ComputeBufferResourceOptions()];
-            if (!statsBuf) return false;
+            if (!statsBuf)
+                return false;
 
             // Extract eps from the fused attribute
             float eps = 1e-5f;
@@ -4215,6 +4828,31 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
             uint32_t totalElements = rows * cols;
             ComputeLinearDispatchConfig(p2, totalElements, &ns->baked_layernorm_pass2_grid,
                                         &ns->baked_layernorm_pass2_tg, dtype);
+            return true;
+        }
+
+        bool is_axis0 = (reduceKind == IntrinsicNativeKind::kReduceSumAxis0 ||
+                         reduceKind == IntrinsicNativeKind::kReduceMaxAxis0 ||
+                         reduceKind == IntrinsicNativeKind::kReduceMinAxis0 ||
+                         reduceKind == IntrinsicNativeKind::kReduceMeanAxis0);
+        if (is_axis0) {
+            // Axis-0 reduce on [R, C]: rows = reduce dim (R), cols = output dim (C)
+            // Kernel: each thread handles one column, loops over rows.
+            // use_threadgroup is false (no TG variant needed for axis-0).
+            std::string kernelName = ReduceKernelFunctionName(reduceKind, dtype, false);
+            if (kernelName.empty()) {
+                return false;
+            }
+            id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kernelName);
+            if (!pipeline) {
+                return false;
+            }
+            ns->baked_kind = NativeStep::BakedKind::kReduce;
+            ns->baked_pipeline = pipeline;
+            ns->baked_rows = static_cast<uint32_t>(inShape[0]); // reduce dimension
+            ns->baked_cols = static_cast<uint32_t>(inShape[1]); // output dimension
+            ns->baked_reduce_threadgroup = false;
+            ComputeLinearDispatchConfig(pipeline, ns->baked_cols, &ns->baked_grid, &ns->baked_tg, dtype);
             return true;
         }
 
@@ -4289,7 +4927,7 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
             int dtypeIdx = (dtype == MPSDataTypeFloat16) ? 1 : 0;
             int vi = AutotuneGemm(device, dtypeIdx, gM, gN, gK);
             if (vi == kMpsGraphGemmVariant) {
-                return false;  // Safety fallback: MPSGraph won, shouldn't reach baking
+                return false; // Safety fallback: MPSGraph won, shouldn't reach baking
             }
 
             id<MTLComputePipelineState> pipeline = nil;
@@ -4299,16 +4937,18 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
             if (vi == kMppGemmVariant) {
                 const char* kernelName = (dtypeIdx == 1) ? "gemm_mpp_f16" : "gemm_mpp_f32";
                 pipeline = GetMppGemmPipeline(device, kernelName, 4);
-                if (!pipeline) return false;
+                if (!pipeline)
+                    return false;
                 // MPP: ceil division for edge-check tiles
-                grid_x = (gN + 63) / 64;  // N tiles (tgid.x)
-                grid_y = (gM + 63) / 64;  // M tiles (tgid.y)
+                grid_x = (gN + 63) / 64; // N tiles (tgid.x)
+                grid_y = (gM + 63) / 64; // M tiles (tgid.y)
                 num_threads = [pipeline threadExecutionWidth] * 4;
             } else {
                 const auto& variant = kGemmVariants[vi];
                 const char* kernelName = (dtypeIdx == 1) ? variant.f16_name : variant.f32_name;
                 pipeline = GetFastNativePipeline(device, kernelName);
-                if (!pipeline) return false;
+                if (!pipeline)
+                    return false;
                 grid_x = gM / variant.bm;
                 grid_y = gN / variant.bn;
                 num_threads = variant.num_threads;
@@ -4321,9 +4961,113 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
             ns->baked_gemm_k = gK;
             ns->baked_gemm_batch = gBatch;
             ns->baked_gemm_variant = vi;
-            ns->baked_grid = MTLSizeMake(grid_x, grid_y, 1);
+            ns->baked_grid = MTLSizeMake(grid_x, grid_y, gBatch);
             ns->baked_tg = MTLSizeMake(num_threads, 1, 1);
             return true;
+        }
+    }
+
+    // --- Small/unaligned GEMM baking (fallback for matrices that fail ClassifyDotGeneralNN) ---
+    {
+        uint32_t gM = 0, gN = 0, gK = 0, gBatch = 0;
+        if (ClassifyDotGeneralSmall(op, &gM, &gN, &gK, &gBatch)) {
+            MPSDataType dtype = MPSDataTypeInvalid;
+            if (!GetStaticTensorInfo(op->getOperand(0).getType(), nullptr, nullptr, &dtype)) {
+                return false;
+            }
+
+            // CPU BLAS fallback for tiny f32 matmuls — avoids GPU dispatch overhead
+            uint64_t flops = (uint64_t)gM * gN * gK;
+            if (dtype == MPSDataTypeFloat32 && gBatch == 1 && flops < 200000) {
+                ns->baked_kind = NativeStep::BakedKind::kCpuBLAS;
+                ns->baked_gemm_m = gM;
+                ns->baked_gemm_n = gN;
+                ns->baked_gemm_k = gK;
+                ns->baked_gemm_batch = 1;
+                return true;
+            }
+
+            const char* kernelName = (dtype == MPSDataTypeFloat16) ? "gemm_naive_f16" : "gemm_naive_f32";
+            id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kernelName);
+            if (!pipeline) {
+                return false;
+            }
+            uint32_t tg_x = std::min(gN, (uint32_t)16);
+            uint32_t tg_y = std::min(gM, (uint32_t)16);
+
+            ns->baked_kind = NativeStep::BakedKind::kGEMM;
+            ns->baked_pipeline = pipeline;
+            ns->baked_gemm_m = gM;
+            ns->baked_gemm_n = gN;
+            ns->baked_gemm_k = gK;
+            ns->baked_gemm_batch = gBatch;
+            ns->baked_gemm_variant = kNaiveGemmVariant;
+            // Grid: ceil(N/tg_x) x ceil(M/tg_y) x batch threadgroups
+            ns->baked_grid = MTLSizeMake((gN + tg_x - 1) / tg_x, (gM + tg_y - 1) / tg_y, gBatch);
+            ns->baked_tg = MTLSizeMake(tg_x, tg_y, 1);
+            return true;
+        }
+    }
+
+    // --- Sort baking ---
+    if (IsEligibleSortNativeOp(op)) {
+        std::vector<int64_t> inShape;
+        if (!GetStaticTensorInfo(op->getOperand(0).getType(), &inShape, nullptr, nullptr) || inShape.empty()) {
+            return false;
+        }
+        uint32_t num_rows = 1;
+        uint32_t n;
+        if (inShape.size() == 1) {
+            n = static_cast<uint32_t>(inShape[0]);
+        } else {
+            // 2D: sort each row independently
+            num_rows = static_cast<uint32_t>(inShape[0]);
+            n = static_cast<uint32_t>(inShape[1]);
+        }
+
+        uint32_t padded_n = 1;
+        while (padded_n < n) padded_n <<= 1;
+
+        const char* kernelName = (num_rows > 1) ? "bitonic_sort_rows_asc_f32" : "bitonic_sort_asc_f32";
+        id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kernelName);
+        if (!pipeline) {
+            return false;
+        }
+        // Use 32 threads per TG (= 1 simdgroup on Apple GPUs). Threads in a
+        // simdgroup execute in lockstep, making threadgroup_barrier essentially free.
+        // Combined with bitwise-optimized inner loop, this gives best perf for small rows.
+        NSUInteger tg_size = std::min((NSUInteger)32, std::min((NSUInteger)(padded_n / 2), (NSUInteger)1024));
+        if (tg_size == 0) tg_size = 1;
+
+        ns->baked_kind = NativeStep::BakedKind::kSort;
+        ns->baked_pipeline = pipeline;
+        ns->baked_sort_n = n;
+        ns->baked_sort_padded_n = padded_n;
+        ns->baked_sort_num_rows = num_rows;
+        ns->baked_grid = MTLSizeMake(num_rows, 1, 1);
+        ns->baked_tg = MTLSizeMake(tg_size, 1, 1);
+        return true;
+    }
+
+    // --- CPU Cholesky baking (LAPACK spotrf_ for small matrices) ---
+    {
+        auto choleskyOp = mlir::dyn_cast_or_null<mlir::stablehlo::CholeskyOp>(op);
+        if (choleskyOp) {
+            auto resultType = mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
+            auto shape = resultType.getShape();
+            if (shape.size() == 2 && resultType.getElementType().isF32()) {
+                int64_t n = shape.back();
+                if (shape[shape.size() - 2] == n && n > 0 && n <= 256) {
+                    bool lower = true;
+                    if (choleskyOp.getLowerAttr()) {
+                        lower = choleskyOp.getLower();
+                    }
+                    ns->baked_kind = NativeStep::BakedKind::kCpuCholesky;
+                    ns->baked_cholesky_n = static_cast<uint32_t>(n);
+                    ns->baked_cholesky_lower = lower;
+                    return true;
+                }
+            }
         }
     }
 
@@ -4349,18 +5093,7 @@ static id<MTLBuffer> NativeIntrinsicConstantHandler(id<MTLDevice> device, id<MTL
         return nil;
     }
 
-    static std::mutex mu;
-    static std::unordered_map<ConstantBufferKey, id<MTLBuffer>, ConstantBufferKeyHash> cache;
-    ConstantBufferKey key{(uintptr_t)device, op};
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        auto it = cache.find(key);
-        if (it != cache.end() && it->second) {
-            CFRetain((__bridge CFTypeRef)it->second);
-            return it->second;
-        }
-    }
-
+    // Constants need CPU write → use Shared storage.
     id<MTLBuffer> buf = [device newBufferWithLength:outBytes options:ComputeBufferResourceOptions()];
     if (!buf || !WriteScalarConstantData(constOp, dtype, [buf contents])) {
         if (buf) {
@@ -4368,12 +5101,6 @@ static id<MTLBuffer> NativeIntrinsicConstantHandler(id<MTLDevice> device, id<MTL
         }
         return nil;
     }
-
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        cache.emplace(key, buf);
-    }
-    CFRetain((__bridge CFTypeRef)buf);
     return buf;
 }
 
@@ -4574,11 +5301,10 @@ static id<MTLBuffer> NativeIntrinsicScatterAddRowsHandler(id<MTLDevice> device,
 
 // Non-baked handler for native gather (embedding lookup)
 static id<MTLBuffer> NativeIntrinsicGatherRowsHandler(id<MTLDevice> device,
-                                                       id<MTLCommandBuffer> commandBuffer,
-                                                       mlir::Operation* op,
-                                                       const std::vector<id<MTLBuffer>>& inputs) {
-    if (!device || !commandBuffer || !IsEligibleGatherRowsNativeOp(op) || inputs.size() < 2 ||
-        !inputs[0] || !inputs[1]) {
+                                                      id<MTLCommandBuffer> commandBuffer, mlir::Operation* op,
+                                                      const std::vector<id<MTLBuffer>>& inputs) {
+    if (!device || !commandBuffer || !IsEligibleGatherRowsNativeOp(op) || inputs.size() < 2 || !inputs[0] ||
+        !inputs[1]) {
         return nil;
     }
     std::vector<int64_t> operandShape, indexShape;
@@ -4592,12 +5318,15 @@ static id<MTLBuffer> NativeIntrinsicGatherRowsHandler(id<MTLDevice> device,
     const uint32_t cols = static_cast<uint32_t>(operandShape[1]);
     const uint32_t table_rows = static_cast<uint32_t>(operandShape[0]);
     const uint64_t total64 = static_cast<uint64_t>(num_indices) * static_cast<uint64_t>(cols);
-    if (total64 == 0 || total64 > std::numeric_limits<uint32_t>::max()) return nil;
+    if (total64 == 0 || total64 > std::numeric_limits<uint32_t>::max())
+        return nil;
 
     size_t outBytes = ByteSizeFromType(op->getResult(0).getType());
-    if (outBytes == 0) return nil;
+    if (outBytes == 0)
+        return nil;
     id<MTLBuffer> out = AcquireReusableOutputBuffer(device, outBytes);
-    if (!out) return nil;
+    if (!out)
+        return nil;
 
     const bool f16 = (gatherDtype == MPSDataTypeFloat16);
     std::string kernelName = f16 ? "gather_rows_f16" : "gather_rows_f32";
@@ -4609,9 +5338,9 @@ static id<MTLBuffer> NativeIntrinsicGatherRowsHandler(id<MTLDevice> device,
 
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
-    [encoder setBuffer:inputs[0] offset:0 atIndex:0];   // operand table
-    [encoder setBuffer:inputs[1] offset:0 atIndex:1];   // indices
-    [encoder setBuffer:out offset:0 atIndex:2];          // output
+    [encoder setBuffer:inputs[0] offset:0 atIndex:0]; // operand table
+    [encoder setBuffer:inputs[1] offset:0 atIndex:1]; // indices
+    [encoder setBuffer:out offset:0 atIndex:2];       // output
     [encoder setBytes:&num_indices length:sizeof(num_indices) atIndex:3];
     [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
     [encoder setBytes:&table_rows length:sizeof(table_rows) atIndex:5];
@@ -4643,6 +5372,157 @@ static bool ShouldRouteToIntrinsicNative(mlir::Operation* op) {
     return true;
 }
 
+// --- Native sort classification ---
+
+static bool IsEligibleSortNativeOp(mlir::Operation* op) {
+    auto sortOp = mlir::dyn_cast_or_null<mlir::stablehlo::SortOp>(op);
+    if (!sortOp) {
+        return false;
+    }
+    // Only single-operand, single-result sort
+    if (op->getNumOperands() != 1 || op->getNumResults() != 1) {
+        return false;
+    }
+    std::vector<int64_t> inShape;
+    MPSDataType dtype = MPSDataTypeInvalid;
+    if (!GetStaticTensorInfo(op->getOperand(0).getType(), &inShape, nullptr, &dtype)) {
+        return false;
+    }
+    // Only f32
+    if (dtype != MPSDataTypeFloat32) {
+        return false;
+    }
+    // 1D or 2D with sort along last axis
+    if (inShape.size() == 1) {
+        uint64_t n = static_cast<uint64_t>(inShape[0]);
+        if (n == 0 || n > kMaxNativeSortElements) {
+            return false;
+        }
+    } else if (inShape.size() == 2) {
+        // 2D: sort must be along last axis (dimension == rank-1 == 1)
+        int64_t sortDim = sortOp.getDimension();
+        if (sortDim != 1) {
+            return false;
+        }
+        uint64_t cols = static_cast<uint64_t>(inShape[1]);
+        if (cols == 0 || cols > kMaxNativeSortElements || inShape[0] <= 0) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    // Only ascending sort
+    bool descending = false;
+    if (!sortOp.getComparator().empty()) {
+        for (mlir::Operation& nestedOp : sortOp.getComparator().front()) {
+            auto compareOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(&nestedOp);
+            if (!compareOp) {
+                continue;
+            }
+            auto direction = compareOp.getComparisonDirection();
+            if (direction == mlir::stablehlo::ComparisonDirection::GT ||
+                direction == mlir::stablehlo::ComparisonDirection::GE) {
+                descending = true;
+            }
+            break;
+        }
+    }
+    if (descending) {
+        return false;
+    }
+    return true;
+}
+
+static id<MTLBuffer> NativeIntrinsicTransposeHandler(id<MTLDevice> device, id<MTLCommandBuffer> commandBuffer,
+                                                      mlir::Operation* op,
+                                                      const std::vector<id<MTLBuffer>>& inputs) {
+    if (!device || !commandBuffer || !op || inputs.empty() || !inputs[0]) {
+        return nil;
+    }
+    uint32_t rows = 0, cols = 0, batch = 1;
+    if (!IsEligibleTransposeNativeOp(op, &rows, &cols, &batch)) {
+        return nil;
+    }
+    id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, "transpose2d_f32");
+    if (!pipeline) {
+        return nil;
+    }
+    size_t outBytes = (size_t)batch * rows * cols * sizeof(float);
+    id<MTLBuffer> out = AcquireReusableOutputBuffer(device, outBytes);
+    if (!out) {
+        return nil;
+    }
+    NSUInteger tg_mem = 32 * 33 * sizeof(float); // 32×33 tile (padded)
+    uint32_t grid_x = (cols + 31) / 32;
+    uint32_t grid_y = (rows + 31) / 32;
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:inputs[0] offset:0 atIndex:0];
+    [encoder setBuffer:out offset:0 atIndex:1];
+    [encoder setBytes:&rows length:sizeof(rows) atIndex:2];
+    [encoder setBytes:&cols length:sizeof(cols) atIndex:3];
+    [encoder setThreadgroupMemoryLength:tg_mem atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, batch)
+             threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+    [encoder endEncoding];
+    return out;
+}
+
+static id<MTLBuffer> NativeIntrinsicSortHandler(id<MTLDevice> device, id<MTLCommandBuffer> commandBuffer,
+                                                 mlir::Operation* op,
+                                                 const std::vector<id<MTLBuffer>>& inputs) {
+    if (!device || !commandBuffer || !op || inputs.empty() || !inputs[0]) {
+        return nil;
+    }
+    if (!IsEligibleSortNativeOp(op)) {
+        return nil;
+    }
+    std::vector<int64_t> inShape;
+    if (!GetStaticTensorInfo(op->getOperand(0).getType(), &inShape, nullptr, nullptr) || inShape.empty()) {
+        return nil;
+    }
+    uint32_t num_rows = 1;
+    uint32_t n;
+    if (inShape.size() == 1) {
+        n = static_cast<uint32_t>(inShape[0]);
+    } else {
+        num_rows = static_cast<uint32_t>(inShape[0]);
+        n = static_cast<uint32_t>(inShape[1]);
+    }
+    uint32_t padded_n = 1;
+    while (padded_n < n) padded_n <<= 1;
+
+    const char* kernelName = (num_rows > 1) ? "bitonic_sort_rows_asc_f32" : "bitonic_sort_asc_f32";
+    id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kernelName);
+    if (!pipeline) {
+        return nil;
+    }
+    size_t totalElements = (size_t)num_rows * (size_t)n;
+    size_t outBytes = totalElements * sizeof(float);
+    id<MTLBuffer> out = AcquireReusableOutputBuffer(device, outBytes);
+    if (!out) {
+        return nil;
+    }
+    NSUInteger tg_mem = (NSUInteger)padded_n * sizeof(float);
+    NSUInteger tg_size = std::min((NSUInteger)32, std::min((NSUInteger)(padded_n / 2), (NSUInteger)1024));
+    if (tg_size == 0) tg_size = 1;
+
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:inputs[0] offset:0 atIndex:0];
+    [encoder setBuffer:out offset:0 atIndex:1];
+    [encoder setBytes:&n length:sizeof(n) atIndex:2];
+    [encoder setBytes:&padded_n length:sizeof(padded_n) atIndex:3];
+    if (num_rows > 1) {
+        [encoder setBytes:&n length:sizeof(n) atIndex:4]; // row_stride = n for contiguous 2D
+    }
+    [encoder setThreadgroupMemoryLength:tg_mem atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(num_rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    [encoder endEncoding];
+    return out;
+}
+
 static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
     if (!op || EnvFlagEnabled("JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS")) {
         return nullptr;
@@ -4653,6 +5533,12 @@ static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
     IntrinsicNativeKind simpleKind = ClassifySimpleKind(op);
     if (simpleKind == IntrinsicNativeKind::kReshapeAlias && IsEligibleReshapeAliasOp(op)) {
         return NativeIntrinsicReshapeAliasHandler;
+    }
+    if (simpleKind == IntrinsicNativeKind::kTransposeAlias && IsEligibleTransposeAliasOp(op)) {
+        return NativeIntrinsicReshapeAliasHandler; // Same handler — alias the input buffer.
+    }
+    if (simpleKind == IntrinsicNativeKind::kTransposeAlias && IsEligibleTransposeNativeOp(op)) {
+        return NativeIntrinsicTransposeHandler; // Fast native transpose for internal transposes.
     }
     if (simpleKind == IntrinsicNativeKind::kConstantScalar && IsEligibleConstantScalarOp(op)) {
         return NativeIntrinsicConstantHandler;
@@ -4683,6 +5569,12 @@ static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
     }
     if (ClassifyDotGeneralNN(op, nullptr, nullptr, nullptr, nullptr)) {
         return NativeIntrinsicGEMMHandler;
+    }
+    if (ClassifyDotGeneralSmall(op, nullptr, nullptr, nullptr, nullptr)) {
+        return NativeIntrinsicGEMMHandler; // Same handler, variant selection differs at bake time
+    }
+    if (IsEligibleSortNativeOp(op)) {
+        return NativeIntrinsicSortHandler;
     }
     return nullptr;
 }
@@ -4736,14 +5628,56 @@ static ReusableOutputPool& GetReusableOutputPool() {
     return pool;
 }
 
+static bool OutputBufferPoolEnabled() {
+    // Default-on for throughput/latency: repeated executions of large kernels (benchmarks,
+    // training loops) avoid costly MTLBuffer allocations. Users can disable for debugging.
+    static const bool enabled = !EnvFlagEnabled("JAX_METALLIB_DISABLE_OUTPUT_BUFFER_POOL");
+    return enabled;
+}
+
+
+// Thread-local single-element cache for output buffer reuse.
+// Avoids the global pool mutex on the hot path for repeated dispatches
+// of the same shape (the common case in JAX benchmarks and training loops).
+struct TLOutputBufSlot {
+    void* device_key = nullptr;
+    size_t bucket = 0;
+    void* metal_buffer = nullptr; // CFRetained when non-null
+    ~TLOutputBufSlot() {
+        if (metal_buffer) {
+            CFRelease(metal_buffer);
+        }
+    }
+};
+static TLOutputBufSlot& GetTLOutputSlot() {
+    static thread_local TLOutputBufSlot slot;
+    return slot;
+}
+
 static id<MTLBuffer> AcquireReusableOutputBuffer(id<MTLDevice> device, size_t byte_size) {
     if (!device || byte_size == 0) {
         return nil;
     }
+    if (!OutputBufferPoolEnabled()) {
+        return [device newBufferWithLength:RoundUpToPow2(byte_size) options:ComputeBufferResourceOptions()];
+    }
 
     const size_t bucket = RoundUpToPow2(byte_size);
+    void* dev_key = (__bridge void*)device;
+
+    // Thread-local fast path: check single-element cache first (no mutex).
+    auto& tls = GetTLOutputSlot();
+    if (tls.metal_buffer && tls.device_key == dev_key && tls.bucket == bucket) {
+        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)tls.metal_buffer;
+        tls.metal_buffer = nullptr;
+        if ([buf length] >= byte_size) {
+            return buf;
+        }
+        CFRelease((__bridge CFTypeRef)buf);
+    }
+
     ReusableOutputPool& pool = GetReusableOutputPool();
-    ReusableOutputKey key{(__bridge void*)device, bucket};
+    ReusableOutputKey key{dev_key, bucket};
     {
         std::scoped_lock lock(pool.mu);
         auto it = pool.bins.find(key);
@@ -4767,21 +5701,37 @@ static void RecycleReusableOutputBuffer(void* device_key, size_t byte_size, void
         }
         return;
     }
+    if (!OutputBufferPoolEnabled()) {
+        CFRelease((__bridge CFTypeRef)metal_buffer);
+        return;
+    }
 
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)metal_buffer;
     const size_t actual_len = (size_t)[buf length];
     const size_t bucket = RoundUpToPow2(actual_len > 0 ? actual_len : byte_size);
-    ReusableOutputPool& pool = GetReusableOutputPool();
-    ReusableOutputKey key{device_key, bucket};
 
-    std::scoped_lock lock(pool.mu);
-    auto& bin = pool.bins[key];
-
-    if (bin.size() >= 16) {
-        CFRelease((__bridge CFTypeRef)metal_buffer);
+    // Thread-local fast path: store in single-element cache.
+    auto& tls = GetTLOutputSlot();
+    void* evicted = tls.metal_buffer;
+    void* evicted_dk = tls.device_key;
+    size_t evicted_bk = tls.bucket;
+    tls.device_key = device_key;
+    tls.bucket = bucket;
+    tls.metal_buffer = metal_buffer;
+    if (!evicted) {
         return;
     }
-    bin.push_back(buf);
+
+    // Recycle evicted entry to global pool.
+    ReusableOutputPool& pool = GetReusableOutputPool();
+    ReusableOutputKey key{evicted_dk, evicted_bk};
+    std::scoped_lock lock(pool.mu);
+    auto& bin = pool.bins[key];
+    if (bin.size() >= 16) {
+        CFRelease(evicted);
+        return;
+    }
+    bin.push_back((__bridge id<MTLBuffer>)evicted);
 }
 
 static id<MTLBuffer> BlitCopyToNewBuffer(id<MTLDevice> device, id<MTLCommandQueue> commandQueue,
@@ -5183,6 +6133,76 @@ static ProcessResult processCallOp(HandlerContext& ctx, mlir::func::CallOp callO
     return ProcessResult{};
 }
 
+// stablehlo.composite references an out-of-line decomposition function by name
+// (FlatSymbolRefAttr), structurally identical to func::CallOp. jax 0.10 lowers
+// many higher-level operations (jnp.arcsin, jnp.argsort, jnp.sum, ...) as
+// composites instead of as direct stablehlo primitives. We just look up the
+// referenced function and walk its body — the same flow processCallOp uses.
+static ProcessResult processCompositeOp(HandlerContext& ctx, mlir::stablehlo::CompositeOp compositeOp) {
+    if (ctx.depth > 100) {
+        return ProcessResult::Error("Maximum composite depth exceeded - possible recursive composite");
+    }
+
+    auto callee = ctx.module.lookupSymbol<mlir::func::FuncOp>(compositeOp.getDecomposition());
+    if (!callee) {
+        return ProcessResult::Error("Could not find composite decomposition function: " +
+                                    compositeOp.getDecomposition().str());
+    }
+
+    if (callee.empty()) {
+        return ProcessResult::Error("Composite decomposition function has no body: " +
+                                    compositeOp.getName().str());
+    }
+
+    auto& calleeBlock = callee.front();
+    for (size_t i = 0; i < compositeOp.getNumOperands() && i < calleeBlock.getNumArguments(); i++) {
+        mlir::Value callArg = compositeOp.getOperand(i);
+        mlir::BlockArgument funcArg = calleeBlock.getArgument(i);
+
+        MPSGraphTensor* argTensor = GetTensor(ctx.values, callArg);
+        if (!argTensor) {
+            return ProcessResult::Error("Composite '" + compositeOp.getName().str() +
+                                        "' argument " + std::to_string(i) + " not found");
+        }
+        ctx.values[funcArg.getAsOpaquePointer()] = argTensor;
+
+        if (ctx.variables) {
+            auto it = ctx.variables->find(callArg.getAsOpaquePointer());
+            if (it != ctx.variables->end()) {
+                (*ctx.variables)[funcArg.getAsOpaquePointer()] = it->second;
+            }
+        }
+    }
+
+    HandlerContext calleeCtx(ctx.graph, nullptr, ctx.values, ctx.module, ctx.depth + 1,
+                             processOperationsAdapter);
+    calleeCtx.variables = ctx.variables;
+    calleeCtx.in_control_flow = ctx.in_control_flow;
+    ProcessResult calleeResult = processOperations(calleeCtx, calleeBlock);
+    if (!calleeResult.ok()) {
+        return calleeResult;
+    }
+
+    for (size_t i = 0; i < compositeOp.getNumResults() && i < calleeResult.return_values.size(); i++) {
+        mlir::Value returnValue = calleeResult.return_values[i];
+        MPSGraphTensor* returnTensor = GetTensor(ctx.values, returnValue);
+        if (!returnTensor) {
+            return ProcessResult::Error("Composite '" + compositeOp.getName().str() +
+                                        "' return value " + std::to_string(i) + " not found");
+        }
+        ctx.values[compositeOp.getResult(i).getAsOpaquePointer()] = returnTensor;
+
+        if (ctx.variables) {
+            auto it = ctx.variables->find(returnValue.getAsOpaquePointer());
+            if (it != ctx.variables->end()) {
+                (*ctx.variables)[compositeOp.getResult(i).getAsOpaquePointer()] = it->second;
+            }
+        }
+    }
+
+    return ProcessResult{};
+}
+
 static ProcessResult processOperations(HandlerContext& ctx, mlir::Block& block) {
     ProcessResult result;
 
@@ -5202,6 +6222,14 @@ static ProcessResult processOperations(HandlerContext& ctx, mlir::Block& block) 
             ProcessResult callResult = processCallOp(ctx, callOp);
             if (!callResult.ok()) {
                 return callResult;
+            }
+            continue;
+        }
+
+        if (auto compositeOp = mlir::dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
+            ProcessResult compositeResult = processCompositeOp(ctx, compositeOp);
+            if (!compositeResult.ok()) {
+                return compositeResult;
             }
             continue;
         }
@@ -5335,7 +6363,8 @@ bool MpsExecutable::BuildExecutionPlan() {
         mlir::func::ReturnOp returnOp = nullptr;
 
         auto build_segments = [&](bool allow_intrinsic_native,
-                                   const std::unordered_set<mlir::Operation*>* force_graph_ops = nullptr) -> bool {
+                                  const std::unordered_set<mlir::Operation*>* force_graph_ops =
+                                      nullptr) -> bool {
             segments.clear();
             SegmentInfo current_segment{false, {}, nullptr};
             returnOp = nullptr;
@@ -5394,886 +6423,907 @@ bool MpsExecutable::BuildExecutionPlan() {
 
         for (int build_pass = 0; build_pass < 2; ++build_pass) {
 
-        plan = std::make_unique<ExecutionPlan>();
+            plan = std::make_unique<ExecutionPlan>();
 
-        if (!build_segments(true, demoted_elem_ops.empty() ? nullptr : &demoted_elem_ops)) {
-            return false;
-        }
-
-        const int mixed_intrinsic_segment_threshold =
-            EnvIntValue("JAX_METALLIB_MIXED_INTRINSIC_SEGMENT_THRESHOLD", 1);
-        const bool keep_mixed_intrinsics = EnvFlagEnabled("JAX_METALLIB_ENABLE_MIXED_INTRINSIC_NATIVE");
-        bool has_graph_segment = false;
-        bool has_native_segment = false;
-        bool has_explicit_native_segment = false;
-        for (const auto& seg : segments) {
-            if (!seg.is_native) {
-                has_graph_segment = true;
-                continue;
-            }
-            has_native_segment = true;
-            if (!seg.ops.empty()) {
-                const std::string native_op_name = seg.ops[0]->getName().getStringRef().str();
-                const OpHandler* native_handler = OpRegistry::Find(native_op_name);
-                if (native_handler && native_handler->is_native()) {
-                    has_explicit_native_segment = true;
-                }
-                if (seg.ops[0]->hasAttr("__softmax_fused") || seg.ops[0]->hasAttr("__mean_fused")) {
-                    has_explicit_native_segment = true;
-                }
-            }
-        }
-        if (!keep_mixed_intrinsics && !has_explicit_native_segment && has_graph_segment &&
-            has_native_segment && (int)segments.size() > mixed_intrinsic_segment_threshold) {
-            MPS_LOG_DEBUG("BuildExecutionPlan: fallback to graph-only intrinsics (%zu mixed segments)\n",
-                          segments.size());
-            if (!build_segments(false)) {
+            if (!build_segments(true, demoted_elem_ops.empty() ? nullptr : &demoted_elem_ops)) {
                 return false;
             }
-        }
-        MPS_LOG_DEBUG("BuildExecutionPlan: Pass 1 complete, %zu segments\n", segments.size());
 
-        if (trace_plan) {
-            std::ostringstream oss;
-            oss << "{\"event\":\"segments\",\"num_segments\":" << segments.size() << ",\"segments\":[";
-            for (size_t i = 0; i < segments.size(); ++i) {
-                if (i > 0) {
-                    oss << ",";
-                }
-                const auto& seg = segments[i];
-                if (seg.is_native) {
-                    std::string op_name =
-                        seg.ops.empty() ? "<missing>" : seg.ops[0]->getName().getStringRef().str();
-                    oss << "{\"kind\":\"native\",\"op\":\"" << JsonEscape(op_name) << "\"}";
+            const int mixed_intrinsic_segment_threshold =
+                EnvIntValue("JAX_METALLIB_MIXED_INTRINSIC_SEGMENT_THRESHOLD", 1);
+            const bool keep_mixed_intrinsics = EnvFlagEnabled("JAX_METALLIB_ENABLE_MIXED_INTRINSIC_NATIVE");
+            bool has_graph_segment = false;
+            bool has_native_segment = false;
+            bool has_explicit_native_segment = false;
+            for (const auto& seg : segments) {
+                if (!seg.is_native) {
+                    has_graph_segment = true;
                     continue;
                 }
-
-                size_t op_count = 0;
-                std::map<std::string, size_t> hist;
-                for (auto* op : seg.ops) {
-                    op->walk([&](mlir::Operation* nested) {
-                        ++op_count;
-                        hist[nested->getName().getStringRef().str()]++;
-                    });
+                has_native_segment = true;
+                if (!seg.ops.empty()) {
+                    const std::string native_op_name = seg.ops[0]->getName().getStringRef().str();
+                    const OpHandler* native_handler = OpRegistry::Find(native_op_name);
+                    if (native_handler && native_handler->is_native()) {
+                        has_explicit_native_segment = true;
+                    }
+                    if (seg.ops[0]->hasAttr("__softmax_fused") || seg.ops[0]->hasAttr("__mean_fused") ||
+                        seg.ops[0]->hasAttr("__softmax_numerator_fused")) {
+                        has_explicit_native_segment = true;
+                    }
                 }
-                oss << "{\"kind\":\"graph\",\"ops\":" << op_count << ",\"op_hist\":{";
-                bool first = true;
-                for (const auto& kv : hist) {
-                    if (!first) {
+            }
+            if (!keep_mixed_intrinsics && !has_explicit_native_segment && has_graph_segment &&
+                has_native_segment && (int)segments.size() > mixed_intrinsic_segment_threshold) {
+                MPS_LOG_DEBUG("BuildExecutionPlan: fallback to graph-only intrinsics (%zu mixed segments)\n",
+                              segments.size());
+                if (!build_segments(false)) {
+                    return false;
+                }
+            }
+            MPS_LOG_DEBUG("BuildExecutionPlan: Pass 1 complete, %zu segments\n", segments.size());
+
+            if (trace_plan) {
+                std::ostringstream oss;
+                oss << "{\"event\":\"segments\",\"num_segments\":" << segments.size() << ",\"segments\":[";
+                for (size_t i = 0; i < segments.size(); ++i) {
+                    if (i > 0) {
                         oss << ",";
                     }
-                    first = false;
-                    oss << "\"" << JsonEscape(kv.first) << "\":" << kv.second;
-                }
-                oss << "}}";
-            }
-            oss << "]}";
-            EmitPlanJsonLine(oss.str());
-        }
-
-        MPS_LOG_DEBUG("BuildExecutionPlan: starting Pass 1b (slot allocation)\n");
-
-        std::unordered_map<mlir::Operation*, int> op_to_seg;
-        for (int i = 0; i < (int)segments.size(); i++) {
-            for (auto* op : segments[i].ops) {
-                op_to_seg[op] = i;
-            }
-        }
-        MPS_LOG_DEBUG("BuildExecutionPlan: op_to_seg map built\n");
-
-        std::unordered_map<void*, SlotId> value_to_slot;
-        auto getOrCreateSlot = [&](mlir::Value value) -> SlotId {
-            MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot called\n");
-            void* key = value.getAsOpaquePointer();
-            MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot key=%p\n", key);
-            auto it = value_to_slot.find(key);
-            if (it != value_to_slot.end()) {
-                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot found existing slot %d\n", it->second);
-                return it->second;
-            }
-
-            SlotId slot = (SlotId)plan->slots.size();
-            MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot creating new slot %d\n", slot);
-            value_to_slot[key] = slot;
-
-            SlotInfo info;
-            MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot getting shape\n");
-            NSArray<NSNumber*>* shape = GetShapeFromType(value.getType());
-            MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot shape=%p\n", (void*)shape);
-            info.shape = (void*)CFBridgingRetain(shape);
-            MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot getting dtype\n");
-            auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
-            info.dtype = tensorType ? MlirTypeToMps(tensorType.getElementType()) : MPSDataTypeFloat32;
-            MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot dtype=%d\n", (int)info.dtype);
-            info.byte_size = ByteSizeFromType(value.getType());
-            MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot byte_size=%zu\n", info.byte_size);
-            plan->slots.push_back(info);
-            MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot done, slot=%d\n", slot);
-            return slot;
-        };
-
-        MPS_LOG_DEBUG("BuildExecutionPlan: allocating slots for %u function arguments\n",
-                      entry_func_.getNumArguments());
-
-        for (unsigned i = 0; i < entry_func_.getNumArguments(); i++) {
-            MPS_LOG_DEBUG("BuildExecutionPlan: arg %u\n", i);
-            auto arg = entry_func_.getArgument(i);
-            SlotId slot = getOrCreateSlot(arg);
-            plan->input_slots.push_back(slot);
-        }
-        MPS_LOG_DEBUG("BuildExecutionPlan: %zu input slots\n", plan->input_slots.size());
-
-        MPS_LOG_DEBUG("BuildExecutionPlan: allocating return value slots\n");
-        if (returnOp) {
-            MPS_LOG_DEBUG("BuildExecutionPlan: returnOp has %u operands\n", returnOp->getNumOperands());
-            for (mlir::Value operand : returnOp->getOperands()) {
-                SlotId slot = getOrCreateSlot(operand);
-                plan->output_slots.push_back(slot);
-                plan->return_types.push_back(operand.getType());
-            }
-        }
-        MPS_LOG_DEBUG("BuildExecutionPlan: %zu output slots\n", plan->output_slots.size());
-
-        MPS_LOG_DEBUG("BuildExecutionPlan: checking segment boundary crossings\n");
-        for (int seg_idx = 0; seg_idx < (int)segments.size(); seg_idx++) {
-            MPS_LOG_DEBUG("BuildExecutionPlan: segment %d, %zu ops\n", seg_idx, segments[seg_idx].ops.size());
-            for (auto* op : segments[seg_idx].ops) {
-
-                for (mlir::Value operand : op->getOperands()) {
-                    auto* defOp = operand.getDefiningOp();
-                    if (!defOp)
+                    const auto& seg = segments[i];
+                    if (seg.is_native) {
+                        std::string op_name =
+                            seg.ops.empty() ? "<missing>" : seg.ops[0]->getName().getStringRef().str();
+                        oss << "{\"kind\":\"native\",\"op\":\"" << JsonEscape(op_name) << "\"}";
                         continue;
-                    auto it = op_to_seg.find(defOp);
-                    if (it == op_to_seg.end() || it->second != seg_idx) {
-                        getOrCreateSlot(operand);
-                    }
-                }
-                MPS_LOG_DEBUG("BuildExecutionPlan:   operands done, checking results\n");
-
-                for (mlir::Value result : op->getResults()) {
-                    for (auto* user : result.getUsers()) {
-                        if (mlir::isa<mlir::func::ReturnOp>(user)) {
-                            getOrCreateSlot(result);
-                            break;
-                        }
-                        auto it = op_to_seg.find(user);
-                        if (it == op_to_seg.end() || it->second != seg_idx) {
-                            getOrCreateSlot(result);
-                            break;
-                        }
-                    }
-                }
-                MPS_LOG_DEBUG("BuildExecutionPlan:   results done\n");
-            }
-        }
-        MPS_LOG_DEBUG("BuildExecutionPlan: segment boundary crossings done, %zu slots\n", plan->slots.size());
-
-        if (trace_plan) {
-            size_t total = 0;
-            size_t max_slot = 0;
-            for (const auto& slot : plan->slots) {
-                total += slot.byte_size;
-                if (slot.byte_size > max_slot) {
-                    max_slot = slot.byte_size;
-                }
-            }
-            std::ostringstream oss;
-            oss << "{\"event\":\"slots\",\"num_slots\":" << plan->slots.size()
-                << ",\"total_slot_bytes\":" << total << ",\"max_slot_bytes\":" << max_slot << "}";
-            EmitPlanJsonLine(oss.str());
-        }
-
-        MPS_LOG_DEBUG("BuildExecutionPlan: starting Pass 2 (step building)\n");
-
-        for (int seg_idx = 0; seg_idx < (int)segments.size(); seg_idx++) {
-            auto& seg = segments[seg_idx];
-            MPS_LOG_DEBUG("BuildExecutionPlan: Pass 2 segment %d, is_native=%d, %zu ops\n", seg_idx,
-                          seg.is_native, seg.ops.size());
-
-            if (seg.is_native) {
-
-                mlir::Operation* op = seg.ops[0];
-                NativeOpHandler native_handler = seg.native_handler;
-                if (!native_handler) {
-                    std::string op_name = op->getName().getStringRef().str();
-                    const OpHandler* handler = OpRegistry::Find(op_name);
-                    if (!handler || !handler->is_native() || !handler->native_handler) {
-                        error_ = "Native segment missing handler for op '" + op_name + "'";
-                        return false;
-                    }
-                    native_handler = handler->native_handler;
-                }
-
-                NativeStep ns;
-                ns.handler = native_handler;
-                ns.op = op;
-                for (mlir::Value operand : op->getOperands()) {
-                    ns.input_slots.push_back(value_to_slot[operand.getAsOpaquePointer()]);
-                }
-
-                ns.output_slot = value_to_slot[op->getResult(0).getAsOpaquePointer()];
-
-                (void)BakeNativeStep(mtl_device, &ns);
-
-                if (ns.baked_kind == NativeStep::BakedKind::kScatterAddRows) {
-                    plan->needs_retained_cmd_bufs = true;
-                }
-
-                plan->native_steps.push_back(std::move(ns));
-                plan->steps.push_back({Step::NATIVE, plan->native_steps.size() - 1});
-            } else {
-
-                MPS_LOG_DEBUG("BuildExecutionPlan: creating MPSGraph\n");
-                MPSGraph* graph = [[MPSGraph alloc] init];
-                if (!graph) {
-                    error_ = "Failed to create MPSGraph";
-                    return false;
-                }
-
-                graph.options = MPSGraphOptionsNone;
-                MPS_LOG_DEBUG("BuildExecutionPlan: MPSGraph created at %p\n", (void*)graph);
-                ValueMap values;
-                GraphStep gs;
-                gs.graph = (void*)CFBridgingRetain(graph);
-                MPS_LOG_DEBUG("BuildExecutionPlan: gs.graph set to %p\n", gs.graph);
-
-                MPS_LOG_DEBUG("BuildExecutionPlan: collecting all ops in segment\n");
-                std::unordered_set<mlir::Operation*> all_seg_ops;
-                for (auto* op : seg.ops) {
-                    all_seg_ops.insert(op);
-                    op->walk([&](mlir::Operation* nestedOp) { all_seg_ops.insert(nestedOp); });
-                }
-                MPS_LOG_DEBUG("BuildExecutionPlan: collected %zu ops in segment\n", all_seg_ops.size());
-
-                std::unordered_set<void*> created_ph;
-
-                auto maybeCreatePlaceholder = [&](mlir::Value operand) {
-                    if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
-                        if (blockArg.getOwner() != &entry_func_.front()) {
-                            return;
-                        }
                     }
 
-                    mlir::Operation* defOp = operand.getDefiningOp();
-
-                    if (defOp && all_seg_ops.count(defOp)) {
-                        return;
-                    }
-
-                    void* key = operand.getAsOpaquePointer();
-                    if (created_ph.count(key)) {
-                        return;
-                    }
-
-                    NSArray<NSNumber*>* shape = GetShapeFromType(operand.getType());
-                    auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(operand.getType());
-                    MPSDataType mps_dtype =
-                        tensorType ? MlirTypeToMps(tensorType.getElementType()) : MPSDataTypeFloat32;
-
-                    MPSGraphTensor* placeholder = [graph placeholderWithShape:shape
-                                                                     dataType:mps_dtype
-                                                                         name:nil];
-                    values[key] = placeholder;
-                    created_ph.insert(key);
-
-                    auto slot_it = value_to_slot.find(key);
-                    if (slot_it != value_to_slot.end()) {
-                        gs.feeds.emplace_back(slot_it->second, (__bridge void*)placeholder);
-                    }
-                };
-
-                MPS_LOG_DEBUG("BuildExecutionPlan: creating placeholders\n");
-                for (auto* op : seg.ops) {
-                    op->walk([&](mlir::Operation* nestedOp) {
-                        for (mlir::Value operand : nestedOp->getOperands()) {
-                            maybeCreatePlaceholder(operand);
-                        }
-                    });
-                }
-                MPS_LOG_DEBUG("BuildExecutionPlan: created %zu placeholders\n", created_ph.size());
-
-                MPS_LOG_DEBUG("BuildExecutionPlan: processing ops in segment\n");
-                @try {
+                    size_t op_count = 0;
+                    std::map<std::string, size_t> hist;
                     for (auto* op : seg.ops) {
-                        std::string op_name = op->getName().getStringRef().str();
+                        op->walk([&](mlir::Operation* nested) {
+                            ++op_count;
+                            hist[nested->getName().getStringRef().str()]++;
+                        });
+                    }
+                    oss << "{\"kind\":\"graph\",\"ops\":" << op_count << ",\"op_hist\":{";
+                    bool first = true;
+                    for (const auto& kv : hist) {
+                        if (!first) {
+                            oss << ",";
+                        }
+                        first = false;
+                        oss << "\"" << JsonEscape(kv.first) << "\":" << kv.second;
+                    }
+                    oss << "}}";
+                }
+                oss << "]}";
+                EmitPlanJsonLine(oss.str());
+            }
 
-                        if (auto callOp = mlir::dyn_cast<mlir::func::CallOp>(op)) {
-                            HandlerContext callCtx(graph, op, values, *module_, 0, processOperationsAdapter);
-                            ProcessResult callResult = processCallOp(callCtx, callOp);
-                            if (!callResult.ok()) {
-                                error_ = callResult.error;
-                                return false;
-                            }
+            MPS_LOG_DEBUG("BuildExecutionPlan: starting Pass 1b (slot allocation)\n");
+
+            std::unordered_map<mlir::Operation*, int> op_to_seg;
+            for (int i = 0; i < (int)segments.size(); i++) {
+                for (auto* op : segments[i].ops) {
+                    op_to_seg[op] = i;
+                }
+            }
+            MPS_LOG_DEBUG("BuildExecutionPlan: op_to_seg map built\n");
+
+            std::unordered_map<void*, SlotId> value_to_slot;
+            auto getOrCreateSlot = [&](mlir::Value value) -> SlotId {
+                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot called\n");
+                void* key = value.getAsOpaquePointer();
+                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot key=%p\n", key);
+                auto it = value_to_slot.find(key);
+                if (it != value_to_slot.end()) {
+                    MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot found existing slot %d\n", it->second);
+                    return it->second;
+                }
+
+                SlotId slot = (SlotId)plan->slots.size();
+                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot creating new slot %d\n", slot);
+                value_to_slot[key] = slot;
+
+                SlotInfo info;
+                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot getting shape\n");
+                NSArray<NSNumber*>* shape = GetShapeFromType(value.getType());
+                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot shape=%p\n", (void*)shape);
+                info.shape = (void*)CFBridgingRetain(shape);
+                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot getting dtype\n");
+                auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+                info.dtype = tensorType ? MlirTypeToMps(tensorType.getElementType()) : MPSDataTypeFloat32;
+                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot dtype=%d\n", (int)info.dtype);
+                info.byte_size = ByteSizeFromType(value.getType());
+                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot byte_size=%zu\n", info.byte_size);
+                plan->slots.push_back(info);
+                MPS_LOG_DEBUG("BuildExecutionPlan: getOrCreateSlot done, slot=%d\n", slot);
+                return slot;
+            };
+
+            MPS_LOG_DEBUG("BuildExecutionPlan: allocating slots for %u function arguments\n",
+                          entry_func_.getNumArguments());
+
+            for (unsigned i = 0; i < entry_func_.getNumArguments(); i++) {
+                MPS_LOG_DEBUG("BuildExecutionPlan: arg %u\n", i);
+                auto arg = entry_func_.getArgument(i);
+                SlotId slot = getOrCreateSlot(arg);
+                plan->input_slots.push_back(slot);
+            }
+            MPS_LOG_DEBUG("BuildExecutionPlan: %zu input slots\n", plan->input_slots.size());
+
+            MPS_LOG_DEBUG("BuildExecutionPlan: allocating return value slots\n");
+            if (returnOp) {
+                MPS_LOG_DEBUG("BuildExecutionPlan: returnOp has %u operands\n", returnOp->getNumOperands());
+                for (mlir::Value operand : returnOp->getOperands()) {
+                    SlotId slot = getOrCreateSlot(operand);
+                    plan->output_slots.push_back(slot);
+                    plan->return_types.push_back(operand.getType());
+                }
+            }
+            MPS_LOG_DEBUG("BuildExecutionPlan: %zu output slots\n", plan->output_slots.size());
+
+            MPS_LOG_DEBUG("BuildExecutionPlan: checking segment boundary crossings\n");
+            for (int seg_idx = 0; seg_idx < (int)segments.size(); seg_idx++) {
+                MPS_LOG_DEBUG("BuildExecutionPlan: segment %d, %zu ops\n", seg_idx,
+                              segments[seg_idx].ops.size());
+                for (auto* op : segments[seg_idx].ops) {
+
+                    for (mlir::Value operand : op->getOperands()) {
+                        auto* defOp = operand.getDefiningOp();
+                        if (!defOp)
                             continue;
-                        }
-
-                        const OpHandler* handler = FindHandler(op);
-                        if (!handler) {
-                            error_ = UnsupportedOpsMessage({op_name}) +
-                                     "\n\nSupported operations: " + OpRegistry::ListRegistered();
-                            return false;
-                        }
-
-                        HandlerContext opCtx(graph, op, values, *module_, 0, processOperationsAdapter);
-                        ProcessResult opResult = handler->graph_handler(opCtx);
-                        if (!opResult.ok()) {
-                            error_ = opResult.error;
-                            return false;
+                        auto it = op_to_seg.find(defOp);
+                        if (it == op_to_seg.end() || it->second != seg_idx) {
+                            getOrCreateSlot(operand);
                         }
                     }
-                } @catch (NSException* exception) {
-                    error_ = "MPS graph build failed: " + std::string([[exception reason] UTF8String]);
-                    return false;
-                }
+                    MPS_LOG_DEBUG("BuildExecutionPlan:   operands done, checking results\n");
 
-                MPS_LOG_DEBUG("BuildExecutionPlan: identifying target values\n");
-                for (auto* op : seg.ops) {
                     for (mlir::Value result : op->getResults()) {
-                        void* key = result.getAsOpaquePointer();
-                        if (value_to_slot.count(key)) {
-                            SlotId slot = value_to_slot[key];
-                            MPSGraphTensor* tensor = values[key];
-                            MPS_LOG_DEBUG("BuildExecutionPlan: target slot=%d, key=%p, tensor=%p\n", slot,
-                                          key, (void*)tensor);
-                            if (tensor) {
-                                MPS_LOG_DEBUG("BuildExecutionPlan: tensor shape=%s, dtype=%d\n",
-                                              [[tensor.shape description] UTF8String], (int)tensor.dataType);
-                                gs.targets.emplace_back(slot, (__bridge void*)tensor);
-                            } else {
-                                MPS_LOG_DEBUG("BuildExecutionPlan: WARNING tensor is nil!\n");
+                        for (auto* user : result.getUsers()) {
+                            if (mlir::isa<mlir::func::ReturnOp>(user)) {
+                                getOrCreateSlot(result);
+                                break;
                             }
-                        }
-                    }
-                }
-                MPS_LOG_DEBUG("BuildExecutionPlan: identified %zu targets\n", gs.targets.size());
-
-                if (!disable_executable && graphDevice && !gs.targets.empty()) {
-                    @try {
-                        NSMutableDictionary<MPSGraphTensor*, MPSGraphShapedType*>* feedTypes =
-                            [NSMutableDictionary dictionaryWithCapacity:gs.feeds.size()];
-                        for (const auto& [slot, tensor_ptr] : gs.feeds) {
-                            (void)slot;
-                            MPSGraphTensor* t = (__bridge MPSGraphTensor*)tensor_ptr;
-                            if (!t) {
-                                continue;
-                            }
-                            MPSGraphShapedType* st = [[MPSGraphShapedType alloc] initWithShape:t.shape
-                                                                                      dataType:t.dataType];
-                            if (st) {
-                                feedTypes[t] = st;
-                                [st release];
-                            }
-                        }
-
-                        NSMutableArray<MPSGraphTensor*>* targetTensors =
-                            [NSMutableArray arrayWithCapacity:gs.targets.size()];
-                        for (const auto& [slot, tensor_ptr] : gs.targets) {
-                            (void)slot;
-                            MPSGraphTensor* t = (__bridge MPSGraphTensor*)tensor_ptr;
-                            if (t) {
-                                [targetTensors addObject:t];
-                            }
-                        }
-
-                        MPSGraphExecutable* exec = [graph compileWithDevice:graphDevice
-                                                                      feeds:feedTypes
-                                                              targetTensors:targetTensors
-                                                           targetOperations:nil
-                                                      compilationDescriptor:nil];
-                        if (exec) {
-                            exec.options = MPSGraphOptionsNone;
-                            gs.executable = (void*)CFBridgingRetain(exec);
-
-                            std::unordered_map<void*, SlotId> feedTensorToSlot;
-                            feedTensorToSlot.reserve(gs.feeds.size());
-                            for (const auto& [slot, tensor_ptr] : gs.feeds) {
-                                feedTensorToSlot[tensor_ptr] = slot;
-                            }
-
-                            NSArray<MPSGraphTensor*>* feedOrder = exec.feedTensors;
-                            if (feedOrder) {
-                                gs.exec_feed_slots.clear();
-                                gs.exec_feed_slots.reserve(feedOrder.count);
-                                bool ok = true;
-                                for (MPSGraphTensor* ft in feedOrder) {
-                                    auto it = feedTensorToSlot.find((__bridge void*)ft);
-                                    if (it == feedTensorToSlot.end()) {
-                                        ok = false;
-                                        break;
-                                    }
-                                    gs.exec_feed_slots.push_back(it->second);
-                                }
-                                if (!ok) {
-                                    gs.exec_feed_slots.clear();
-                                }
-                            }
-
-                            std::unordered_map<void*, SlotId> targetTensorToSlot;
-                            targetTensorToSlot.reserve(gs.targets.size());
-                            for (const auto& [slot, tensor_ptr] : gs.targets) {
-                                targetTensorToSlot[tensor_ptr] = slot;
-                            }
-
-                            NSArray<MPSGraphTensor*>* targetOrder = exec.targetTensors;
-                            if (targetOrder) {
-                                gs.exec_target_slots.clear();
-                                gs.exec_target_slots.reserve(targetOrder.count);
-                                bool ok = true;
-                                for (MPSGraphTensor* tt in targetOrder) {
-                                    auto it = targetTensorToSlot.find((__bridge void*)tt);
-                                    if (it == targetTensorToSlot.end()) {
-                                        ok = false;
-                                        break;
-                                    }
-                                    gs.exec_target_slots.push_back(it->second);
-                                }
-                                if (!ok) {
-                                    gs.exec_target_slots.clear();
-                                }
-                            }
-                        }
-                    } @catch (NSException*) {
-                    }
-                }
-
-                plan->graph_steps.push_back(gs);
-                plan->steps.push_back({Step::GRAPH, plan->graph_steps.size() - 1});
-            }
-        }
-
-        MPS_LOG_DEBUG("BuildExecutionPlan: setting plan_ and plan_built_=true\n");
-        MPS_LOG_DEBUG("BuildExecutionPlan: %zu steps, %zu graph_steps, %zu native_steps, %zu slots\n",
-                      plan->steps.size(), plan->graph_steps.size(), plan->native_steps.size(),
-                      plan->slots.size());
-
-        if (trace_plan) {
-            std::ostringstream oss;
-            oss << "{\"event\":\"steps\",\"num_steps\":" << plan->steps.size()
-                << ",\"graph_steps\":" << plan->graph_steps.size()
-                << ",\"native_steps\":" << plan->native_steps.size() << ",\"graph_step_io\":[";
-            for (size_t i = 0; i < plan->graph_steps.size(); ++i) {
-                if (i > 0) {
-                    oss << ",";
-                }
-                const auto& gs = plan->graph_steps[i];
-                oss << "{\"feeds\":" << gs.feeds.size() << ",\"targets\":" << gs.targets.size() << "}";
-            }
-            oss << "]}";
-            EmitPlanJsonLine(oss.str());
-        }
-
-        static const bool enable_fusion = !EnvFlagEnabled("JAX_METALLIB_DISABLE_ELEMENTWISE_FUSION");
-        MPS_LOG_DEBUG("Fusion pass: enable=%d, native_steps=%zu, steps=%zu, graph_steps=%zu\n",
-                      (int)enable_fusion, plan->native_steps.size(), plan->steps.size(),
-                      plan->graph_steps.size());
-        if (enable_fusion && !plan->native_steps.empty()) {
-            const size_t num_slots = plan->slots.size();
-
-            std::vector<int> slot_producer_step(num_slots, -1);
-
-            std::vector<int> slot_consumer_count(num_slots, 0);
-
-            for (size_t si = 0; si < plan->steps.size(); ++si) {
-                const auto& step = plan->steps[si];
-                if (step.kind != Step::NATIVE)
-                    continue;
-                const auto& ns = plan->native_steps[step.index];
-                if (ns.baked_kind == NativeStep::BakedKind::kElementwise) {
-                    if (ns.output_slot >= 0 && (size_t)ns.output_slot < num_slots) {
-                        slot_producer_step[(size_t)ns.output_slot] = (int)step.index;
-                    }
-                }
-                for (auto slot : ns.input_slots) {
-                    if (slot >= 0 && (size_t)slot < num_slots) {
-                        slot_consumer_count[(size_t)slot]++;
-                    }
-                }
-            }
-
-            for (const auto& gs : plan->graph_steps) {
-                for (const auto& [slot, _] : gs.feeds) {
-                    if (slot >= 0 && (size_t)slot < num_slots) {
-                        slot_consumer_count[(size_t)slot]++;
-                    }
-                }
-            }
-
-            std::vector<uint8_t> is_func_io(num_slots, 0);
-            for (auto s : plan->input_slots) {
-                if (s >= 0 && (size_t)s < num_slots)
-                    is_func_io[(size_t)s] = 1;
-            }
-            for (auto s : plan->output_slots) {
-                if (s >= 0 && (size_t)s < num_slots)
-                    is_func_io[(size_t)s] = 1;
-            }
-
-            auto dtype_byte_size = [](MPSDataType d) -> size_t { return (d == MPSDataTypeFloat16) ? 2 : 4; };
-
-            struct ChainRange {
-                size_t steps_begin;
-                size_t steps_end;
-            };
-            std::vector<ChainRange> chains;
-
-            size_t chain_start = 0;
-            bool in_chain = false;
-            MPSDataType chain_dtype = MPSDataTypeInvalid;
-            uint64_t chain_numel = 0;
-
-            std::unordered_set<int> chain_ns_indices;
-
-            auto flush_chain = [&](size_t chain_end) {
-                if (in_chain && chain_end - chain_start >= 2) {
-                    chains.push_back({chain_start, chain_end});
-                }
-                in_chain = false;
-                chain_ns_indices.clear();
-            };
-
-            for (size_t si = 0; si < plan->steps.size(); ++si) {
-                const auto& step = plan->steps[si];
-                if (step.kind != Step::NATIVE) {
-                    flush_chain(si);
-                    continue;
-                }
-                const auto& ns = plan->native_steps[step.index];
-                if (ns.baked_kind != NativeStep::BakedKind::kElementwise) {
-                    flush_chain(si);
-                    continue;
-                }
-
-                IntrinsicNativeKind kind = ClassifyElementwiseKind(ns.op);
-                if (!IsFusibleElementwiseKind(kind)) {
-                    flush_chain(si);
-                    continue;
-                }
-
-                MPSDataType ns_dtype = plan->slots[(size_t)ns.output_slot].dtype;
-                size_t dsize = dtype_byte_size(ns_dtype);
-                uint64_t ns_numel = (dsize > 0) ? plan->slots[(size_t)ns.output_slot].byte_size / dsize : 0;
-
-                if (!in_chain) {
-
-                    chain_start = si;
-                    in_chain = true;
-                    chain_dtype = ns_dtype;
-                    chain_numel = ns_numel;
-                    chain_ns_indices.clear();
-                    chain_ns_indices.insert((int)step.index);
-                    continue;
-                }
-
-                if (ns_dtype != chain_dtype || ns_numel != chain_numel) {
-                    flush_chain(si);
-
-                    chain_start = si;
-                    in_chain = true;
-                    chain_dtype = ns_dtype;
-                    chain_numel = ns_numel;
-                    chain_ns_indices.clear();
-                    chain_ns_indices.insert((int)step.index);
-                    continue;
-                }
-
-                bool intermediates_ok = true;
-                for (auto slot : ns.input_slots) {
-                    if (slot >= 0 && (size_t)slot < num_slots) {
-                        int prod = slot_producer_step[(size_t)slot];
-                        if (prod >= 0 && chain_ns_indices.count(prod)) {
-
-                            if (slot_consumer_count[(size_t)slot] != 1 || is_func_io[(size_t)slot]) {
-                                intermediates_ok = false;
+                            auto it = op_to_seg.find(user);
+                            if (it == op_to_seg.end() || it->second != seg_idx) {
+                                getOrCreateSlot(result);
                                 break;
                             }
                         }
                     }
+                    MPS_LOG_DEBUG("BuildExecutionPlan:   results done\n");
                 }
-                if (!intermediates_ok) {
-                    flush_chain(si);
-                    chain_start = si;
-                    in_chain = true;
-                    chain_dtype = ns_dtype;
-                    chain_numel = ns_numel;
-                    chain_ns_indices.clear();
-                    chain_ns_indices.insert((int)step.index);
-                    continue;
-                }
-
-                chain_ns_indices.insert((int)step.index);
             }
-            flush_chain(plan->steps.size());
+            MPS_LOG_DEBUG("BuildExecutionPlan: segment boundary crossings done, %zu slots\n",
+                          plan->slots.size());
 
-            if (!chains.empty()) {
-
-                std::vector<int> step_chain_id(plan->steps.size(), -1);
-                for (size_t ci = 0; ci < chains.size(); ++ci) {
-                    for (size_t si = chains[ci].steps_begin; si < chains[ci].steps_end; ++si) {
-                        step_chain_id[si] = (int)ci;
+            if (trace_plan) {
+                size_t total = 0;
+                size_t max_slot = 0;
+                for (const auto& slot : plan->slots) {
+                    total += slot.byte_size;
+                    if (slot.byte_size > max_slot) {
+                        max_slot = slot.byte_size;
                     }
                 }
+                std::ostringstream oss;
+                oss << "{\"event\":\"slots\",\"num_slots\":" << plan->slots.size()
+                    << ",\"total_slot_bytes\":" << total << ",\"max_slot_bytes\":" << max_slot << "}";
+                EmitPlanJsonLine(oss.str());
+            }
 
-                std::vector<NativeStep> fused_steps;
-                fused_steps.reserve(chains.size());
+            MPS_LOG_DEBUG("BuildExecutionPlan: starting Pass 2 (step building)\n");
 
-                for (size_t ci = 0; ci < chains.size(); ++ci) {
-                    const auto& cr = chains[ci];
+            for (int seg_idx = 0; seg_idx < (int)segments.size(); seg_idx++) {
+                auto& seg = segments[seg_idx];
+                MPS_LOG_DEBUG("BuildExecutionPlan: Pass 2 segment %d, is_native=%d, %zu ops\n", seg_idx,
+                              seg.is_native, seg.ops.size());
 
-                    std::vector<size_t> chain_ns_idxs;
-                    for (size_t si = cr.steps_begin; si < cr.steps_end; ++si) {
-                        chain_ns_idxs.push_back(plan->steps[si].index);
+                if (seg.is_native) {
+
+                    mlir::Operation* op = seg.ops[0];
+                    NativeOpHandler native_handler = seg.native_handler;
+                    if (!native_handler) {
+                        std::string op_name = op->getName().getStringRef().str();
+                        const OpHandler* handler = OpRegistry::Find(op_name);
+                        if (!handler || !handler->is_native() || !handler->native_handler) {
+                            error_ = "Native segment missing handler for op '" + op_name + "'";
+                            return false;
+                        }
+                        native_handler = handler->native_handler;
                     }
 
-                    std::unordered_map<SlotId, int> slot_to_chain_op;
-                    for (size_t i = 0; i < chain_ns_idxs.size(); ++i) {
-                        const auto& ns = plan->native_steps[chain_ns_idxs[i]];
-                        slot_to_chain_op[ns.output_slot] = (int)i;
+                    NativeStep ns;
+                    ns.handler = native_handler;
+                    ns.op = op;
+                    for (mlir::Value operand : op->getOperands()) {
+                        ns.input_slots.push_back(value_to_slot[operand.getAsOpaquePointer()]);
                     }
 
-                    std::vector<FusionOp> fusion_ops;
-                    std::vector<SlotId> external_input_slots;
-                    std::unordered_map<SlotId, int> ext_slot_to_idx;
-                    std::vector<SlotId> eliminated_slots;
+                    ns.output_slot = value_to_slot[op->getResult(0).getAsOpaquePointer()];
 
-                    for (size_t i = 0; i < chain_ns_idxs.size(); ++i) {
-                        const auto& ns = plan->native_steps[chain_ns_idxs[i]];
-                        IntrinsicNativeKind kind = ClassifyElementwiseKind(ns.op);
-                        FusionOp fop;
-                        fop.kind = kind;
-                        for (auto slot : ns.input_slots) {
-                            auto chain_it = slot_to_chain_op.find(slot);
-                            if (chain_it != slot_to_chain_op.end()) {
+                    (void)BakeNativeStep(mtl_device, &ns);
 
-                                fop.sources.push_back(chain_it->second);
-                            } else {
+                    if (ns.baked_kind == NativeStep::BakedKind::kScatterAddRows) {
+                        plan->needs_retained_cmd_bufs = true;
+                    }
 
-                                auto ext_it = ext_slot_to_idx.find(slot);
-                                if (ext_it == ext_slot_to_idx.end()) {
-                                    int idx = (int)external_input_slots.size();
-                                    ext_slot_to_idx[slot] = idx;
-                                    external_input_slots.push_back(slot);
-                                    fop.sources.push_back(-(idx + 1));
+                    plan->native_steps.push_back(std::move(ns));
+                    plan->steps.push_back({Step::NATIVE, plan->native_steps.size() - 1});
+                } else {
+
+                    MPS_LOG_DEBUG("BuildExecutionPlan: creating MPSGraph\n");
+                    MPSGraph* graph = [[MPSGraph alloc] init];
+                    if (!graph) {
+                        error_ = "Failed to create MPSGraph";
+                        return false;
+                    }
+
+                    graph.options = MPSGraphOptionsNone;
+                    MPS_LOG_DEBUG("BuildExecutionPlan: MPSGraph created at %p\n", (void*)graph);
+                    ValueMap values;
+                    GraphStep gs;
+                    gs.graph = (void*)CFBridgingRetain(graph);
+                    MPS_LOG_DEBUG("BuildExecutionPlan: gs.graph set to %p\n", gs.graph);
+
+                    MPS_LOG_DEBUG("BuildExecutionPlan: collecting all ops in segment\n");
+                    std::unordered_set<mlir::Operation*> all_seg_ops;
+                    for (auto* op : seg.ops) {
+                        all_seg_ops.insert(op);
+                        op->walk([&](mlir::Operation* nestedOp) { all_seg_ops.insert(nestedOp); });
+                    }
+                    MPS_LOG_DEBUG("BuildExecutionPlan: collected %zu ops in segment\n", all_seg_ops.size());
+
+                    std::unordered_set<void*> created_ph;
+
+                    auto maybeCreatePlaceholder = [&](mlir::Value operand) {
+                        if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
+                            if (blockArg.getOwner() != &entry_func_.front()) {
+                                return;
+                            }
+                        }
+
+                        mlir::Operation* defOp = operand.getDefiningOp();
+
+                        if (defOp && all_seg_ops.count(defOp)) {
+                            return;
+                        }
+
+                        void* key = operand.getAsOpaquePointer();
+                        if (created_ph.count(key)) {
+                            return;
+                        }
+
+                        NSArray<NSNumber*>* shape = GetShapeFromType(operand.getType());
+                        auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(operand.getType());
+                        MPSDataType mps_dtype =
+                            tensorType ? MlirTypeToMps(tensorType.getElementType()) : MPSDataTypeFloat32;
+
+                        MPSGraphTensor* placeholder = [graph placeholderWithShape:shape
+                                                                         dataType:mps_dtype
+                                                                             name:nil];
+                        values[key] = placeholder;
+                        created_ph.insert(key);
+
+                        auto slot_it = value_to_slot.find(key);
+                        if (slot_it != value_to_slot.end()) {
+                            gs.feeds.emplace_back(slot_it->second, (__bridge void*)placeholder);
+                        }
+                    };
+
+                    MPS_LOG_DEBUG("BuildExecutionPlan: creating placeholders\n");
+                    for (auto* op : seg.ops) {
+                        op->walk([&](mlir::Operation* nestedOp) {
+                            for (mlir::Value operand : nestedOp->getOperands()) {
+                                maybeCreatePlaceholder(operand);
+                            }
+                        });
+                    }
+                    MPS_LOG_DEBUG("BuildExecutionPlan: created %zu placeholders\n", created_ph.size());
+
+                    MPS_LOG_DEBUG("BuildExecutionPlan: processing ops in segment\n");
+                    @try {
+                        for (auto* op : seg.ops) {
+                            std::string op_name = op->getName().getStringRef().str();
+
+                            if (auto callOp = mlir::dyn_cast<mlir::func::CallOp>(op)) {
+                                HandlerContext callCtx(graph, op, values, *module_, 0,
+                                                       processOperationsAdapter);
+                                ProcessResult callResult = processCallOp(callCtx, callOp);
+                                if (!callResult.ok()) {
+                                    error_ = callResult.error;
+                                    return false;
+                                }
+                                continue;
+                            }
+
+                            if (auto compositeOp = mlir::dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
+                                HandlerContext compositeCtx(graph, op, values, *module_, 0,
+                                                            processOperationsAdapter);
+                                ProcessResult compositeResult = processCompositeOp(compositeCtx, compositeOp);
+                                if (!compositeResult.ok()) {
+                                    error_ = compositeResult.error;
+                                    return false;
+                                }
+                                continue;
+                            }
+
+                            const OpHandler* handler = FindHandler(op);
+                            if (!handler) {
+                                error_ = UnsupportedOpsMessage({op_name}) +
+                                         "\n\nSupported operations: " + OpRegistry::ListRegistered();
+                                return false;
+                            }
+
+                            HandlerContext opCtx(graph, op, values, *module_, 0, processOperationsAdapter);
+                            ProcessResult opResult = handler->graph_handler(opCtx);
+                            if (!opResult.ok()) {
+                                error_ = opResult.error;
+                                return false;
+                            }
+                        }
+                    } @catch (NSException* exception) {
+                        error_ = "MPS graph build failed: " + std::string([[exception reason] UTF8String]);
+                        return false;
+                    }
+
+                    MPS_LOG_DEBUG("BuildExecutionPlan: identifying target values\n");
+                    for (auto* op : seg.ops) {
+                        for (mlir::Value result : op->getResults()) {
+                            void* key = result.getAsOpaquePointer();
+                            if (value_to_slot.count(key)) {
+                                SlotId slot = value_to_slot[key];
+                                MPSGraphTensor* tensor = values[key];
+                                MPS_LOG_DEBUG("BuildExecutionPlan: target slot=%d, key=%p, tensor=%p\n", slot,
+                                              key, (void*)tensor);
+                                if (tensor) {
+                                    MPS_LOG_DEBUG("BuildExecutionPlan: tensor shape=%s, dtype=%d\n",
+                                                  [[tensor.shape description] UTF8String],
+                                                  (int)tensor.dataType);
+                                    gs.targets.emplace_back(slot, (__bridge void*)tensor);
                                 } else {
-                                    fop.sources.push_back(-(ext_it->second + 1));
+                                    MPS_LOG_DEBUG("BuildExecutionPlan: WARNING tensor is nil!\n");
                                 }
                             }
                         }
-                        fusion_ops.push_back(std::move(fop));
+                    }
+                    MPS_LOG_DEBUG("BuildExecutionPlan: identified %zu targets\n", gs.targets.size());
 
-                        if (i < chain_ns_idxs.size() - 1) {
-                            eliminated_slots.push_back(ns.output_slot);
+                    if (!disable_executable && graphDevice && !gs.targets.empty()) {
+                        @try {
+                            NSMutableDictionary<MPSGraphTensor*, MPSGraphShapedType*>* feedTypes =
+                                [NSMutableDictionary dictionaryWithCapacity:gs.feeds.size()];
+                            for (const auto& [slot, tensor_ptr] : gs.feeds) {
+                                (void)slot;
+                                MPSGraphTensor* t = (__bridge MPSGraphTensor*)tensor_ptr;
+                                if (!t) {
+                                    continue;
+                                }
+                                MPSGraphShapedType* st =
+                                    [[MPSGraphShapedType alloc] initWithShape:t.shape dataType:t.dataType];
+                                if (st) {
+                                    feedTypes[t] = st;
+                                    [st release];
+                                }
+                            }
+
+                            NSMutableArray<MPSGraphTensor*>* targetTensors =
+                                [NSMutableArray arrayWithCapacity:gs.targets.size()];
+                            for (const auto& [slot, tensor_ptr] : gs.targets) {
+                                (void)slot;
+                                MPSGraphTensor* t = (__bridge MPSGraphTensor*)tensor_ptr;
+                                if (t) {
+                                    [targetTensors addObject:t];
+                                }
+                            }
+
+                            MPSGraphExecutable* exec = [graph compileWithDevice:graphDevice
+                                                                          feeds:feedTypes
+                                                                  targetTensors:targetTensors
+                                                               targetOperations:nil
+                                                          compilationDescriptor:nil];
+                            if (exec) {
+                                exec.options = MPSGraphOptionsNone;
+                                gs.executable = (void*)CFBridgingRetain(exec);
+
+                                std::unordered_map<void*, SlotId> feedTensorToSlot;
+                                feedTensorToSlot.reserve(gs.feeds.size());
+                                for (const auto& [slot, tensor_ptr] : gs.feeds) {
+                                    feedTensorToSlot[tensor_ptr] = slot;
+                                }
+
+                                NSArray<MPSGraphTensor*>* feedOrder = exec.feedTensors;
+                                if (feedOrder) {
+                                    gs.exec_feed_slots.clear();
+                                    gs.exec_feed_slots.reserve(feedOrder.count);
+                                    bool ok = true;
+                                    for (MPSGraphTensor* ft in feedOrder) {
+                                        auto it = feedTensorToSlot.find((__bridge void*)ft);
+                                        if (it == feedTensorToSlot.end()) {
+                                            ok = false;
+                                            break;
+                                        }
+                                        gs.exec_feed_slots.push_back(it->second);
+                                    }
+                                    if (!ok) {
+                                        gs.exec_feed_slots.clear();
+                                    }
+                                }
+
+                                std::unordered_map<void*, SlotId> targetTensorToSlot;
+                                targetTensorToSlot.reserve(gs.targets.size());
+                                for (const auto& [slot, tensor_ptr] : gs.targets) {
+                                    targetTensorToSlot[tensor_ptr] = slot;
+                                }
+
+                                NSArray<MPSGraphTensor*>* targetOrder = exec.targetTensors;
+                                if (targetOrder) {
+                                    gs.exec_target_slots.clear();
+                                    gs.exec_target_slots.reserve(targetOrder.count);
+                                    bool ok = true;
+                                    for (MPSGraphTensor* tt in targetOrder) {
+                                        auto it = targetTensorToSlot.find((__bridge void*)tt);
+                                        if (it == targetTensorToSlot.end()) {
+                                            ok = false;
+                                            break;
+                                        }
+                                        gs.exec_target_slots.push_back(it->second);
+                                    }
+                                    if (!ok) {
+                                        gs.exec_target_slots.clear();
+                                    }
+                                }
+                            }
+                        } @catch (NSException*) {
                         }
                     }
 
-                    bool vec_disabled = EnvFlagEnabled("JAX_METALLIB_DISABLE_VEC4_INTRINSICS");
-                    bool stride_disabled = EnvFlagEnabled("JAX_METALLIB_DISABLE_STRIDE_KERNELS");
-                    static const uint64_t stride_min_numel_fuse = static_cast<uint64_t>(
-                        EnvIntValue("JAX_METALLIB_STRIDE_MIN_NUMEL", 1048576));
-                    const uint64_t fusion_vec8_min = (chain_dtype == MPSDataTypeFloat32) ? 262144u : 8u;
-                    int vec_mode = 0;
-                    if (!vec_disabled) {
-                        if (!stride_disabled && IsFloat16Or32(chain_dtype) && chain_numel % 4 == 0 &&
-                            chain_numel >= stride_min_numel_fuse) {
-                            vec_mode = 16;  // stride
-                        } else if (IsFloat16Or32(chain_dtype) && chain_numel % 8 == 0 &&
-                                   chain_numel >= fusion_vec8_min) {
-                            vec_mode = 8;
-                        } else if (IsFloat16Or32(chain_dtype) && chain_numel % 4 == 0) {
-                            vec_mode = 4;
+                    plan->graph_steps.push_back(gs);
+                    plan->steps.push_back({Step::GRAPH, plan->graph_steps.size() - 1});
+                }
+            }
+
+            MPS_LOG_DEBUG("BuildExecutionPlan: setting plan_ and plan_built_=true\n");
+            MPS_LOG_DEBUG("BuildExecutionPlan: %zu steps, %zu graph_steps, %zu native_steps, %zu slots\n",
+                          plan->steps.size(), plan->graph_steps.size(), plan->native_steps.size(),
+                          plan->slots.size());
+
+            if (trace_plan) {
+                std::ostringstream oss;
+                oss << "{\"event\":\"steps\",\"num_steps\":" << plan->steps.size()
+                    << ",\"graph_steps\":" << plan->graph_steps.size()
+                    << ",\"native_steps\":" << plan->native_steps.size() << ",\"graph_step_io\":[";
+                for (size_t i = 0; i < plan->graph_steps.size(); ++i) {
+                    if (i > 0) {
+                        oss << ",";
+                    }
+                    const auto& gs = plan->graph_steps[i];
+                    oss << "{\"feeds\":" << gs.feeds.size() << ",\"targets\":" << gs.targets.size() << "}";
+                }
+                oss << "]}";
+                EmitPlanJsonLine(oss.str());
+            }
+
+            static const bool enable_fusion = !EnvFlagEnabled("JAX_METALLIB_DISABLE_ELEMENTWISE_FUSION");
+            MPS_LOG_DEBUG("Fusion pass: enable=%d, native_steps=%zu, steps=%zu, graph_steps=%zu\n",
+                          (int)enable_fusion, plan->native_steps.size(), plan->steps.size(),
+                          plan->graph_steps.size());
+            if (enable_fusion && !plan->native_steps.empty()) {
+                const size_t num_slots = plan->slots.size();
+
+                std::vector<int> slot_producer_step(num_slots, -1);
+
+                std::vector<int> slot_consumer_count(num_slots, 0);
+
+                for (size_t si = 0; si < plan->steps.size(); ++si) {
+                    const auto& step = plan->steps[si];
+                    if (step.kind != Step::NATIVE)
+                        continue;
+                    const auto& ns = plan->native_steps[step.index];
+                    if (ns.baked_kind == NativeStep::BakedKind::kElementwise) {
+                        if (ns.output_slot >= 0 && (size_t)ns.output_slot < num_slots) {
+                            slot_producer_step[(size_t)ns.output_slot] = (int)step.index;
                         }
                     }
-
-                    std::string cache_key = "fused_";
-                    cache_key += (chain_dtype == MPSDataTypeFloat16) ? "f16" : "f32";
-                    if (vec_mode == 16)
-                        cache_key += "_stride";
-                    else if (vec_mode == 8)
-                        cache_key += "_v8";
-                    else if (vec_mode == 4)
-                        cache_key += "_v4";
-                    for (size_t i = 0; i < fusion_ops.size(); ++i) {
-                        cache_key += "_";
-                        cache_key += FusionKindShortName(fusion_ops[i].kind);
-                        cache_key += "(";
-                        for (size_t j = 0; j < fusion_ops[i].sources.size(); ++j) {
-                            if (j > 0)
-                                cache_key += ",";
-                            cache_key += std::to_string(fusion_ops[i].sources[j]);
+                    for (auto slot : ns.input_slots) {
+                        if (slot >= 0 && (size_t)slot < num_slots) {
+                            slot_consumer_count[(size_t)slot]++;
                         }
-                        cache_key += ")";
                     }
+                }
 
-                    std::string fn_name = cache_key;
-
-                    for (char& c : fn_name) {
-                        if (c == '(' || c == ')' || c == ',' || c == '-')
-                            c = '_';
-                    }
-
-                    std::string source = GenerateFusedKernelSource(
-                        fn_name, fusion_ops, (int)external_input_slots.size(), chain_dtype, vec_mode);
-
-                    MPS_LOG_DEBUG("Fusion: chain %zu has %zu ops, %zu external inputs, "
-                                  "%zu eliminated slots, vec_mode=%d, cache_key=%s\n",
-                                  ci, fusion_ops.size(), external_input_slots.size(), eliminated_slots.size(),
-                                  vec_mode, cache_key.c_str());
-
-                    id<MTLComputePipelineState> pipeline =
-                        GetOrCompileFusedPipeline(mtl_device, cache_key, fn_name, source);
-                    if (!pipeline) {
-                        MPS_LOG_WARN("Fusion: JIT compile failed for chain %zu (%s), skipping\n", ci,
-                                     cache_key.c_str());
-
-                        for (size_t si = cr.steps_begin; si < cr.steps_end; ++si) {
-                            step_chain_id[si] = -1;
+                for (const auto& gs : plan->graph_steps) {
+                    for (const auto& [slot, _] : gs.feeds) {
+                        if (slot >= 0 && (size_t)slot < num_slots) {
+                            slot_consumer_count[(size_t)slot]++;
                         }
-                        NativeStep dummy;
-                        dummy.baked_kind = NativeStep::BakedKind::kNone;
-                        fused_steps.push_back(std::move(dummy));
+                    }
+                }
+
+                std::vector<uint8_t> is_func_io(num_slots, 0);
+                for (auto s : plan->input_slots) {
+                    if (s >= 0 && (size_t)s < num_slots)
+                        is_func_io[(size_t)s] = 1;
+                }
+                for (auto s : plan->output_slots) {
+                    if (s >= 0 && (size_t)s < num_slots)
+                        is_func_io[(size_t)s] = 1;
+                }
+
+                auto dtype_byte_size = [](MPSDataType d) -> size_t {
+                    return (d == MPSDataTypeFloat16) ? 2 : 4;
+                };
+
+                struct ChainRange {
+                    size_t steps_begin;
+                    size_t steps_end;
+                };
+                std::vector<ChainRange> chains;
+
+                size_t chain_start = 0;
+                bool in_chain = false;
+                MPSDataType chain_dtype = MPSDataTypeInvalid;
+                uint64_t chain_numel = 0;
+
+                std::unordered_set<int> chain_ns_indices;
+
+                auto flush_chain = [&](size_t chain_end) {
+                    if (in_chain && chain_end - chain_start >= 2) {
+                        chains.push_back({chain_start, chain_end});
+                    }
+                    in_chain = false;
+                    chain_ns_indices.clear();
+                };
+
+                for (size_t si = 0; si < plan->steps.size(); ++si) {
+                    const auto& step = plan->steps[si];
+                    if (step.kind != Step::NATIVE) {
+                        flush_chain(si);
+                        continue;
+                    }
+                    const auto& ns = plan->native_steps[step.index];
+                    if (ns.baked_kind != NativeStep::BakedKind::kElementwise) {
+                        flush_chain(si);
                         continue;
                     }
 
-                    NativeStep fns;
-                    fns.handler = nullptr;
-                    fns.op = plan->native_steps[chain_ns_idxs[0]].op;
-                    fns.input_slots = external_input_slots;
-                    fns.output_slot = plan->native_steps[chain_ns_idxs.back()].output_slot;
-                    fns.baked_kind = NativeStep::BakedKind::kFusedElementwise;
-                    fns.baked_pipeline = pipeline;
-                    uint32_t n;
-                    if (vec_mode == 16)
-                        n = static_cast<uint32_t>(chain_numel / 4);
-                    else if (vec_mode == 8)
-                        n = static_cast<uint32_t>(chain_numel / 8);
-                    else if (vec_mode == 4)
-                        n = static_cast<uint32_t>(chain_numel / 4);
-                    else
-                        n = static_cast<uint32_t>(chain_numel);
-                    fns.baked_n = n;
-                    fns.baked_use_vec4 = (vec_mode >= 4);
-                    fns.baked_use_stride = (vec_mode == 16);
-                    if (vec_mode == 16) {
-                        uint32_t grid_threads = ComputeStrideGridSize(n);
-                        NSUInteger tg = ResolveLinearThreadgroupSize(pipeline, chain_dtype);
-                        NSUInteger tg_count = ((NSUInteger)grid_threads + tg - 1) / tg;
-                        fns.baked_grid = MTLSizeMake(tg_count, 1, 1);
-                        fns.baked_tg = MTLSizeMake(tg, 1, 1);
-                    } else {
-                        ComputeLinearDispatchConfig(pipeline, n, &fns.baked_grid, &fns.baked_tg, chain_dtype);
+                    IntrinsicNativeKind kind = ClassifyElementwiseKind(ns.op);
+                    if (!IsFusibleElementwiseKind(kind)) {
+                        flush_chain(si);
+                        continue;
                     }
-                    fns.fused_info = std::make_unique<FusedElementwiseInfo>();
-                    fns.fused_info->external_input_slots = external_input_slots;
-                    fns.fused_info->eliminated_slots = eliminated_slots;
-                    fns.fused_info->num_buffer_args = (uint32_t)external_input_slots.size() + 2;
 
-                    fused_steps.push_back(std::move(fns));
-                }
+                    MPSDataType ns_dtype = plan->slots[(size_t)ns.output_slot].dtype;
+                    size_t dsize = dtype_byte_size(ns_dtype);
+                    uint64_t ns_numel =
+                        (dsize > 0) ? plan->slots[(size_t)ns.output_slot].byte_size / dsize : 0;
 
-                std::vector<Step> new_steps;
-                std::vector<NativeStep> new_native_steps;
-                new_steps.reserve(plan->steps.size());
-                new_native_steps.reserve(plan->native_steps.size());
+                    if (!in_chain) {
 
-                std::vector<size_t> old_to_new_ns(plan->native_steps.size(), SIZE_MAX);
-                for (size_t si = 0; si < plan->steps.size(); ++si) {
-                    const auto& step = plan->steps[si];
-                    if (step_chain_id[si] >= 0) {
-
-                        int ci = step_chain_id[si];
-
-                        if (si == chains[(size_t)ci].steps_begin &&
-                            fused_steps[(size_t)ci].baked_kind == NativeStep::BakedKind::kFusedElementwise) {
-                            size_t new_idx = new_native_steps.size();
-                            new_native_steps.push_back(std::move(fused_steps[(size_t)ci]));
-                            new_steps.push_back({Step::NATIVE, new_idx});
-                        }
-
-                    } else if (step.kind == Step::NATIVE) {
-                        size_t new_idx = new_native_steps.size();
-                        old_to_new_ns[step.index] = new_idx;
-                        new_native_steps.push_back(std::move(plan->native_steps[step.index]));
-                        new_steps.push_back({Step::NATIVE, new_idx});
-                    } else {
-
-                        new_steps.push_back(step);
+                        chain_start = si;
+                        in_chain = true;
+                        chain_dtype = ns_dtype;
+                        chain_numel = ns_numel;
+                        chain_ns_indices.clear();
+                        chain_ns_indices.insert((int)step.index);
+                        continue;
                     }
-                }
 
-                plan->steps = std::move(new_steps);
-                plan->native_steps = std::move(new_native_steps);
+                    if (ns_dtype != chain_dtype || ns_numel != chain_numel) {
+                        flush_chain(si);
 
-                std::vector<uint8_t> elim(num_slots, 0);
-                for (const auto& ns : plan->native_steps) {
-                    if (ns.fused_info) {
-                        for (auto s : ns.fused_info->eliminated_slots) {
-                            if (s >= 0 && (size_t)s < num_slots) {
-                                elim[(size_t)s] = 1;
+                        chain_start = si;
+                        in_chain = true;
+                        chain_dtype = ns_dtype;
+                        chain_numel = ns_numel;
+                        chain_ns_indices.clear();
+                        chain_ns_indices.insert((int)step.index);
+                        continue;
+                    }
+
+                    bool intermediates_ok = true;
+                    for (auto slot : ns.input_slots) {
+                        if (slot >= 0 && (size_t)slot < num_slots) {
+                            int prod = slot_producer_step[(size_t)slot];
+                            if (prod >= 0 && chain_ns_indices.count(prod)) {
+
+                                if (slot_consumer_count[(size_t)slot] != 1 || is_func_io[(size_t)slot]) {
+                                    intermediates_ok = false;
+                                    break;
+                                }
                             }
                         }
                     }
-                }
-                plan->slot_is_eliminated = std::move(elim);
+                    if (!intermediates_ok) {
+                        flush_chain(si);
+                        chain_start = si;
+                        in_chain = true;
+                        chain_dtype = ns_dtype;
+                        chain_numel = ns_numel;
+                        chain_ns_indices.clear();
+                        chain_ns_indices.insert((int)step.index);
+                        continue;
+                    }
 
-                MPS_LOG_DEBUG("BuildExecutionPlan: fused %zu chains, %zu steps -> %zu steps, "
-                              "%zu native_steps -> %zu native_steps\n",
-                              chains.size(), plan->steps.size() + chains.size(), plan->steps.size(),
-                              plan->native_steps.size() + chains.size(), plan->native_steps.size());
+                    chain_ns_indices.insert((int)step.index);
+                }
+                flush_chain(plan->steps.size());
+
+                if (!chains.empty()) {
+
+                    std::vector<int> step_chain_id(plan->steps.size(), -1);
+                    for (size_t ci = 0; ci < chains.size(); ++ci) {
+                        for (size_t si = chains[ci].steps_begin; si < chains[ci].steps_end; ++si) {
+                            step_chain_id[si] = (int)ci;
+                        }
+                    }
+
+                    std::vector<NativeStep> fused_steps;
+                    fused_steps.reserve(chains.size());
+
+                    for (size_t ci = 0; ci < chains.size(); ++ci) {
+                        const auto& cr = chains[ci];
+
+                        std::vector<size_t> chain_ns_idxs;
+                        for (size_t si = cr.steps_begin; si < cr.steps_end; ++si) {
+                            chain_ns_idxs.push_back(plan->steps[si].index);
+                        }
+
+                        std::unordered_map<SlotId, int> slot_to_chain_op;
+                        for (size_t i = 0; i < chain_ns_idxs.size(); ++i) {
+                            const auto& ns = plan->native_steps[chain_ns_idxs[i]];
+                            slot_to_chain_op[ns.output_slot] = (int)i;
+                        }
+
+                        std::vector<FusionOp> fusion_ops;
+                        std::vector<SlotId> external_input_slots;
+                        std::unordered_map<SlotId, int> ext_slot_to_idx;
+                        std::vector<SlotId> eliminated_slots;
+
+                        for (size_t i = 0; i < chain_ns_idxs.size(); ++i) {
+                            const auto& ns = plan->native_steps[chain_ns_idxs[i]];
+                            IntrinsicNativeKind kind = ClassifyElementwiseKind(ns.op);
+                            FusionOp fop;
+                            fop.kind = kind;
+                            for (auto slot : ns.input_slots) {
+                                auto chain_it = slot_to_chain_op.find(slot);
+                                if (chain_it != slot_to_chain_op.end()) {
+
+                                    fop.sources.push_back(chain_it->second);
+                                } else {
+
+                                    auto ext_it = ext_slot_to_idx.find(slot);
+                                    if (ext_it == ext_slot_to_idx.end()) {
+                                        int idx = (int)external_input_slots.size();
+                                        ext_slot_to_idx[slot] = idx;
+                                        external_input_slots.push_back(slot);
+                                        fop.sources.push_back(-(idx + 1));
+                                    } else {
+                                        fop.sources.push_back(-(ext_it->second + 1));
+                                    }
+                                }
+                            }
+                            fusion_ops.push_back(std::move(fop));
+
+                            if (i < chain_ns_idxs.size() - 1) {
+                                eliminated_slots.push_back(ns.output_slot);
+                            }
+                        }
+
+                        bool vec_disabled = EnvFlagEnabled("JAX_METALLIB_DISABLE_VEC4_INTRINSICS");
+                        bool stride_disabled = EnvFlagEnabled("JAX_METALLIB_DISABLE_STRIDE_KERNELS");
+                        static const uint64_t stride_min_numel_fuse =
+                            static_cast<uint64_t>(EnvIntValue("JAX_METALLIB_STRIDE_MIN_NUMEL", 1048576));
+                        const uint64_t fusion_vec8_min = (chain_dtype == MPSDataTypeFloat32) ? 262144u : 8u;
+                        int vec_mode = 0;
+                        if (!vec_disabled) {
+                            if (!stride_disabled && IsFloat16Or32(chain_dtype) && chain_numel % 4 == 0 &&
+                                chain_numel >= stride_min_numel_fuse) {
+                                vec_mode = 16; // stride
+                            } else if (IsFloat16Or32(chain_dtype) && chain_numel % 8 == 0 &&
+                                       chain_numel >= fusion_vec8_min) {
+                                vec_mode = 8;
+                            } else if (IsFloat16Or32(chain_dtype) && chain_numel % 4 == 0) {
+                                vec_mode = 4;
+                            }
+                        }
+
+                        std::string cache_key = "fused_";
+                        cache_key += (chain_dtype == MPSDataTypeFloat16) ? "f16" : "f32";
+                        if (vec_mode == 16)
+                            cache_key += "_stride";
+                        else if (vec_mode == 8)
+                            cache_key += "_v8";
+                        else if (vec_mode == 4)
+                            cache_key += "_v4";
+                        for (size_t i = 0; i < fusion_ops.size(); ++i) {
+                            cache_key += "_";
+                            cache_key += FusionKindShortName(fusion_ops[i].kind);
+                            cache_key += "(";
+                            for (size_t j = 0; j < fusion_ops[i].sources.size(); ++j) {
+                                if (j > 0)
+                                    cache_key += ",";
+                                cache_key += std::to_string(fusion_ops[i].sources[j]);
+                            }
+                            cache_key += ")";
+                        }
+
+                        std::string fn_name = cache_key;
+
+                        for (char& c : fn_name) {
+                            if (c == '(' || c == ')' || c == ',' || c == '-')
+                                c = '_';
+                        }
+
+                        std::string source = GenerateFusedKernelSource(
+                            fn_name, fusion_ops, (int)external_input_slots.size(), chain_dtype, vec_mode);
+
+                        MPS_LOG_DEBUG("Fusion: chain %zu has %zu ops, %zu external inputs, "
+                                      "%zu eliminated slots, vec_mode=%d, cache_key=%s\n",
+                                      ci, fusion_ops.size(), external_input_slots.size(),
+                                      eliminated_slots.size(), vec_mode, cache_key.c_str());
+
+                        id<MTLComputePipelineState> pipeline =
+                            GetOrCompileFusedPipeline(mtl_device, cache_key, fn_name, source);
+                        if (!pipeline) {
+                            MPS_LOG_WARN("Fusion: JIT compile failed for chain %zu (%s), skipping\n", ci,
+                                         cache_key.c_str());
+
+                            for (size_t si = cr.steps_begin; si < cr.steps_end; ++si) {
+                                step_chain_id[si] = -1;
+                            }
+                            NativeStep dummy;
+                            dummy.baked_kind = NativeStep::BakedKind::kNone;
+                            fused_steps.push_back(std::move(dummy));
+                            continue;
+                        }
+
+                        NativeStep fns;
+                        fns.handler = nullptr;
+                        fns.op = plan->native_steps[chain_ns_idxs[0]].op;
+                        fns.input_slots = external_input_slots;
+                        fns.output_slot = plan->native_steps[chain_ns_idxs.back()].output_slot;
+                        fns.baked_kind = NativeStep::BakedKind::kFusedElementwise;
+                        fns.baked_pipeline = pipeline;
+                        uint32_t n;
+                        if (vec_mode == 16)
+                            n = static_cast<uint32_t>(chain_numel / 4);
+                        else if (vec_mode == 8)
+                            n = static_cast<uint32_t>(chain_numel / 8);
+                        else if (vec_mode == 4)
+                            n = static_cast<uint32_t>(chain_numel / 4);
+                        else
+                            n = static_cast<uint32_t>(chain_numel);
+                        fns.baked_n = n;
+                        fns.baked_use_vec4 = (vec_mode >= 4);
+                        fns.baked_use_stride = (vec_mode == 16);
+                        if (vec_mode == 16) {
+                            uint32_t grid_threads = ComputeStrideGridSize(n);
+                            NSUInteger tg = ResolveLinearThreadgroupSize(pipeline, chain_dtype);
+                            NSUInteger tg_count = ((NSUInteger)grid_threads + tg - 1) / tg;
+                            fns.baked_grid = MTLSizeMake(tg_count, 1, 1);
+                            fns.baked_tg = MTLSizeMake(tg, 1, 1);
+                        } else {
+                            ComputeLinearDispatchConfig(pipeline, n, &fns.baked_grid, &fns.baked_tg,
+                                                        chain_dtype);
+                        }
+                        fns.fused_info = std::make_unique<FusedElementwiseInfo>();
+                        fns.fused_info->external_input_slots = external_input_slots;
+                        fns.fused_info->eliminated_slots = eliminated_slots;
+                        fns.fused_info->num_buffer_args = (uint32_t)external_input_slots.size() + 2;
+
+                        fused_steps.push_back(std::move(fns));
+                    }
+
+                    std::vector<Step> new_steps;
+                    std::vector<NativeStep> new_native_steps;
+                    new_steps.reserve(plan->steps.size());
+                    new_native_steps.reserve(plan->native_steps.size());
+
+                    std::vector<size_t> old_to_new_ns(plan->native_steps.size(), SIZE_MAX);
+                    for (size_t si = 0; si < plan->steps.size(); ++si) {
+                        const auto& step = plan->steps[si];
+                        if (step_chain_id[si] >= 0) {
+
+                            int ci = step_chain_id[si];
+
+                            if (si == chains[(size_t)ci].steps_begin &&
+                                fused_steps[(size_t)ci].baked_kind ==
+                                    NativeStep::BakedKind::kFusedElementwise) {
+                                size_t new_idx = new_native_steps.size();
+                                new_native_steps.push_back(std::move(fused_steps[(size_t)ci]));
+                                new_steps.push_back({Step::NATIVE, new_idx});
+                            }
+
+                        } else if (step.kind == Step::NATIVE) {
+                            size_t new_idx = new_native_steps.size();
+                            old_to_new_ns[step.index] = new_idx;
+                            new_native_steps.push_back(std::move(plan->native_steps[step.index]));
+                            new_steps.push_back({Step::NATIVE, new_idx});
+                        } else {
+
+                            new_steps.push_back(step);
+                        }
+                    }
+
+                    plan->steps = std::move(new_steps);
+                    plan->native_steps = std::move(new_native_steps);
+
+                    std::vector<uint8_t> elim(num_slots, 0);
+                    for (const auto& ns : plan->native_steps) {
+                        if (ns.fused_info) {
+                            for (auto s : ns.fused_info->eliminated_slots) {
+                                if (s >= 0 && (size_t)s < num_slots) {
+                                    elim[(size_t)s] = 1;
+                                }
+                            }
+                        }
+                    }
+                    plan->slot_is_eliminated = std::move(elim);
+
+                    MPS_LOG_DEBUG("BuildExecutionPlan: fused %zu chains, %zu steps -> %zu steps, "
+                                  "%zu native_steps -> %zu native_steps\n",
+                                  chains.size(), plan->steps.size() + chains.size(), plan->steps.size(),
+                                  plan->native_steps.size() + chains.size(), plan->native_steps.size());
+                } else {
+                    plan->slot_is_eliminated.assign(num_slots, 0);
+                }
             } else {
-                plan->slot_is_eliminated.assign(num_slots, 0);
+                plan->slot_is_eliminated.assign(plan->slots.size(), 0);
             }
-        } else {
-            plan->slot_is_eliminated.assign(plan->slots.size(), 0);
-        }
 
-        // ── Pass 3b: elementwise autotune demotion ──
-        // Scan for standalone (non-fused) bandwidth-bound elementwise native steps.
-        // Autotune each against MPSGraph; if MPSGraph is faster, demote to graph and rebuild.
-        if (enable_elem_autotune && demoted_elem_ops.empty()) {
-            std::unordered_set<mlir::Operation*> new_demotions;
-            for (size_t si = 0; si < plan->steps.size(); ++si) {
-                const auto& step = plan->steps[si];
-                if (step.kind != Step::NATIVE)
-                    continue;
-                const auto& ns = plan->native_steps[step.index];
-                // Only standalone kElementwise (not fused, not other kinds)
-                if (ns.baked_kind != NativeStep::BakedKind::kElementwise)
-                    continue;
+            // ── Pass 3b: elementwise autotune demotion ──
+            // Scan for standalone (non-fused) bandwidth-bound elementwise native steps.
+            // Autotune each against MPSGraph; if MPSGraph is faster, demote to graph and rebuild.
+            if (enable_elem_autotune && demoted_elem_ops.empty()) {
+                std::unordered_set<mlir::Operation*> new_demotions;
+                for (size_t si = 0; si < plan->steps.size(); ++si) {
+                    const auto& step = plan->steps[si];
+                    if (step.kind != Step::NATIVE)
+                        continue;
+                    const auto& ns = plan->native_steps[step.index];
+                    // Only standalone kElementwise (not fused, not other kinds)
+                    if (ns.baked_kind != NativeStep::BakedKind::kElementwise)
+                        continue;
 
-                IntrinsicNativeKind kind = ClassifyElementwiseKind(ns.op);
-                if (kind == IntrinsicNativeKind::kNone)
-                    continue;
+                    IntrinsicNativeKind kind = ClassifyElementwiseKind(ns.op);
+                    if (kind == IntrinsicNativeKind::kNone)
+                        continue;
 
-                // Compute-bound ops always win native — skip autotuning
-                if (IsComputeBoundElementwise(kind))
-                    continue;
+                    // Compute-bound ops always win native — skip autotuning
+                    if (IsComputeBoundElementwise(kind))
+                        continue;
 
-                // Get dtype and numel from the output slot
-                MPSDataType dtype = plan->slots[(size_t)ns.output_slot].dtype;
-                size_t dsize = (dtype == MPSDataTypeFloat16) ? 2 : 4;
-                uint64_t numel = (dsize > 0)
-                    ? plan->slots[(size_t)ns.output_slot].byte_size / dsize : 0;
+                    // Get dtype and numel from the output slot
+                    MPSDataType dtype = plan->slots[(size_t)ns.output_slot].dtype;
+                    size_t dsize = (dtype == MPSDataTypeFloat16) ? 2 : 4;
+                    uint64_t numel = (dsize > 0) ? plan->slots[(size_t)ns.output_slot].byte_size / dsize : 0;
 
-                if (numel == 0)
-                    continue;
+                    if (numel == 0)
+                        continue;
 
-                // Autotune: returns true if native wins, false if MPSGraph wins
-                bool native_wins = AutotuneElementwise(mtl_device, kind, dtype, numel);
-                if (!native_wins) {
-                    new_demotions.insert(ns.op);
-                    MPS_LOG_WARN("elemwise-autotune: demoting op to MPSGraph (numel=%llu dtype=%s)\n",
-                                 (unsigned long long)numel,
-                                 (dtype == MPSDataTypeFloat16) ? "f16" : "f32");
+                    // Autotune: returns true if native wins, false if MPSGraph wins
+                    bool native_wins = AutotuneElementwise(mtl_device, kind, dtype, numel);
+                    if (!native_wins) {
+                        new_demotions.insert(ns.op);
+                        MPS_LOG_WARN("elemwise-autotune: demoting op to MPSGraph (numel=%llu dtype=%s)\n",
+                                     (unsigned long long)numel,
+                                     (dtype == MPSDataTypeFloat16) ? "f16" : "f32");
+                    }
+                }
+                if (!new_demotions.empty()) {
+                    MPS_LOG_WARN(
+                        "elemwise-autotune: demoting %zu standalone ops to MPSGraph, rebuilding plan\n",
+                        new_demotions.size());
+                    demoted_elem_ops = std::move(new_demotions);
+                    continue; // rebuild plan with demotions
                 }
             }
-            if (!new_demotions.empty()) {
-                MPS_LOG_WARN("elemwise-autotune: demoting %zu standalone ops to MPSGraph, rebuilding plan\n",
-                             new_demotions.size());
-                demoted_elem_ops = std::move(new_demotions);
-                continue;  // rebuild plan with demotions
-            }
-        }
 
-        break;  // no demotions needed, exit build loop
+            break; // no demotions needed, exit build loop
         } // end for (build_pass)
 
         plan->slot_is_input.assign(plan->slots.size(), 0);
@@ -6289,6 +7339,15 @@ bool MpsExecutable::BuildExecutionPlan() {
             }
         }
 
+        // Build a map from output slot → native step index for transpose alias detection.
+        std::unordered_map<SlotId, size_t> slot_to_native_step;
+        for (size_t si = 0; si < plan->native_steps.size(); ++si) {
+            const auto& ns = plan->native_steps[si];
+            if (ns.baked_kind == NativeStep::BakedKind::kTransposeAlias) {
+                slot_to_native_step[ns.output_slot] = si;
+            }
+        }
+
         plan->output_meta.reserve(plan->output_slots.size());
         for (size_t i = 0; i < plan->output_slots.size(); i++) {
             ExecutionPlan::OutputMeta meta;
@@ -6299,6 +7358,22 @@ bool MpsExecutable::BuildExecutionPlan() {
             SlotId slot = plan->output_slots[i];
             meta.byte_size =
                 (slot >= 0 && (size_t)slot < plan->slots.size()) ? plan->slots[(size_t)slot].byte_size : 0;
+
+            // If this output was produced by a transpose alias, record the
+            // permutation and input shape so we can build strided output buffers.
+            auto tn_it = slot_to_native_step.find(slot);
+            if (tn_it != slot_to_native_step.end()) {
+                const auto& ns = plan->native_steps[tn_it->second];
+                auto transposeOp = mlir::dyn_cast_or_null<mlir::stablehlo::TransposeOp>(ns.op);
+                if (transposeOp) {
+                    auto perm = transposeOp.getPermutation();
+                    meta.transpose_perm.assign(perm.begin(), perm.end());
+                    auto inType = mlir::cast<mlir::RankedTensorType>(ns.op->getOperand(0).getType());
+                    auto inShape = inType.getShape();
+                    meta.transpose_input_dims.assign(inShape.begin(), inShape.end());
+                }
+            }
+
             plan->output_meta.push_back(std::move(meta));
         }
 
@@ -6307,6 +7382,122 @@ bool MpsExecutable::BuildExecutionPlan() {
     }
     MPS_LOG_DEBUG("BuildExecutionPlan: returning true\n");
     return true;
+}
+
+// Global queue for delayed IntermediateCacheSet releases. A background
+// thread waits for each cache's completion event to fire (via Await()) and
+// then destroys the shared_ptr, which calls IntermediateCacheSet::ReleaseAll
+// to release the owned MTLBuffers.
+//
+// This pattern guarantees the GPU is idle when the buffers are released, so
+// the next Execute() can safely allocate new buffers from a fresh cache set
+// without colliding with in-flight GPU work.
+struct PendingCacheRelease {
+    std::shared_ptr<IntermediateCacheSet> cache;
+    CompletionEvent fence;
+};
+
+namespace {
+std::mutex& GetCacheReleaseQueueMutex() {
+    static std::mutex m;
+    return m;
+}
+std::vector<PendingCacheRelease>& GetCacheReleaseQueue() {
+    static std::vector<PendingCacheRelease> q;
+    return q;
+}
+std::condition_variable& GetCacheReleaseCV() {
+    static std::condition_variable cv;
+    return cv;
+}
+std::atomic<bool>& GetCacheReleaseShutdown() {
+    static std::atomic<bool> s{false};
+    return s;
+}
+
+void CacheReleaseWorker() {
+    std::unique_lock<std::mutex> lock(GetCacheReleaseQueueMutex());
+    while (!GetCacheReleaseShutdown().load()) {
+        GetCacheReleaseCV().wait(lock, [] {
+            return GetCacheReleaseShutdown().load() || !GetCacheReleaseQueue().empty();
+        });
+        if (GetCacheReleaseShutdown().load() && GetCacheReleaseQueue().empty()) {
+            return;
+        }
+        // Drain the entire queue. For each entry, we wait for its completion
+        // event WITHOUT holding the queue mutex so other threads can enqueue
+        // while we wait. CompletionEvent::Await() is the safe way to wait for
+        // GPU work to finish.
+        std::vector<PendingCacheRelease> batch;
+        batch.swap(GetCacheReleaseQueue());
+        lock.unlock();
+        for (auto& item : batch) {
+            if (item.fence) {
+                item.fence->Await();
+            }
+            // shared_ptr destructor in `item.cache` runs here, releasing the
+            // MTLBuffers via IntermediateCacheSet::ReleaseAll.
+        }
+        lock.lock();
+    }
+}
+
+// Start the worker thread lazily on first enqueue. Idempotent.
+void EnsureCacheReleaseWorker() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread t(CacheReleaseWorker);
+        t.detach();
+    });
+}
+} // namespace
+
+void EnqueueCacheForDelayedRelease(std::shared_ptr<IntermediateCacheSet> cache, CompletionEvent fence) {
+    if (!cache) {
+        return;
+    }
+    EnsureCacheReleaseWorker();
+    {
+        std::scoped_lock lock(GetCacheReleaseQueueMutex());
+        GetCacheReleaseQueue().push_back({std::move(cache), std::move(fence)});
+    }
+    GetCacheReleaseCV().notify_one();
+}
+
+// Submit a no-op command buffer to the given Metal command queue and
+// return a CompletionEvent that fires when it completes. Because the
+// Metal command queue is serial, this serves as a synchronization
+// barrier that fires only after all prior work submitted to the queue
+// has finished. The queue parameter is void* to avoid pulling the
+// Objective-C Metal headers into a C++ header.
+static CompletionEvent SubmitSyncBarrier(void* mtlCommandQueue) {
+    // Create an empty command buffer and chain a completion handler on it.
+    // Because Metal serializes command buffer execution on a single queue,
+    // this handler fires only after every prior command buffer on the queue
+    // (including the one created by [MPSGraphExecutable runWithMTLCommandQueue:])
+    // has finished executing. This gives us a real GPU-completion fence without
+    // needing to expose the underlying MPSCommandBuffer.
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlCommandQueue;
+    if (!queue) {
+        return MakeReadyCompletionEvent();
+    }
+    id<MTLCommandBuffer> barrier = [queue commandBuffer];
+    if (!barrier) {
+        return MakeReadyCompletionEvent();
+    }
+    // Use an empty blit encoder pass to ensure the command buffer actually has
+    // work to do (otherwise Metal may skip submitting it).
+    id<MTLBlitCommandEncoder> blit = [barrier blitCommandEncoder];
+    if (blit) {
+        [blit endEncoding];
+    }
+    CompletionEvent completion = MakePendingCompletionEvent();
+    CompletionEvent captured = completion;
+    [barrier addCompletedHandler:^(id<MTLCommandBuffer> /*completed*/) {
+        MarkCompletionFromCommandBuffer(captured, barrier);
+    }];
+    [barrier commit];
+    return completion;
 }
 
 ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, MpsDevice* device) {
@@ -6324,23 +7515,24 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
         MPS_LOG_DEBUG("Execute: plan built successfully\n");
     }
 
+    // Validation outside autoreleasepool to reduce overhead on fast path.
+    if (!client_) {
+        return ExecutionResult::Error("No MPS client available");
+    }
+    id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)client_->metal_device();
+    if (!mtl_device) {
+        return ExecutionResult::Error(
+            "No Metal GPU device available. MPS backend requires Apple Silicon or AMD GPU.");
+    }
+
+    size_t num_args = plan_->input_slots.size();
+    if (inputs.size() < num_args) {
+        return ExecutionResult::Error("Input count mismatch: expected " + std::to_string(num_args) +
+                                      " inputs, got " + std::to_string(inputs.size()));
+    }
+
     @autoreleasepool {
         MPS_LOG_DEBUG("Execute: entering autoreleasepool\n");
-
-        if (!client_) {
-            return ExecutionResult::Error("No MPS client available");
-        }
-        id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)client_->metal_device();
-        if (!mtl_device) {
-            return ExecutionResult::Error(
-                "No Metal GPU device available. MPS backend requires Apple Silicon or AMD GPU.");
-        }
-
-        size_t num_args = plan_->input_slots.size();
-        if (inputs.size() < num_args) {
-            return ExecutionResult::Error("Input count mismatch: expected " + std::to_string(num_args) +
-                                          " inputs, got " + std::to_string(inputs.size()));
-        }
 
         if (plan_->steps.empty() && !plan_->output_slots.empty() && !inputs.empty()) {
             ExecutionResult result;
@@ -6411,38 +7603,328 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
             return ExecutionResult::Error("No Metal command queue available");
         }
 
-        std::unique_ptr<ExecutionPlan::ExecScratch> scratch;
-        {
-            std::scoped_lock lock(plan_->scratch_pool_mutex);
-            if (!plan_->scratch_pool.empty()) {
-                scratch = std::move(plan_->scratch_pool.back());
-                plan_->scratch_pool.pop_back();
-            }
-        }
-        if (!scratch) {
-            scratch = std::make_unique<ExecutionPlan::ExecScratch>();
-        }
-        scratch->reset(plan_->slots.size());
-        auto& slot_bufs = scratch->slot_bufs;
-        auto& slot_producer_events = scratch->slot_producer_events;
-
-        struct ScratchGuard {
-            std::unique_ptr<ExecutionPlan::ExecScratch>& scratch_;
-            ExecutionPlan* plan_;
-            ~ScratchGuard() {
-                if (scratch_) {
-                    std::scoped_lock lock(plan_->scratch_pool_mutex);
-                    plan_->scratch_pool.push_back(std::move(scratch_));
+        // ── Single-step native baked fast path ──────────────────────────
+        // For single baked native step plans, skip scratch pool, generic step
+        // loop, and deferred cleanup. Supports: elementwise, fused elementwise,
+        // reduce, softmax, gather, GEMM, and sort.
+        if (plan_->steps.size() == 1 && plan_->graph_steps.empty() &&
+            plan_->output_slots.size() == 1 && plan_->steps[0].kind == Step::NATIVE &&
+            plan_->slots.size() <= 16) {
+            auto& ns_fp = plan_->native_steps[plan_->steps[0].index];
+            const auto fp_kind = ns_fp.baked_kind;
+            const bool fp_has_pipeline = (ns_fp.baked_pipeline != nil);
+            // Eligible baked kinds for the fast path
+            const bool fp_eligible =
+                fp_has_pipeline &&
+                (fp_kind == NativeStep::BakedKind::kElementwise ||
+                 fp_kind == NativeStep::BakedKind::kFusedElementwise ||
+                 fp_kind == NativeStep::BakedKind::kReduce ||
+                 fp_kind == NativeStep::BakedKind::kSoftmax ||
+                 fp_kind == NativeStep::BakedKind::kGatherRows ||
+                 fp_kind == NativeStep::BakedKind::kGEMM ||
+                 fp_kind == NativeStep::BakedKind::kSort);
+            if (fp_eligible) {
+                bool fp_ok = true;
+                for (size_t i = 0; i < num_args && fp_ok; ++i) {
+                    fp_ok = inputs[i] && inputs[i]->metal_buffer() && inputs[i]->is_contiguous();
+                }
+                if (fp_ok) {
+                    size_t out_bytes = plan_->slots[ns_fp.output_slot].byte_size;
+                    id<MTLBuffer> out_buf = (out_bytes > 0)
+                        ? AcquireReusableOutputBuffer(mtl_device, out_bytes) : nil;
+                    if (out_buf) {
+                        // Create command buffer. We use the default
+                        // commandBufferWithDescriptor-less path with
+                        // retainedReferences=YES (the Metal default) so that
+                        // MTLBuffers bound to the command encoder stay alive
+                        // until the GPU finishes executing the command buffer.
+                        //
+                        // The previous "fp_unretained" optimization (setting
+                        // retainedReferences=NO) saved a few hundred bytes of
+                        // memory per command buffer but was the root cause of
+                        // the "Metal command buffer error: Invalid Resource"
+                        // failures in the test suite: the next eager Execute()
+                        // would free/reuse an MTLBuffer that was still bound to
+                        // the previous command buffer's compute encoder.
+                        static const bool fp_unretained = false;
+                        id<MTLCommandBuffer> fp_cmd = fp_unretained
+                            ? [commandQueue commandBuffer]  // unused, kept for the type
+                            : [commandQueue commandBuffer];
+                        if (fp_cmd) {
+                            static const bool fp_async =
+                                !EnvFlagEnabled("JAX_METALLIB_DISABLE_ASYNC_COMPLETION");
+                            // Reuse CompletionEvent from thread-local pool when possible.
+                            thread_local CompletionEvent tl_fp_completion;
+                            CompletionEvent fp_completion;
+                            if (tl_fp_completion && tl_fp_completion->TryReset()) {
+                                fp_completion = tl_fp_completion;
+                            } else {
+                                fp_completion = MakePendingCompletionEvent();
+                                tl_fp_completion = fp_completion;
+                            }
+                            if (fp_async) {
+                                // Capture raw pointer to avoid shared_ptr copy (2 atomics) in block.
+                                // Safe: MpsBuffer holds a shared_ptr keeping the event alive.
+                                CompletionEventState* fp_raw = fp_completion.get();
+                                [fp_cmd addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                                    if (!completed || completed.status == MTLCommandBufferStatusCompleted) {
+                                        fp_raw->MarkReady();
+                                    } else {
+                                        NSString* desc = completed.error
+                                            ? completed.error.localizedDescription : @"unknown error";
+                                        fp_raw->MarkError("Metal command buffer error: " +
+                                                          std::string([desc UTF8String]));
+                                    }
+                                }];
+                            }
+                            id<MTLComputeCommandEncoder> fp_enc = [fp_cmd computeCommandEncoder];
+                            if (fp_enc) {
+                                // Build small stack mapping: slot ID → MTLBuffer.
+                                id<MTLBuffer> fp_slot[16] = {};
+                                for (size_t i = 0; i < num_args; ++i) {
+                                    SlotId s = plan_->input_slots[i];
+                                    if (s >= 0 && s < 16)
+                                        fp_slot[s] = (__bridge id<MTLBuffer>)inputs[i]->metal_buffer();
+                                }
+                                bool fp_encoded = false;
+                                [fp_enc setComputePipelineState:ns_fp.baked_pipeline];
+                                switch (fp_kind) {
+                                case NativeStep::BakedKind::kElementwise: {
+                                    if (ns_fp.input_slots.size() == 1) {
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                        [fp_enc setBuffer:out_buf offset:0 atIndex:1];
+                                        [fp_enc setBytes:&ns_fp.baked_n length:sizeof(ns_fp.baked_n) atIndex:2];
+                                    } else if (ns_fp.input_slots.size() == 2) {
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[1]] offset:0 atIndex:1];
+                                        [fp_enc setBuffer:out_buf offset:0 atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_n length:sizeof(ns_fp.baked_n) atIndex:3];
+                                    } else if (ns_fp.input_slots.size() == 3) {
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[1]] offset:0 atIndex:1];
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[2]] offset:0 atIndex:2];
+                                        [fp_enc setBuffer:out_buf offset:0 atIndex:3];
+                                        [fp_enc setBytes:&ns_fp.baked_n length:sizeof(ns_fp.baked_n) atIndex:4];
+                                    }
+                                    if (ns_fp.baked_use_stride) {
+                                        [fp_enc dispatchThreadgroups:ns_fp.baked_grid
+                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                    } else {
+                                        [fp_enc dispatchThreads:ns_fp.baked_grid
+                                                threadsPerThreadgroup:ns_fp.baked_tg];
+                                    }
+                                    fp_encoded = true;
+                                    break;
+                                }
+                                case NativeStep::BakedKind::kFusedElementwise: {
+                                    if (ns_fp.fused_info) {
+                                        auto& fi = *ns_fp.fused_info;
+                                        uint32_t buf_idx = 0;
+                                        for (SlotId s : fi.external_input_slots) {
+                                            [fp_enc setBuffer:fp_slot[s] offset:0 atIndex:buf_idx++];
+                                        }
+                                        [fp_enc setBuffer:out_buf offset:0 atIndex:buf_idx++];
+                                        [fp_enc setBytes:&ns_fp.baked_n length:sizeof(ns_fp.baked_n)
+                                                 atIndex:buf_idx++];
+                                        if (ns_fp.baked_use_stride) {
+                                            [fp_enc dispatchThreadgroups:ns_fp.baked_grid
+                                                         threadsPerThreadgroup:ns_fp.baked_tg];
+                                        } else {
+                                            [fp_enc dispatchThreads:ns_fp.baked_grid
+                                                    threadsPerThreadgroup:ns_fp.baked_tg];
+                                        }
+                                        fp_encoded = true;
+                                    }
+                                    break;
+                                }
+                                case NativeStep::BakedKind::kReduce: {
+                                    [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                    [fp_enc setBuffer:out_buf offset:0 atIndex:1];
+                                    [fp_enc setBytes:&ns_fp.baked_rows length:sizeof(ns_fp.baked_rows) atIndex:2];
+                                    [fp_enc setBytes:&ns_fp.baked_cols length:sizeof(ns_fp.baked_cols) atIndex:3];
+                                    if (ns_fp.baked_reduce_threadgroup) {
+                                        [fp_enc dispatchThreadgroups:ns_fp.baked_grid
+                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                    } else {
+                                        [fp_enc dispatchThreads:ns_fp.baked_grid
+                                                threadsPerThreadgroup:ns_fp.baked_tg];
+                                    }
+                                    fp_encoded = true;
+                                    break;
+                                }
+                                case NativeStep::BakedKind::kSoftmax: {
+                                    if (!ns_fp.baked_softmax_pass2_pipeline) {
+                                        // Single-pass softmax_numerator: exp(x - max(x))
+                                        // Uses threadgroup memory to cache row data.
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                        [fp_enc setBuffer:out_buf offset:0 atIndex:1];
+                                        [fp_enc setBytes:&ns_fp.baked_rows length:sizeof(ns_fp.baked_rows) atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_cols length:sizeof(ns_fp.baked_cols) atIndex:3];
+                                        NSUInteger tg_mem = (NSUInteger)ns_fp.baked_cols * sizeof(float);
+                                        [fp_enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+                                        [fp_enc dispatchThreadgroups:ns_fp.baked_grid
+                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                        fp_encoded = true;
+                                    } else if (ns_fp.baked_softmax_maxsum) {
+                                        // 2-pass full softmax
+                                        // Pass 1: compute max+sum per row
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                        [fp_enc setBuffer:ns_fp.baked_softmax_maxsum offset:0 atIndex:1];
+                                        [fp_enc setBytes:&ns_fp.baked_rows length:sizeof(ns_fp.baked_rows) atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_cols length:sizeof(ns_fp.baked_cols) atIndex:3];
+                                        [fp_enc dispatchThreadgroups:ns_fp.baked_grid
+                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                        [fp_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                                        // Pass 2: normalize
+                                        [fp_enc setComputePipelineState:ns_fp.baked_softmax_pass2_pipeline];
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                        [fp_enc setBuffer:ns_fp.baked_softmax_maxsum offset:0 atIndex:1];
+                                        [fp_enc setBuffer:out_buf offset:0 atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_cols length:sizeof(ns_fp.baked_cols) atIndex:3];
+                                        [fp_enc dispatchThreads:ns_fp.baked_softmax_pass2_grid
+                                                threadsPerThreadgroup:ns_fp.baked_softmax_pass2_tg];
+                                        fp_encoded = true;
+                                    }
+                                    break;
+                                }
+                                case NativeStep::BakedKind::kGatherRows: {
+                                    if (ns_fp.input_slots.size() >= 2) {
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[1]] offset:0 atIndex:1];
+                                        [fp_enc setBuffer:out_buf offset:0 atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_gather_num_indices
+                                                  length:sizeof(ns_fp.baked_gather_num_indices) atIndex:3];
+                                        [fp_enc setBytes:&ns_fp.baked_gather_cols
+                                                  length:sizeof(ns_fp.baked_gather_cols) atIndex:4];
+                                        [fp_enc setBytes:&ns_fp.baked_gather_table_rows
+                                                  length:sizeof(ns_fp.baked_gather_table_rows) atIndex:5];
+                                        if (ns_fp.baked_use_stride) {
+                                            [fp_enc dispatchThreadgroups:ns_fp.baked_grid
+                                                         threadsPerThreadgroup:ns_fp.baked_tg];
+                                        } else {
+                                            [fp_enc dispatchThreads:ns_fp.baked_grid
+                                                    threadsPerThreadgroup:ns_fp.baked_tg];
+                                        }
+                                        fp_encoded = true;
+                                    }
+                                    break;
+                                }
+                                case NativeStep::BakedKind::kGEMM: {
+                                    if (ns_fp.input_slots.size() >= 2) {
+                                        bool isNaive = (ns_fp.baked_gemm_variant == kNaiveGemmVariant);
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[1]] offset:0 atIndex:1];
+                                        [fp_enc setBuffer:out_buf offset:0 atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_gemm_m
+                                                  length:sizeof(ns_fp.baked_gemm_m) atIndex:3];
+                                        [fp_enc setBytes:&ns_fp.baked_gemm_n
+                                                  length:sizeof(ns_fp.baked_gemm_n) atIndex:4];
+                                        [fp_enc setBytes:&ns_fp.baked_gemm_k
+                                                  length:sizeof(ns_fp.baked_gemm_k) atIndex:5];
+                                        if (isNaive) {
+                                            MTLSize naive_grid = MTLSizeMake(
+                                                ns_fp.baked_gemm_n, ns_fp.baked_gemm_m, ns_fp.baked_gemm_batch);
+                                            [fp_enc dispatchThreads:naive_grid
+                                                    threadsPerThreadgroup:ns_fp.baked_tg];
+                                        } else {
+                                            [fp_enc dispatchThreadgroups:ns_fp.baked_grid
+                                                         threadsPerThreadgroup:ns_fp.baked_tg];
+                                        }
+                                        fp_encoded = true;
+                                    }
+                                    break;
+                                }
+                                case NativeStep::BakedKind::kSort: {
+                                    if (!ns_fp.input_slots.empty()) {
+                                        [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                        [fp_enc setBuffer:out_buf offset:0 atIndex:1];
+                                        [fp_enc setBytes:&ns_fp.baked_sort_n
+                                                  length:sizeof(ns_fp.baked_sort_n) atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_sort_padded_n
+                                                  length:sizeof(ns_fp.baked_sort_padded_n) atIndex:3];
+                                        if (ns_fp.baked_sort_num_rows > 1) {
+                                            [fp_enc setBytes:&ns_fp.baked_sort_n
+                                                      length:sizeof(ns_fp.baked_sort_n) atIndex:4];
+                                        }
+                                        NSUInteger tg_mem = (NSUInteger)ns_fp.baked_sort_padded_n * sizeof(float);
+                                        [fp_enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+                                        [fp_enc dispatchThreadgroups:ns_fp.baked_grid
+                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                        fp_encoded = true;
+                                    }
+                                    break;
+                                }
+                                default:
+                                    break;
+                                }
+                                if (fp_encoded) {
+                                    [fp_enc endEncoding];
+                                    [fp_cmd commit];
+                                    if (!fp_async) {
+                                        [fp_cmd waitUntilCompleted];
+                                        MarkCompletionFromCommandBuffer(fp_completion, fp_cmd);
+                                    }
+                                    // Wrap output.
+                                    const auto& fp_meta = plan_->output_meta[0];
+                                    static const bool fp_pool = OutputBufferPoolEnabled();
+                                    void* fp_dk = (__bridge void*)mtl_device;
+                                    ExecutionResult fp_result;
+                                    if (fp_pool) {
+                                        fp_result.buffers.push_back(std::make_unique<MpsBuffer>(
+                                            device, (__bridge void*)out_buf, fp_meta.pjrt_dtype, fp_meta.dims,
+                                            [fp_dk, out_bytes](void* mb) {
+                                                RecycleReusableOutputBuffer(fp_dk, out_bytes, mb);
+                                            },
+                                            fp_completion));
+                                    } else {
+                                        fp_result.buffers.push_back(std::make_unique<MpsBuffer>(
+                                            device, (__bridge void*)out_buf, fp_meta.pjrt_dtype, fp_meta.dims,
+                                            MpsBuffer::BufferReleaser{}, fp_completion));
+                                    }
+                                    CFRelease((__bridge CFTypeRef)out_buf);
+                                    fp_result.completion = fp_completion;
+                                    return fp_result;
+                                }
+                                // Encoding failed for this kind — close encoder and fall through.
+                                [fp_enc endEncoding];
+                            }
+                        }
+                        // Encoder/cmd creation failed — recycle buffer and fall through.
+                        RecycleReusableOutputBuffer(
+                            (__bridge void*)mtl_device, out_bytes, (__bridge void*)out_buf);
+                    }
                 }
             }
-        } scratch_guard{scratch, plan_.get()};
+        }
+
+        // Thread-local scratch arrays — avoids mutex-protected pool acquire/return.
+        thread_local std::vector<id<MTLBuffer>> tl_slot_bufs;
+        thread_local std::vector<CompletionEvent> tl_slot_events;
+        const size_t num_slots = plan_->slots.size();
+        tl_slot_bufs.assign(num_slots, nil);
+        tl_slot_events.assign(num_slots, nullptr);
+        auto& slot_bufs = tl_slot_bufs;
+        auto& slot_producer_events = tl_slot_events;
 
         CompletionEvent execution_completion = MakeReadyCompletionEvent();
+
+        // Materialized copies of non-contiguous inputs (lazy — only allocated if needed).
+        std::vector<std::unique_ptr<MpsBuffer>> materialized_inputs;
 
         for (size_t i = 0; i < num_args; i++) {
             MpsBuffer* input = inputs[i];
             if (!input) {
                 return ExecutionResult::Error("Null input buffer at index " + std::to_string(i));
+            }
+            if (__builtin_expect(!input->is_contiguous(), 0)) {
+                std::string mat_err;
+                auto contig = input->MaterializeContiguous(&mat_err);
+                if (!contig) {
+                    return ExecutionResult::Error("Failed to materialize contiguous input " +
+                                                  std::to_string(i) + ": " + mat_err);
+                }
+                materialized_inputs.push_back(std::move(contig));
+                input = materialized_inputs.back().get();
             }
             id<MTLBuffer> mtl_buf = (__bridge id<MTLBuffer>)input->metal_buffer();
             if (!mtl_buf) {
@@ -6455,20 +7937,22 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
         }
 
         static const bool cache_intermediates = !EnvFlagEnabled("JAX_METALLIB_DISABLE_INTERMEDIATE_CACHE");
-        static const bool enable_output_pool = !EnvFlagEnabled("JAX_METALLIB_DISABLE_OUTPUT_BUFFER_POOL");
+        static const bool enable_output_pool = OutputBufferPoolEnabled();
         std::unique_ptr<IntermediateCacheSet> cache_set;
         IntermediateCacheSet* cache = nullptr;
-        if (cache_intermediates) {
+        // Only acquire intermediate cache for plans that have graph steps (avoids
+        // mutex lock on the hot path for native-only programs).
+        if (cache_intermediates && !plan_->graph_steps.empty()) {
             std::scoped_lock lock(plan_->intermediate_pool_mutex);
             if (!plan_->intermediate_pool.empty()) {
                 cache_set = std::move(plan_->intermediate_pool.back());
                 plan_->intermediate_pool.pop_back();
             }
+            if (!cache_set) {
+                cache_set = std::make_unique<IntermediateCacheSet>(plan_->slots.size());
+            }
+            cache = cache_set.get();
         }
-        if (cache_intermediates && !cache_set) {
-            cache_set = std::make_unique<IntermediateCacheSet>(plan_->slots.size());
-        }
-        cache = cache_set.get();
 
         for (const auto& gs : plan_->graph_steps) {
             for (const auto& [slot, tensor] : gs.targets) {
@@ -6497,8 +7981,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                        plan_->slot_is_output[(size_t)slot];
 
                 id<MTLBuffer> buf = nil;
-                if (cache && !is_input && !is_output && slot >= 0 &&
-                    (size_t)slot < cache->bufs.size()) {
+                if (cache && !is_input && !is_output && slot >= 0 && (size_t)slot < cache->bufs.size()) {
                     if (cache->bufs[(size_t)slot]) {
                         buf = cache->bufs[(size_t)slot];
                         if ([buf length] < byte_size) {
@@ -6595,7 +8078,15 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                         resultsArray:resultsArray
                                  executionDescriptor:nil];
 
-                        CompletionEvent ready = MakeReadyCompletionEvent();
+                        // The MPSGraphExecutable direct run dispatches work to the
+                        // command queue but doesn't expose the underlying
+                        // MPSCommandBuffer. To prevent the next eager Execute()
+                        // from freeing/reusing MTLBuffers while the GPU is still
+                        // executing this dispatch, submit a no-op command buffer
+                        // to the same queue and chain a completion handler on it.
+                        // Because the Metal command queue is serial, the handler
+                        // only fires after runWithMTLCommandQueue's work is done.
+                        CompletionEvent ready = SubmitSyncBarrier((__bridge void*)commandQueue);
 
                         executed_direct_run = true;
                         for (SlotId slot : gs.exec_target_slots) {
@@ -6614,6 +8105,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
 
         if (!executed_direct_run && plan_->graph_steps.empty()) {
 
+            // Unretained command buffers avoid Metal's internal reference counting overhead.
+            // Safe for native-only JIT plans where buffer lifetimes are managed by the execution plan.
+            // Disable with JAX_METALLIB_DISABLE_NATIVE_UNRETAINED_CMDBUF if GPU faults occur.
             static const bool use_unretained_default =
                 !EnvFlagEnabled("JAX_METALLIB_DISABLE_NATIVE_UNRETAINED_CMDBUF");
             const bool use_unretained = use_unretained_default && !plan_->needs_retained_cmd_bufs;
@@ -6723,13 +8217,14 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     input_bufs.push_back(slot_bufs[slot]);
                 }
 
-                if (ns.baked_kind == NativeStep::BakedKind::kReshapeAlias) {
+                if (ns.baked_kind == NativeStep::BakedKind::kReshapeAlias ||
+                    ns.baked_kind == NativeStep::BakedKind::kTransposeAlias) {
                     if (ns.input_slots.empty()) {
-                        return ExecutionResult::Error("Baked reshape missing input slot");
+                        return ExecutionResult::Error("Baked reshape/transpose missing input slot");
                     }
                     SlotId in_slot = ns.input_slots[0];
                     if (in_slot < 0 || (size_t)in_slot >= slot_bufs.size() || !slot_bufs[in_slot]) {
-                        return ExecutionResult::Error("Baked reshape input slot is nil");
+                        return ExecutionResult::Error("Baked reshape/transpose input slot is nil");
                     }
                     id<MTLBuffer> out = slot_bufs[in_slot];
                     CFRetain((__bridge CFTypeRef)out);
@@ -6744,6 +8239,112 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     }
                     CFRetain((__bridge CFTypeRef)ns.baked_constant_buffer);
                     slot_bufs[ns.output_slot] = ns.baked_constant_buffer;
+                    slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
+                    continue;
+                }
+
+                // CPU sort for medium arrays — faster than GPU bitonic for 8K-64K range
+                if (ns.baked_kind == NativeStep::BakedKind::kCpuSort) {
+                    if (ns.input_slots.empty()) {
+                        return ExecutionResult::Error("CPU sort missing input slot");
+                    }
+                    // Flush any pending GPU work so input buffers are ready on CPU
+                    if (ops_in_cmd > 0) {
+                        if (!flush_native_cmd()) {
+                            return ExecutionResult::Error("Failed to flush before CPU sort");
+                        }
+                    }
+                    if (!ensure_output_buffer(ns.output_slot)) {
+                        return ExecutionResult::Error("Failed to allocate CPU sort output");
+                    }
+                    const float* src = (const float*)[slot_bufs[ns.input_slots[0]] contents];
+                    float* dst = (float*)[slot_bufs[ns.output_slot] contents];
+                    vDSP_Length sort_n = (vDSP_Length)ns.baked_sort_n;
+                    uint32_t num_rows = ns.baked_sort_num_rows;
+                    if (num_rows <= 1) {
+                        memcpy(dst, src, sort_n * sizeof(float));
+                        vDSP_vsort(dst, sort_n, 1); // 1 = ascending
+                    } else {
+                        // Parallel 2D row-wise sort using GCD dispatch_apply
+                        size_t row_bytes = sort_n * sizeof(float);
+                        memcpy(dst, src, (size_t)num_rows * row_bytes);
+                        dispatch_apply((size_t)num_rows, DISPATCH_APPLY_AUTO, ^(size_t row) {
+                            vDSP_vsort(dst + row * sort_n, sort_n, 1);
+                        });
+                    }
+                    slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
+                    continue;
+                }
+
+                // CPU Cholesky for small matrices — LAPACK spotrf_ on CPU
+                if (ns.baked_kind == NativeStep::BakedKind::kCpuCholesky) {
+                    if (ns.input_slots.empty()) {
+                        return ExecutionResult::Error("CPU Cholesky missing input slot");
+                    }
+                    // Flush any pending GPU work so input buffers are ready on CPU
+                    if (ops_in_cmd > 0) {
+                        if (!flush_native_cmd()) {
+                            return ExecutionResult::Error("Failed to flush before CPU Cholesky");
+                        }
+                    }
+                    if (!ensure_output_buffer(ns.output_slot)) {
+                        return ExecutionResult::Error("Failed to allocate CPU Cholesky output");
+                    }
+                    uint32_t n = ns.baked_cholesky_n;
+                    const float* src = (const float*)[slot_bufs[ns.input_slots[0]] contents];
+                    float* dst = (float*)[slot_bufs[ns.output_slot] contents];
+                    // Copy input to output (spotrf_ works in-place)
+                    memcpy(dst, src, (size_t)n * n * sizeof(float));
+                    char uplo = ns.baked_cholesky_lower ? 'U' : 'L'; // Swap L↔U: LAPACK is column-major, JAX is row-major
+                    int n_int = (int)n;
+                    int info = 0;
+                    spotrf_(&uplo, &n_int, dst, &n_int, &info);
+                    if (info != 0) {
+                        // Non-posdef or error: fill output with NaN to match GPU behavior
+                        for (uint32_t i = 0; i < n * n; ++i) {
+                            dst[i] = NAN;
+                        }
+                    } else {
+                        // Zero the non-factored triangle
+                        if (ns.baked_cholesky_lower) {
+                            for (uint32_t row = 0; row < n; ++row) {
+                                for (uint32_t col = row + 1; col < n; ++col) {
+                                    dst[row * n + col] = 0.0f;
+                                }
+                            }
+                        } else {
+                            for (uint32_t row = 1; row < n; ++row) {
+                                for (uint32_t col = 0; col < row; ++col) {
+                                    dst[row * n + col] = 0.0f;
+                                }
+                            }
+                        }
+                    }
+                    slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
+                    continue;
+                }
+
+                // CPU BLAS for tiny matmuls — bypasses GPU dispatch entirely
+                if (ns.baked_kind == NativeStep::BakedKind::kCpuBLAS) {
+                    if (ns.input_slots.size() < 2) {
+                        return ExecutionResult::Error("CPU BLAS missing input slots");
+                    }
+                    // Flush any pending GPU work so input buffers are ready on CPU
+                    if (ops_in_cmd > 0) {
+                        if (!flush_native_cmd()) {
+                            return ExecutionResult::Error("Failed to flush before CPU BLAS");
+                        }
+                    }
+                    if (!ensure_output_buffer(ns.output_slot)) {
+                        return ExecutionResult::Error("Failed to allocate CPU BLAS output");
+                    }
+                    float* A = (float*)[slot_bufs[ns.input_slots[0]] contents];
+                    float* B = (float*)[slot_bufs[ns.input_slots[1]] contents];
+                    float* C = (float*)[slot_bufs[ns.output_slot] contents];
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                                (int)ns.baked_gemm_m, (int)ns.baked_gemm_n, (int)ns.baked_gemm_k,
+                                1.0f, A, (int)ns.baked_gemm_k, B, (int)ns.baked_gemm_n,
+                                0.0f, C, (int)ns.baked_gemm_n);
                     slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
                     continue;
                 }
@@ -6807,7 +8408,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         }
                         if (ns.baked_use_stride) {
                             [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
-                                              threadsPerThreadgroup:ns.baked_tg];
+                                                 threadsPerThreadgroup:ns.baked_tg];
                         } else {
                             [nativeComputeEncoder dispatchThreads:ns.baked_grid
                                             threadsPerThreadgroup:ns.baked_tg];
@@ -6830,7 +8431,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                                atIndex:buf_idx++];
                         if (ns.baked_use_stride) {
                             [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
-                                              threadsPerThreadgroup:ns.baked_tg];
+                                                 threadsPerThreadgroup:ns.baked_tg];
                         } else {
                             [nativeComputeEncoder dispatchThreads:ns.baked_grid
                                             threadsPerThreadgroup:ns.baked_tg];
@@ -6857,25 +8458,39 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         break;
                     }
                     case NativeStep::BakedKind::kSoftmax: {
-                        if (ns.input_slots.empty() || !ns.baked_softmax_maxsum ||
-                            !ns.baked_softmax_pass2_pipeline) {
-                            return ExecutionResult::Error("Baked softmax missing state");
+                        if (ns.input_slots.empty()) {
+                            return ExecutionResult::Error("Baked softmax missing input slot");
                         }
                         [nativeComputeEncoder setComputePipelineState:ns.baked_pipeline];
-                        [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
-                        [nativeComputeEncoder setBuffer:ns.baked_softmax_maxsum offset:0 atIndex:1];
-                        [nativeComputeEncoder setBytes:&ns.baked_rows length:sizeof(ns.baked_rows) atIndex:2];
-                        [nativeComputeEncoder setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
-                        [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
-                                             threadsPerThreadgroup:ns.baked_tg];
-                        [nativeComputeEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                        [nativeComputeEncoder setComputePipelineState:ns.baked_softmax_pass2_pipeline];
-                        [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
-                        [nativeComputeEncoder setBuffer:ns.baked_softmax_maxsum offset:0 atIndex:1];
-                        [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:2];
-                        [nativeComputeEncoder setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
-                        [nativeComputeEncoder dispatchThreads:ns.baked_softmax_pass2_grid
-                                        threadsPerThreadgroup:ns.baked_softmax_pass2_tg];
+                        if (!ns.baked_softmax_pass2_pipeline) {
+                            // Single-pass softmax_numerator
+                            [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                            [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
+                            [nativeComputeEncoder setBytes:&ns.baked_rows length:sizeof(ns.baked_rows) atIndex:2];
+                            [nativeComputeEncoder setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
+                            NSUInteger tg_mem = (NSUInteger)ns.baked_cols * sizeof(float);
+                            [nativeComputeEncoder setThreadgroupMemoryLength:tg_mem atIndex:0];
+                            [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
+                                                 threadsPerThreadgroup:ns.baked_tg];
+                        } else if (ns.baked_softmax_maxsum) {
+                            // 2-pass full softmax
+                            [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                            [nativeComputeEncoder setBuffer:ns.baked_softmax_maxsum offset:0 atIndex:1];
+                            [nativeComputeEncoder setBytes:&ns.baked_rows length:sizeof(ns.baked_rows) atIndex:2];
+                            [nativeComputeEncoder setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
+                            [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
+                                                 threadsPerThreadgroup:ns.baked_tg];
+                            [nativeComputeEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                            [nativeComputeEncoder setComputePipelineState:ns.baked_softmax_pass2_pipeline];
+                            [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                            [nativeComputeEncoder setBuffer:ns.baked_softmax_maxsum offset:0 atIndex:1];
+                            [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:2];
+                            [nativeComputeEncoder setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
+                            [nativeComputeEncoder dispatchThreads:ns.baked_softmax_pass2_grid
+                                            threadsPerThreadgroup:ns.baked_softmax_pass2_tg];
+                        } else {
+                            return ExecutionResult::Error("Baked softmax missing state");
+                        }
                         encoded = true;
                         break;
                     }
@@ -6890,7 +8505,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         [nativeComputeEncoder setBuffer:ns.baked_layernorm_stats offset:0 atIndex:1];
                         [nativeComputeEncoder setBytes:&ns.baked_rows length:sizeof(ns.baked_rows) atIndex:2];
                         [nativeComputeEncoder setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
-                        [nativeComputeEncoder setBytes:&ns.baked_layernorm_eps length:sizeof(ns.baked_layernorm_eps) atIndex:4];
+                        [nativeComputeEncoder setBytes:&ns.baked_layernorm_eps
+                                                length:sizeof(ns.baked_layernorm_eps)
+                                               atIndex:4];
                         [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
                                              threadsPerThreadgroup:ns.baked_tg];
                         [nativeComputeEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -6913,13 +8530,21 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[1]] offset:0 atIndex:1];
                         [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:2];
                         [nativeComputeEncoder setBytes:&ns.baked_gather_num_indices
-                                                length:sizeof(ns.baked_gather_num_indices) atIndex:3];
+                                                length:sizeof(ns.baked_gather_num_indices)
+                                               atIndex:3];
                         [nativeComputeEncoder setBytes:&ns.baked_gather_cols
-                                                length:sizeof(ns.baked_gather_cols) atIndex:4];
+                                                length:sizeof(ns.baked_gather_cols)
+                                               atIndex:4];
                         [nativeComputeEncoder setBytes:&ns.baked_gather_table_rows
-                                                length:sizeof(ns.baked_gather_table_rows) atIndex:5];
-                        [nativeComputeEncoder dispatchThreads:ns.baked_grid
-                                        threadsPerThreadgroup:ns.baked_tg];
+                                                length:sizeof(ns.baked_gather_table_rows)
+                                               atIndex:5];
+                        if (ns.baked_use_stride) {
+                            [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
+                                                 threadsPerThreadgroup:ns.baked_tg];
+                        } else {
+                            [nativeComputeEncoder dispatchThreads:ns.baked_grid
+                                            threadsPerThreadgroup:ns.baked_tg];
+                        }
                         encoded = true;
                         break;
                     }
@@ -7062,32 +8687,85 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         if (ns.input_slots.size() < 2) {
                             return ExecutionResult::Error("Baked GEMM missing input slots");
                         }
-                        MPSDataType gemmDtype = plan_->slots[ns.input_slots[0]].dtype;
-                        size_t gemmElemSize = (gemmDtype == MPSDataTypeFloat16) ? 2 : 4;
                         bool isMpp = (ns.baked_gemm_variant == kMppGemmVariant);
-                        for (uint32_t b = 0; b < ns.baked_gemm_batch; ++b) {
-                            size_t a_off = (size_t)b * ns.baked_gemm_m * ns.baked_gemm_k * gemmElemSize;
-                            size_t b_off = (size_t)b * ns.baked_gemm_k * ns.baked_gemm_n * gemmElemSize;
-                            size_t c_off = (size_t)b * ns.baked_gemm_m * ns.baked_gemm_n * gemmElemSize;
-                            if (isMpp) {
-                                DispatchMppGemm(nativeComputeEncoder, ns.baked_pipeline,
-                                    slot_bufs[ns.input_slots[0]], a_off,
-                                    slot_bufs[ns.input_slots[1]], b_off,
-                                    slot_bufs[ns.output_slot], c_off,
-                                    ns.baked_gemm_m, ns.baked_gemm_n, ns.baked_gemm_k,
-                                    gemmDtype == MPSDataTypeFloat16);
-                            } else {
-                                [nativeComputeEncoder setComputePipelineState:ns.baked_pipeline];
-                                [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:a_off atIndex:0];
-                                [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[1]] offset:b_off atIndex:1];
-                                [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:c_off atIndex:2];
-                                [nativeComputeEncoder setBytes:&ns.baked_gemm_m length:sizeof(ns.baked_gemm_m) atIndex:3];
-                                [nativeComputeEncoder setBytes:&ns.baked_gemm_n length:sizeof(ns.baked_gemm_n) atIndex:4];
-                                [nativeComputeEncoder setBytes:&ns.baked_gemm_k length:sizeof(ns.baked_gemm_k) atIndex:5];
-                                [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
-                                                     threadsPerThreadgroup:ns.baked_tg];
+                        bool isNaive = (ns.baked_gemm_variant == kNaiveGemmVariant);
+                        // Single dispatch with grid.z = batch (kernels use tgid.z/gid.z for batch offset)
+                        [nativeComputeEncoder setComputePipelineState:ns.baked_pipeline];
+                        [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                        [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[1]] offset:0 atIndex:1];
+                        [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:2];
+                        [nativeComputeEncoder setBytes:&ns.baked_gemm_m
+                                                length:sizeof(ns.baked_gemm_m) atIndex:3];
+                        [nativeComputeEncoder setBytes:&ns.baked_gemm_n
+                                                length:sizeof(ns.baked_gemm_n) atIndex:4];
+                        [nativeComputeEncoder setBytes:&ns.baked_gemm_k
+                                                length:sizeof(ns.baked_gemm_k) atIndex:5];
+                        if (isNaive) {
+                            MTLSize naive_grid = MTLSizeMake(ns.baked_gemm_n, ns.baked_gemm_m, ns.baked_gemm_batch);
+                            [nativeComputeEncoder dispatchThreads:naive_grid
+                                            threadsPerThreadgroup:ns.baked_tg];
+                        } else {
+                            [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
+                                                 threadsPerThreadgroup:ns.baked_tg];
+                        }
+                        encoded = true;
+                        break;
+                    }
+                    case NativeStep::BakedKind::kTranspose2D: {
+                        if (ns.input_slots.empty()) {
+                            return ExecutionResult::Error("Baked transpose missing input slot");
+                        }
+                        // Reuse existing encoder if available, else create one
+                        if (!nativeComputeEncoder) {
+                            if (!ensure_cmd_buf()) {
+                                return ExecutionResult::Error("Failed to create cmd buf for transpose");
+                            }
+                            nativeComputeEncoder = [cmdBuf computeCommandEncoder];
+                            if (!nativeComputeEncoder) {
+                                return ExecutionResult::Error("Failed to create transpose compute encoder");
                             }
                         }
+                        [nativeComputeEncoder setComputePipelineState:ns.baked_pipeline];
+                        [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                        [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
+                        [nativeComputeEncoder setBytes:&ns.baked_transpose_rows
+                                                length:sizeof(ns.baked_transpose_rows) atIndex:2];
+                        [nativeComputeEncoder setBytes:&ns.baked_transpose_cols
+                                                length:sizeof(ns.baked_transpose_cols) atIndex:3];
+                        NSUInteger tg_mem = 32 * 33 * sizeof(float);
+                        [nativeComputeEncoder setThreadgroupMemoryLength:tg_mem atIndex:0];
+                        [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
+                                             threadsPerThreadgroup:ns.baked_tg];
+                        encoded = true;
+                        break;
+                    }
+                    case NativeStep::BakedKind::kSort: {
+                        if (ns.input_slots.empty()) {
+                            return ExecutionResult::Error("Baked sort missing input slot");
+                        }
+                        // Sort needs threadgroup memory — use a fresh encoder
+                        if (nativeComputeEncoder) {
+                            [nativeComputeEncoder endEncoding];
+                            nativeComputeEncoder = nil;
+                        }
+                        nativeComputeEncoder = [cmdBuf computeCommandEncoder];
+                        if (!nativeComputeEncoder) {
+                            return ExecutionResult::Error("Failed to create sort compute encoder");
+                        }
+                        [nativeComputeEncoder setComputePipelineState:ns.baked_pipeline];
+                        [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                        [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
+                        [nativeComputeEncoder setBytes:&ns.baked_sort_n length:sizeof(ns.baked_sort_n) atIndex:2];
+                        [nativeComputeEncoder setBytes:&ns.baked_sort_padded_n
+                                                length:sizeof(ns.baked_sort_padded_n)
+                                               atIndex:3];
+                        if (ns.baked_sort_num_rows > 1) {
+                            [nativeComputeEncoder setBytes:&ns.baked_sort_n length:sizeof(ns.baked_sort_n) atIndex:4];
+                        }
+                        NSUInteger tg_mem = (NSUInteger)ns.baked_sort_padded_n * sizeof(float);
+                        [nativeComputeEncoder setThreadgroupMemoryLength:tg_mem atIndex:0];
+                        [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
+                                             threadsPerThreadgroup:ns.baked_tg];
                         encoded = true;
                         break;
                     }
@@ -7161,10 +8839,29 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
             MPS_LOG_DEBUG("Executing %zu steps\n", plan_->steps.size());
             std::vector<id<MTLBuffer>> mixed_input_bufs;
             mixed_input_bufs.reserve(4);
+            // Persistent compute encoder reused across consecutive native steps to
+            // avoid the ~15-20µs overhead of creating a new encoder per dispatch.
+            id<MTLComputeCommandEncoder> mixedNativeEncoder = nil;
+            bool mixedNativeEncoderHasWork = false;
+            auto endMixedNativeEncoder = [&]() {
+                if (mixedNativeEncoder) {
+                    [mixedNativeEncoder endEncoding];
+                    mixedNativeEncoder = nil;
+                    mixedNativeEncoderHasWork = false;
+                }
+            };
+            auto ensureMixedNativeEncoder = [&]() -> id<MTLComputeCommandEncoder> {
+                if (!mixedNativeEncoder) {
+                    mixedNativeEncoder = [cmdBuf computeCommandEncoder];
+                    mixedNativeEncoderHasWork = false;
+                }
+                return mixedNativeEncoder;
+            };
             for (size_t step_idx = 0; step_idx < plan_->steps.size(); step_idx++) {
                 const auto& step = plan_->steps[step_idx];
                 MPS_LOG_DEBUG("Step %zu: kind=%s\n", step_idx, step.kind == Step::GRAPH ? "GRAPH" : "NATIVE");
                 if (step.kind == Step::GRAPH) {
+                    endMixedNativeEncoder();
                     auto& gs = plan_->graph_steps[step.index];
                     MPS_LOG_DEBUG("  graph_step index=%zu, feeds=%zu, targets=%zu\n", step.index,
                                   gs.feeds.size(), gs.targets.size());
@@ -7341,7 +9038,8 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
 
                     auto& ns = plan_->native_steps[step.index];
 
-                    if (ns.baked_kind == NativeStep::BakedKind::kReshapeAlias) {
+                    if (ns.baked_kind == NativeStep::BakedKind::kReshapeAlias ||
+                        ns.baked_kind == NativeStep::BakedKind::kTransposeAlias) {
                         if (!ns.input_slots.empty()) {
                             SlotId in_slot = ns.input_slots[0];
                             if (in_slot >= 0 && (size_t)in_slot < slot_bufs.size() && slot_bufs[in_slot]) {
@@ -7361,7 +9059,151 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         continue;
                     }
 
-                    if (ns.baked_kind != NativeStep::BakedKind::kNone && ns.baked_pipeline) {
+                    // CPU sort for medium arrays in mixed path
+                    if (ns.baked_kind == NativeStep::BakedKind::kCpuSort) {
+                        if (ns.input_slots.empty()) {
+                            return ExecutionResult::Error("CPU sort missing input slot (mixed)");
+                        }
+                        // Flush all pending GPU work so input buffers are ready
+                        endMixedNativeEncoder();
+                        [cmdBuf commit];
+                        [cmdBuf waitUntilCompleted];
+                        // Create a new command buffer for subsequent steps
+                        cmdBuf = [MPSCommandBuffer commandBufferFromCommandQueue:commandQueue];
+                        if (!cmdBuf) {
+                            return ExecutionResult::Error("Failed to recreate cmdBuf after CPU sort");
+                        }
+                        cmd_completion = CompletionEventForCommandBuffer(cmdBuf, async_completion);
+                        if (ns.output_slot >= 0 && (size_t)ns.output_slot < slot_bufs.size() &&
+                            !slot_bufs[ns.output_slot]) {
+                            size_t out_bytes = plan_->slots[ns.output_slot].byte_size;
+                            if (out_bytes > 0) {
+                                slot_bufs[ns.output_slot] =
+                                    [mtl_device newBufferWithLength:out_bytes
+                                                           options:ComputeBufferResourceOptions()];
+                            }
+                        }
+                        const float* src = (const float*)[slot_bufs[ns.input_slots[0]] contents];
+                        float* dst = (float*)[slot_bufs[ns.output_slot] contents];
+                        vDSP_Length sort_n = (vDSP_Length)ns.baked_sort_n;
+                        uint32_t num_rows_mixed = ns.baked_sort_num_rows;
+                        if (num_rows_mixed <= 1) {
+                            memcpy(dst, src, sort_n * sizeof(float));
+                            vDSP_vsort(dst, sort_n, 1);
+                        } else {
+                            size_t row_bytes = sort_n * sizeof(float);
+                            memcpy(dst, src, (size_t)num_rows_mixed * row_bytes);
+                            dispatch_apply((size_t)num_rows_mixed, DISPATCH_APPLY_AUTO, ^(size_t row) {
+                                vDSP_vsort(dst + row * sort_n, sort_n, 1);
+                            });
+                        }
+                        slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
+                        continue;
+                    }
+
+                    // CPU Cholesky for small matrices in mixed path
+                    if (ns.baked_kind == NativeStep::BakedKind::kCpuCholesky) {
+                        if (ns.input_slots.empty()) {
+                            return ExecutionResult::Error("CPU Cholesky missing input slot (mixed)");
+                        }
+                        // Flush all pending GPU work so input buffers are ready
+                        endMixedNativeEncoder();
+                        [cmdBuf commit];
+                        [cmdBuf waitUntilCompleted];
+                        // Create a new command buffer for subsequent steps
+                        cmdBuf = [MPSCommandBuffer commandBufferFromCommandQueue:commandQueue];
+                        if (!cmdBuf) {
+                            return ExecutionResult::Error("Failed to recreate cmdBuf after CPU Cholesky");
+                        }
+                        cmd_completion = CompletionEventForCommandBuffer(cmdBuf, async_completion);
+                        if (ns.output_slot >= 0 && (size_t)ns.output_slot < slot_bufs.size() &&
+                            !slot_bufs[ns.output_slot]) {
+                            size_t out_bytes = plan_->slots[ns.output_slot].byte_size;
+                            if (out_bytes > 0) {
+                                slot_bufs[ns.output_slot] =
+                                    [mtl_device newBufferWithLength:out_bytes
+                                                           options:ComputeBufferResourceOptions()];
+                            }
+                        }
+                        uint32_t n = ns.baked_cholesky_n;
+                        const float* src = (const float*)[slot_bufs[ns.input_slots[0]] contents];
+                        float* dst = (float*)[slot_bufs[ns.output_slot] contents];
+                        memcpy(dst, src, (size_t)n * n * sizeof(float));
+                        char uplo = ns.baked_cholesky_lower ? 'U' : 'L'; // Swap L↔U: LAPACK is column-major, JAX is row-major
+                        int n_int = (int)n;
+                        int info = 0;
+                        spotrf_(&uplo, &n_int, dst, &n_int, &info);
+                        if (info != 0) {
+                            for (uint32_t i = 0; i < n * n; ++i) dst[i] = NAN;
+                        } else {
+                            if (ns.baked_cholesky_lower) {
+                                for (uint32_t row = 0; row < n; ++row)
+                                    for (uint32_t col = row + 1; col < n; ++col)
+                                        dst[row * n + col] = 0.0f;
+                            } else {
+                                for (uint32_t row = 1; row < n; ++row)
+                                    for (uint32_t col = 0; col < row; ++col)
+                                        dst[row * n + col] = 0.0f;
+                            }
+                        }
+                        slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
+                        continue;
+                    }
+
+                    // CPU BLAS for tiny matmuls in mixed path
+                    if (ns.baked_kind == NativeStep::BakedKind::kCpuBLAS) {
+                        if (ns.input_slots.size() < 2) {
+                            return ExecutionResult::Error("CPU BLAS missing input slots (mixed)");
+                        }
+                        // Flush all pending GPU work so input buffers are ready
+                        endMixedNativeEncoder();
+                        [cmdBuf commit];
+                        [cmdBuf waitUntilCompleted];
+                        // Create a new command buffer for subsequent steps
+                        cmdBuf = [MPSCommandBuffer commandBufferFromCommandQueue:commandQueue];
+                        if (!cmdBuf) {
+                            return ExecutionResult::Error("Failed to recreate cmdBuf after CPU BLAS");
+                        }
+                        cmd_completion = CompletionEventForCommandBuffer(cmdBuf, async_completion);
+                        if (ns.output_slot >= 0 && (size_t)ns.output_slot < slot_bufs.size() &&
+                            !slot_bufs[ns.output_slot]) {
+                            size_t out_bytes = plan_->slots[ns.output_slot].byte_size;
+                            if (out_bytes > 0) {
+                                slot_bufs[ns.output_slot] =
+                                    [mtl_device newBufferWithLength:out_bytes
+                                                           options:ComputeBufferResourceOptions()];
+                            }
+                        }
+                        float* A = (float*)[slot_bufs[ns.input_slots[0]] contents];
+                        float* B = (float*)[slot_bufs[ns.input_slots[1]] contents];
+                        float* C = (float*)[slot_bufs[ns.output_slot] contents];
+                        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                                    (int)ns.baked_gemm_m, (int)ns.baked_gemm_n, (int)ns.baked_gemm_k,
+                                    1.0f, A, (int)ns.baked_gemm_k, B, (int)ns.baked_gemm_n,
+                                    0.0f, C, (int)ns.baked_gemm_n);
+                        slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
+                        continue;
+                    }
+
+                    auto supports_baked_mixed = [](NativeStep::BakedKind kind) {
+                        switch (kind) {
+                        case NativeStep::BakedKind::kSoftmax:
+                        case NativeStep::BakedKind::kLayerNorm:
+                        case NativeStep::BakedKind::kGatherRows:
+                        case NativeStep::BakedKind::kElementwise:
+                        case NativeStep::BakedKind::kReduce:
+                        case NativeStep::BakedKind::kFusedElementwise:
+                        case NativeStep::BakedKind::kGEMM:
+                        case NativeStep::BakedKind::kSort:
+                        case NativeStep::BakedKind::kTranspose2D:
+                            return true;
+                        default:
+                            return false;
+                        }
+                    };
+
+                    if (ns.baked_kind != NativeStep::BakedKind::kNone && ns.baked_pipeline &&
+                        supports_baked_mixed(ns.baked_kind)) {
                         if (ns.output_slot >= 0 && (size_t)ns.output_slot < slot_bufs.size() &&
                             !slot_bufs[ns.output_slot]) {
                             size_t out_bytes = plan_->slots[ns.output_slot].byte_size;
@@ -7371,9 +9213,16 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             }
                         }
 
-                        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+                        // Reuse persistent encoder; add memory barrier if we already
+                        // dispatched something (ensures prior writes are visible).
+                        id<MTLComputeCommandEncoder> enc = ensureMixedNativeEncoder();
                         if (!enc) {
                             return ExecutionResult::Error("Failed to create compute encoder in mixed path");
+                        }
+                        // Only insert a memory barrier if we already dispatched work
+                        // into this encoder (prior writes must be visible to this read).
+                        if (mixedNativeEncoderHasWork) {
+                            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                         }
 
                         bool baked_ok = true;
@@ -7381,7 +9230,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         case NativeStep::BakedKind::kSoftmax: {
                             if (ns.input_slots.empty() || !ns.baked_softmax_maxsum ||
                                 !ns.baked_softmax_pass2_pipeline) {
-                                [enc endEncoding];
+                                endMixedNativeEncoder();
                                 return ExecutionResult::Error("Baked softmax missing state (mixed path)");
                             }
                             [enc setComputePipelineState:ns.baked_pipeline];
@@ -7403,7 +9252,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         case NativeStep::BakedKind::kLayerNorm: {
                             if (ns.input_slots.empty() || !ns.baked_layernorm_stats ||
                                 !ns.baked_layernorm_pass2_pipeline) {
-                                [enc endEncoding];
+                                endMixedNativeEncoder();
                                 return ExecutionResult::Error("Baked layernorm missing state (mixed path)");
                             }
                             [enc setComputePipelineState:ns.baked_pipeline];
@@ -7411,7 +9260,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             [enc setBuffer:ns.baked_layernorm_stats offset:0 atIndex:1];
                             [enc setBytes:&ns.baked_rows length:sizeof(ns.baked_rows) atIndex:2];
                             [enc setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
-                            [enc setBytes:&ns.baked_layernorm_eps length:sizeof(ns.baked_layernorm_eps) atIndex:4];
+                            [enc setBytes:&ns.baked_layernorm_eps
+                                   length:sizeof(ns.baked_layernorm_eps)
+                                  atIndex:4];
                             [enc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
                             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                             [enc setComputePipelineState:ns.baked_layernorm_pass2_pipeline];
@@ -7425,20 +9276,28 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         }
                         case NativeStep::BakedKind::kGatherRows: {
                             if (ns.input_slots.size() < 2) {
-                                [enc endEncoding];
-                                return ExecutionResult::Error("Baked gather missing input slots (mixed path)");
+                                endMixedNativeEncoder();
+                                return ExecutionResult::Error(
+                                    "Baked gather missing input slots (mixed path)");
                             }
                             [enc setComputePipelineState:ns.baked_pipeline];
                             [enc setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
                             [enc setBuffer:slot_bufs[ns.input_slots[1]] offset:0 atIndex:1];
                             [enc setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:2];
                             [enc setBytes:&ns.baked_gather_num_indices
-                                    length:sizeof(ns.baked_gather_num_indices) atIndex:3];
+                                   length:sizeof(ns.baked_gather_num_indices)
+                                  atIndex:3];
                             [enc setBytes:&ns.baked_gather_cols
-                                    length:sizeof(ns.baked_gather_cols) atIndex:4];
+                                   length:sizeof(ns.baked_gather_cols)
+                                  atIndex:4];
                             [enc setBytes:&ns.baked_gather_table_rows
-                                    length:sizeof(ns.baked_gather_table_rows) atIndex:5];
-                            [enc dispatchThreads:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
+                                   length:sizeof(ns.baked_gather_table_rows)
+                                  atIndex:5];
+                            if (ns.baked_use_stride) {
+                                [enc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
+                            } else {
+                                [enc dispatchThreads:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
+                            }
                             break;
                         }
                         case NativeStep::BakedKind::kElementwise: {
@@ -7463,7 +9322,8 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             }
                             if (baked_ok) {
                                 if (ns.baked_use_stride) {
-                                    [enc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
+                                    [enc dispatchThreadgroups:ns.baked_grid
+                                        threadsPerThreadgroup:ns.baked_tg];
                                 } else {
                                     [enc dispatchThreads:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
                                 }
@@ -7507,31 +9367,73 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                 baked_ok = false;
                                 break;
                             }
-                            MPSDataType gemmDtype = plan_->slots[ns.input_slots[0]].dtype;
-                            size_t gemmElemSize = (gemmDtype == MPSDataTypeFloat16) ? 2 : 4;
-                            bool isMpp = (ns.baked_gemm_variant == kMppGemmVariant);
-                            for (uint32_t b = 0; b < ns.baked_gemm_batch; ++b) {
-                                size_t a_off = (size_t)b * ns.baked_gemm_m * ns.baked_gemm_k * gemmElemSize;
-                                size_t b_off = (size_t)b * ns.baked_gemm_k * ns.baked_gemm_n * gemmElemSize;
-                                size_t c_off = (size_t)b * ns.baked_gemm_m * ns.baked_gemm_n * gemmElemSize;
-                                if (isMpp) {
-                                    DispatchMppGemm(enc, ns.baked_pipeline,
-                                        slot_bufs[ns.input_slots[0]], a_off,
-                                        slot_bufs[ns.input_slots[1]], b_off,
-                                        slot_bufs[ns.output_slot], c_off,
-                                        ns.baked_gemm_m, ns.baked_gemm_n, ns.baked_gemm_k,
-                                        gemmDtype == MPSDataTypeFloat16);
-                                } else {
-                                    [enc setComputePipelineState:ns.baked_pipeline];
-                                    [enc setBuffer:slot_bufs[ns.input_slots[0]] offset:a_off atIndex:0];
-                                    [enc setBuffer:slot_bufs[ns.input_slots[1]] offset:b_off atIndex:1];
-                                    [enc setBuffer:slot_bufs[ns.output_slot] offset:c_off atIndex:2];
-                                    [enc setBytes:&ns.baked_gemm_m length:sizeof(ns.baked_gemm_m) atIndex:3];
-                                    [enc setBytes:&ns.baked_gemm_n length:sizeof(ns.baked_gemm_n) atIndex:4];
-                                    [enc setBytes:&ns.baked_gemm_k length:sizeof(ns.baked_gemm_k) atIndex:5];
-                                    [enc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
-                                }
+                            bool isNaive = (ns.baked_gemm_variant == kNaiveGemmVariant);
+                            // Single dispatch with grid.z = batch
+                            [enc setComputePipelineState:ns.baked_pipeline];
+                            [enc setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                            [enc setBuffer:slot_bufs[ns.input_slots[1]] offset:0 atIndex:1];
+                            [enc setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:2];
+                            [enc setBytes:&ns.baked_gemm_m length:sizeof(ns.baked_gemm_m) atIndex:3];
+                            [enc setBytes:&ns.baked_gemm_n length:sizeof(ns.baked_gemm_n) atIndex:4];
+                            [enc setBytes:&ns.baked_gemm_k length:sizeof(ns.baked_gemm_k) atIndex:5];
+                            if (isNaive) {
+                                MTLSize naive_grid = MTLSizeMake(ns.baked_gemm_n, ns.baked_gemm_m, ns.baked_gemm_batch);
+                                [enc dispatchThreads:naive_grid threadsPerThreadgroup:ns.baked_tg];
+                            } else {
+                                [enc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
                             }
+                            break;
+                        }
+                        case NativeStep::BakedKind::kTranspose2D: {
+                            if (ns.input_slots.empty()) {
+                                baked_ok = false;
+                                break;
+                            }
+                            endMixedNativeEncoder();
+                            id<MTLComputeCommandEncoder> trEnc = ensureMixedNativeEncoder();
+                            if (!trEnc) {
+                                baked_ok = false;
+                                break;
+                            }
+                            [trEnc setComputePipelineState:ns.baked_pipeline];
+                            [trEnc setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                            [trEnc setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
+                            [trEnc setBytes:&ns.baked_transpose_rows
+                                        length:sizeof(ns.baked_transpose_rows) atIndex:2];
+                            [trEnc setBytes:&ns.baked_transpose_cols
+                                        length:sizeof(ns.baked_transpose_cols) atIndex:3];
+                            NSUInteger tg_mem = 32 * 33 * sizeof(float);
+                            [trEnc setThreadgroupMemoryLength:tg_mem atIndex:0];
+                            [trEnc dispatchThreadgroups:ns.baked_grid
+                                     threadsPerThreadgroup:ns.baked_tg];
+                            break;
+                        }
+                        case NativeStep::BakedKind::kSort: {
+                            if (ns.input_slots.empty()) {
+                                baked_ok = false;
+                                break;
+                            }
+                            // Sort needs threadgroup memory — end current encoder, use fresh one
+                            endMixedNativeEncoder();
+                            id<MTLComputeCommandEncoder> sortEnc = ensureMixedNativeEncoder();
+                            if (!sortEnc) {
+                                baked_ok = false;
+                                break;
+                            }
+                            [sortEnc setComputePipelineState:ns.baked_pipeline];
+                            [sortEnc setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                            [sortEnc setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
+                            [sortEnc setBytes:&ns.baked_sort_n length:sizeof(ns.baked_sort_n) atIndex:2];
+                            [sortEnc setBytes:&ns.baked_sort_padded_n
+                                        length:sizeof(ns.baked_sort_padded_n)
+                                       atIndex:3];
+                            if (ns.baked_sort_num_rows > 1) {
+                                [sortEnc setBytes:&ns.baked_sort_n length:sizeof(ns.baked_sort_n) atIndex:4];
+                            }
+                            NSUInteger tg_mem = (NSUInteger)ns.baked_sort_padded_n * sizeof(float);
+                            [sortEnc setThreadgroupMemoryLength:tg_mem atIndex:0];
+                            [sortEnc dispatchThreadgroups:ns.baked_grid
+                                     threadsPerThreadgroup:ns.baked_tg];
                             break;
                         }
                         default:
@@ -7539,9 +9441,19 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             break;
                         }
 
-                        [enc endEncoding];
+                        // Mark that this encoder has dispatched work (for barrier logic).
+                        mixedNativeEncoderHasWork = true;
+
+                        // Don't end encoder here — it persists for the next native step.
+                        // Softmax/LayerNorm already inserted internal barriers.
+                        // ScatterAddRows uses blit and needs its own encoder cycle;
+                        // flush if we just dispatched one.
+                        if (ns.baked_kind == NativeStep::BakedKind::kScatterAddRows) {
+                            endMixedNativeEncoder();
+                        }
 
                         if (!baked_ok) {
+                            endMixedNativeEncoder();
                             return ExecutionResult::Error("Unsupported baked kind in mixed execution path");
                         }
 
@@ -7549,6 +9461,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         slot_producer_events[(size_t)ns.output_slot] = cmd_completion;
                         continue;
                     }
+
+                    // Non-baked handler creates its own encoder, so flush ours first.
+                    endMixedNativeEncoder();
 
                     mixed_input_bufs.clear();
                     for (auto slot : ns.input_slots) {
@@ -7575,6 +9490,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                 }
             }
 
+            endMixedNativeEncoder();
             [cmdBuf commit];
             if (!async_completion) {
                 [cmdBuf waitUntilCompleted];
@@ -7611,6 +9527,29 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                 if (buf_len > out_byte_size) {
                     out_byte_size = buf_len;
                 }
+            }
+
+            // Transpose aliases: create strided view — no copy needed.
+            if (!meta.transpose_perm.empty() && buf) {
+                size_t elem_size = DtypeByteSize(dtype);
+                auto input_strides = ComputeRowMajorByteStrides(meta.transpose_input_dims, elem_size);
+                std::vector<int64_t> transposed_strides(meta.transpose_perm.size());
+                for (size_t d = 0; d < meta.transpose_perm.size(); ++d) {
+                    transposed_strides[d] = input_strides[meta.transpose_perm[d]];
+                }
+                size_t storage_size = buf ? (size_t)[buf length] : out_byte_size;
+                MpsBuffer::BufferReleaser rel;
+                if (enable_output_pool) {
+                    rel = [output_device_key, storage_size](void* metal_buffer) {
+                        RecycleReusableOutputBuffer(output_device_key, storage_size, metal_buffer);
+                    };
+                }
+                result.buffers.push_back(std::make_unique<MpsBuffer>(device, (__bridge void*)buf, dtype, dims,
+                                                                     transposed_strides, storage_size,
+                                                                     std::move(rel), slot_completion));
+                CFRelease((__bridge CFTypeRef)buf);
+                slot_bufs[slot] = nil;
+                continue;
             }
 
             bool aliases_input = false;
@@ -7728,14 +9667,24 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
             });
         }
 
-        if (cache_intermediates && cache_set) {
-            if (execution_completion && !execution_completion->IsReady()) {
-                auto delayed_cache = std::shared_ptr<IntermediateCacheSet>(cache_set.release());
-                execution_completion->AddReadyCallback([delayed_cache] {});
-            } else {
-                std::scoped_lock lock(plan_->intermediate_pool_mutex);
-                plan_->intermediate_pool.push_back(std::move(cache_set));
-            }
+        // The intermediate buffer cache owns MTLBuffers that may still be in
+        // flight on the GPU (in flight either because the direct-run command
+        // buffer hasn't been observed to complete, or because the MPSGraph
+        // framework holds internal references to the MPSGraphTensorData
+        // wrappers). Releasing them at scope exit can corrupt an in-flight
+        // command buffer and crash the process with "Invalid Resource".
+        //
+        // We always enqueue the cache onto a global release queue, which is
+        // drained by a background thread. The background thread waits for the
+        // completion event to fire (via Await()) before destroying the cache,
+        // so the GPU is guaranteed to be idle when ReleaseAll() runs.
+        //
+        // Returning the cache to the pool is never safe because the next
+        // Execute() would grab it and reuse buffers before the previous
+        // command buffer's GPU work finishes.
+        if (cache_set) {
+            CompletionEvent fence = execution_completion ? execution_completion : MakeReadyCompletionEvent();
+            EnqueueCacheForDelayedRelease(std::shared_ptr<IntermediateCacheSet>(cache_set.release()), fence);
         }
 
         result.completion = execution_completion ? execution_completion : MakeReadyCompletionEvent();

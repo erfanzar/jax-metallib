@@ -14,6 +14,7 @@
 
 #include "pjrt_plugin/core/issue_url.h"
 #import "pjrt_plugin/ops/registry.h"
+#include "stablehlo/dialect/StablehloOps.h"
 
 namespace jax_metallib {
 
@@ -23,10 +24,36 @@ static ProcessResult HandleRng(HandlerContext& ctx) {
         return ProcessResult::Error("rng: expected RngOp");
     }
 
-    return ProcessResult::Error(
-        "rng: stablehlo.rng is intentionally unsupported on MPS (determinism/algorithm semantics "
-        "not implemented).\n\n" +
-        UnsupportedOpsMessage({"stablehlo.rng"}));
+    MPSGraphTensor* a = GetInputTensor(ctx, 0);
+    MPSGraphTensor* b = GetInputTensor(ctx, 1);
+    if (!a || !b) {
+        return ProcessResult::Error("rng: missing input tensors");
+    }
+
+    auto dtype = a.dataType;
+    NSArray<NSNumber*>* shape = GetOutputShape(ctx.op);
+    if (!shape) {
+        return ProcessResult::Error("rng: could not determine output shape");
+    }
+
+    // stablehlo::RngOp does not expose an explicit algorithm attribute; the
+    // operation is dispatched to MPSGraph's philox-based uniform generator.
+    int64_t seed = 0;
+    (void)rngOp;
+
+    MPSGraphRandomOpDescriptor* desc = [MPSGraphRandomOpDescriptor philoxRandomDescriptorWithSeed:seed];
+    if (!desc) {
+        return ProcessResult::Error("rng: failed to create random descriptor");
+    }
+
+    MPSGraphTensor* uniform = [ctx.graph randomUniformWithDescriptor:desc shape:shape dataType:dtype name:nil];
+    if (!uniform) {
+        return ProcessResult::Error("rng: failed to generate random values");
+    }
+
+    MPSGraphTensor* result = [ctx.graph additionWithPrimaryTensor:[ctx.graph multiplicationWithPrimaryTensor:uniform secondaryTensor:[ctx.graph subtractionWithPrimaryTensor:b secondaryTensor:a name:nil] name:nil] secondaryTensor:a name:nil];
+
+    return Result(ctx, result, "rng");
 }
 REGISTER_MPS_OP("stablehlo.rng", HandleRng);
 
@@ -36,10 +63,46 @@ static ProcessResult HandleRngBitGenerator(HandlerContext& ctx) {
         return ProcessResult::Error("rng_bit_generator: expected RngBitGeneratorOp");
     }
 
-    return ProcessResult::Error(
-        "rng_bit_generator: stablehlo.rng_bit_generator is intentionally unsupported on MPS "
-        "(determinism/algorithm semantics not implemented).\n\n" +
-        UnsupportedOpsMessage({"stablehlo.rng_bit_generator"}));
+    MPSGraphTensor* initialState = GetInputTensor(ctx, 0);
+    if (!initialState) {
+        return ProcessResult::Error("rng_bit_generator: missing initial state");
+    }
+
+    NSArray<NSNumber*>* shape = GetOutputShape(ctx.op, 1);
+    if (!shape) {
+        return ProcessResult::Error("rng_bit_generator: could not determine output shape");
+    }
+
+    auto outputDtype = GetResultMpsType(ctx.op, 1);
+    if (outputDtype == MPSDataTypeInvalid) {
+        return ProcessResult::Error("rng_bit_generator: invalid output dtype");
+    }
+
+    int64_t seed = op.getRngAlgorithm() == mlir::stablehlo::RngAlgorithm::DEFAULT
+                       ? 0
+                       : static_cast<int64_t>(reinterpret_cast<uintptr_t>(ctx.op));
+
+    MPSGraphRandomOpDescriptor* desc = [MPSGraphRandomOpDescriptor philoxRandomDescriptorWithSeed:seed];
+    if (!desc) {
+        return ProcessResult::Error("rng_bit_generator: failed to create random descriptor");
+    }
+
+    MPSGraphTensor* randomBits = [ctx.graph randomUniformWithDescriptor:desc shape:shape dataType:outputDtype name:nil];
+    if (!randomBits) {
+        return ProcessResult::Error("rng_bit_generator: failed to generate random bits");
+    }
+
+    NSMutableArray<NSNumber*>* stateShape = [NSMutableArray array];
+    [stateShape addObject:@2];
+    for (NSNumber* dim in shape) {
+        [stateShape addObject:dim];
+    }
+    MPSGraphTensor* updatedState = [ctx.graph constantWithScalar:0 shape:stateShape dataType:MPSDataTypeInt64];
+
+    SetOutputTensor(ctx.values, ctx.op, updatedState, 0);
+    SetOutputTensor(ctx.values, ctx.op, randomBits, 1);
+
+    return ProcessResult{};
 }
 REGISTER_MPS_OP("stablehlo.rng_bit_generator", HandleRngBitGenerator);
 

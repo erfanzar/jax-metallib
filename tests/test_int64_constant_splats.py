@@ -54,4 +54,3 @@ def test_int64_constant_splat_matches_cpu():
         text=True,
     )
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
-

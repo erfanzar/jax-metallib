@@ -34,6 +34,11 @@ NSString* FastNativeKernelsSource();
 // Returns nil if not supported (pre-M3 hardware).
 NSString* MppGemmKernelSource();
 
+// MX microscaling format kernels: quantize, dequantize, quantized GEMM.
+// Supports MXFP4 (E2M1 + E8M0 scale, group=32), MXFP8 (E4M3 + E8M0 scale, group=32),
+// and NVFP4 (E2M1 + E4M3 scale, group=16).
+NSString* MxQuantizedKernelSource();
+
 } // namespace jax_metallib
 
 #endif

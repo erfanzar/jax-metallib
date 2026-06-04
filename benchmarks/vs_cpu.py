@@ -810,10 +810,7 @@ def main():
     gpu_only = sum(1 for r in results if r["gpu"] and not r["cpu"])
     cpu_only = sum(1 for r in results if not r["gpu"] and r["cpu"])
 
-    print(
-        f"\nScoreboard:  GPU wins: {wins}  |  CPU wins: {losses}  |  "
-        f"gpu-only: {gpu_only}  |  cpu-only: {cpu_only}"
-    )
+    print(f"\nScoreboard:  GPU wins: {wins}  |  CPU wins: {losses}  |  gpu-only: {gpu_only}  |  cpu-only: {cpu_only}")
 
     speedups = [r["speedup"] for r in results if r["speedup"] is not None]
     if speedups:

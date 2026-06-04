@@ -6,24 +6,18 @@ from .util import OperationTestConfig, complex_standard_normal
 
 
 def make_reduction_op_configs():
-    for complex in [True, False]:
-        with OperationTestConfig.module_name(
-            "reduction-complex" if complex else "reduction-real"
-        ):
+    for is_complex in [True, False]:
+        with OperationTestConfig.module_name("reduction-complex" if is_complex else "reduction-real"):
             for reduction in [jnp.sum, jnp.mean, jnp.var, jnp.std]:
                 yield from [
                     OperationTestConfig(
                         reduction,
-                        lambda rng, complex=complex: complex_standard_normal(
-                            rng, (4, 5), complex
-                        ),
+                        lambda rng, is_complex=is_complex: complex_standard_normal(rng, (4, 5), is_complex),
                     ),
                     # Explicit argument because capture doesn't work.
                     OperationTestConfig(
                         lambda x, reduction=reduction: reduction(x, axis=1),
-                        lambda rng, complex=complex: complex_standard_normal(
-                            rng, (4, 5), complex
-                        ),
+                        lambda rng, is_complex=is_complex: complex_standard_normal(rng, (4, 5), is_complex),
                     ),
                 ]
 

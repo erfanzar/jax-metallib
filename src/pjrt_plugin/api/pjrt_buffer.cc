@@ -16,7 +16,7 @@
 #include "pjrt_plugin/core/pjrt_types.h"
 
 PJRT_Error* MPS_Buffer_Destroy(PJRT_Buffer_Destroy_Args* args) {
-    delete args->buffer;
+    ReleasePjrtBuffer(args->buffer);
     return nullptr;
 }
 
@@ -59,12 +59,17 @@ PJRT_Error* MPS_Buffer_DynamicDimensionIndices(PJRT_Buffer_DynamicDimensionIndic
 
 PJRT_Error* MPS_Buffer_GetMemoryLayout(PJRT_Buffer_GetMemoryLayout_Args* args) {
     args->layout.type = PJRT_Buffer_MemoryLayout_Type_Strides;
+    if (args->buffer && args->buffer->buffer) {
+        const auto& strides = args->buffer->buffer->byte_strides();
+        args->layout.strides.byte_strides = strides.data();
+        args->layout.strides.num_byte_strides = strides.size();
+    }
     return nullptr;
 }
 
 PJRT_Error* MPS_Buffer_OnDeviceSizeInBytes(PJRT_Buffer_OnDeviceSizeInBytes_Args* args) {
     args->on_device_size_in_bytes =
-        args->buffer && args->buffer->buffer ? args->buffer->buffer->byte_size() : 0;
+        args->buffer && args->buffer->buffer ? args->buffer->buffer->storage_byte_size() : 0;
     return nullptr;
 }
 
@@ -234,7 +239,7 @@ PJRT_Error* MPS_Buffer_IsOnCpu(PJRT_Buffer_IsOnCpu_Args* args) {
 }
 
 PJRT_Error* MPS_Buffer_ReadyEvent(PJRT_Buffer_ReadyEvent_Args* args) {
-    auto* event = new PJRT_Event();
+    auto* event = AcquirePjrtEvent();
     event->completion = args->buffer && args->buffer->buffer ? args->buffer->buffer->producer_completion()
                                                              : jax_metallib::MakeReadyCompletionEvent();
     args->event = event;

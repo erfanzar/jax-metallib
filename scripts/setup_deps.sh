@@ -19,11 +19,21 @@ PREFIX="${PREFIX:-$HOME/.local/jax-metallib-deps}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 BUILD_DIR="${BUILD_DIR:-/tmp/jax-metallib-deps-build}"
 
-# Pin to versions matching jaxlib 0.9.0 for bytecode compatibility
-# These are extracted from XLA commit bb760b047bdbfeff962f0366ad5cc782c98657e0
-XLA_COMMIT="${XLA_COMMIT:-bb760b047bdbfeff962f0366ad5cc782c98657e0}"
-STABLEHLO_COMMIT="${STABLEHLO_COMMIT:-127d2f238010589ac96f2f402a27afc9dccbb7ab}"
-LLVM_COMMIT_OVERRIDE="${LLVM_COMMIT_OVERRIDE:-f6d0a512972a74ef100723b9526a6a0ddb23f894}"
+# Pin to versions matching jaxlib 0.10.0 for bytecode compatibility
+# These are extracted from:
+#   - JAX revision.bzl @ a33ed614c58ee8a10d0b7536c50c2609c38500c1 (JAX 0.10.0)
+#   - XLA third_party/stablehlo/workspace.bzl @ b6f37ab7767f428fd6f993de5e211643d47d4deb
+#
+# LLVM pin note: StableHLO 3a8886d integrates LLVM at 8918319 (April 2025), but
+# that LLVM predates the OpaqueProperties MLIR type. Bumping to the next
+# StableHLO integrate (0dc0fd71, April 9 2026) which integrates LLVM at
+# 5e14916fa6ab — that LLVM has the matching PropertyRef API (post-PR #185157
+# rename from OpaqueProperties). XLA b6f37ab is left as-is for the bytecode
+# shape; only the build-time LLVM pin needs to match what StableHLO's source
+# code expects.
+XLA_COMMIT="${XLA_COMMIT:-b6f37ab7767f428fd6f993de5e211643d47d4deb}"
+STABLEHLO_COMMIT="${STABLEHLO_COMMIT:-0dc0fd71ccb5eab0f6edc7a8cab0a489a83a91f2}"
+LLVM_COMMIT_OVERRIDE="${LLVM_COMMIT_OVERRIDE:-5e14916fa6ab8dbafd06f4d3b7b8f9eb3abb767d}"
 
 # Abseil and Protobuf versions (protobuf depends on abseil)
 ABSEIL_VERSION="${ABSEIL_VERSION:-20250127.0}"

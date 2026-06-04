@@ -7,6 +7,7 @@ Usage:
     uv run python -m benchmarks.routing_ab
     uv run python -m benchmarks.routing_ab --compare before.jsonl after.jsonl
 """
+
 from __future__ import annotations
 
 import argparse
@@ -108,6 +109,7 @@ def run_op_trials(
 
 def compare_jsonl(before_path: str, after_path: str) -> None:
     """Load before/after JSONL and compare steady-state for priority ops."""
+
     def load(path):
         records = {}
         for line in Path(path).read_text().strip().split("\n"):
@@ -123,8 +125,10 @@ def compare_jsonl(before_path: str, after_path: str) -> None:
 
     all_ops = PRIORITY_OPS + SECONDARY_OPS
 
-    print(f"\n{'Op':<30} {'dtype':<6} {'Before MPS':<12} {'After MPS':<12} "
-          f"{'Delta%':<10} {'CPU (ms)':<10} {'A/CPU':<8} {'Set'}")
+    print(
+        f"\n{'Op':<30} {'dtype':<6} {'Before MPS':<12} {'After MPS':<12} "
+        f"{'Delta%':<10} {'CPU (ms)':<10} {'A/CPU':<8} {'Set'}"
+    )
     print("-" * 100)
 
     for op in all_ops:
@@ -143,9 +147,9 @@ def compare_jsonl(before_path: str, after_path: str) -> None:
             a_mps = get_ss(a, "mps")
             b_cpu = get_ss(b, "cpu")
 
-            b_ms = f"{b_mps*1e3:.3f}" if b_mps else "N/A"
-            a_ms = f"{a_mps*1e3:.3f}" if a_mps else "N/A"
-            cpu_ms = f"{b_cpu*1e3:.3f}" if b_cpu else "N/A"
+            b_ms = f"{b_mps * 1e3:.3f}" if b_mps else "N/A"
+            a_ms = f"{a_mps * 1e3:.3f}" if a_mps else "N/A"
+            cpu_ms = f"{b_cpu * 1e3:.3f}" if b_cpu else "N/A"
 
             if b_mps and a_mps:
                 delta = (a_mps - b_mps) / b_mps * 100
@@ -154,19 +158,19 @@ def compare_jsonl(before_path: str, after_path: str) -> None:
                 delta_s = "N/A"
 
             if a_mps and b_cpu and b_cpu > 0:
-                a_ratio = f"{a_mps/b_cpu:.2f}x"
+                a_ratio = f"{a_mps / b_cpu:.2f}x"
             else:
                 a_ratio = "N/A"
 
             s = "PRI" if op in PRIORITY_OPS else "SEC"
-            print(f"{op:<30} {dtype:<6} {b_ms:<12} {a_ms:<12} {delta_s:<10} "
-                  f"{cpu_ms:<10} {a_ratio:<8} {s}")
+            print(f"{op:<30} {dtype:<6} {b_ms:<12} {a_ms:<12} {delta_s:<10} {cpu_ms:<10} {a_ratio:<8} {s}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"),
-                        help="Compare two JSONL files instead of running benchmarks")
+    parser.add_argument(
+        "--compare", nargs=2, metavar=("BEFORE", "AFTER"), help="Compare two JSONL files instead of running benchmarks"
+    )
     parser.add_argument("--n-outer", type=int, default=5)
     parser.add_argument("--inner-iters", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
@@ -188,7 +192,8 @@ def main():
             dtype_label = "fp16" if fp_dtype == jnp.float16 else "fp32"
             print(f"\n--- {op} ({dtype_label}) ---")
             result = run_op_trials(
-                op, fp_dtype,
+                op,
+                fp_dtype,
                 n_outer=args.n_outer,
                 warmup=args.warmup,
                 inner_iters=args.inner_iters,
@@ -199,7 +204,7 @@ def main():
             cpu = result.get("cpu", {})
 
             if "error" in mps or "error" in cpu:
-                print(f"  ERROR: mps={mps.get('error','')} cpu={cpu.get('error','')}")
+                print(f"  ERROR: mps={mps.get('error', '')} cpu={cpu.get('error', '')}")
                 continue
 
             mps_ms = mps["median_of_medians_ms"]

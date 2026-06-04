@@ -363,13 +363,18 @@ static bool MatchCountedWhile(mlir::stablehlo::WhileOp whileOp, mlir::Block& con
 
 } // namespace
 
+static int max_while_depth = [] {
+    const char* env = std::getenv("JAX_METALLIB_MAX_WHILE_DEPTH");
+    return env ? std::stoi(env) : 100;
+}();
+
 static ProcessResult HandleWhileOp(HandlerContext& ctx) {
     auto whileOp = mlir::dyn_cast<mlir::stablehlo::WhileOp>(ctx.op);
     if (!whileOp) {
         return ProcessResult::Error("Expected stablehlo.while operation");
     }
 
-    if (ctx.depth > 100) {
+    if (ctx.depth > max_while_depth) {
         return ProcessResult::Error("Maximum call depth exceeded - possible recursive while");
     }
 

@@ -125,9 +125,7 @@ def make_sort_op_configs():
         # Key-value with stable sort
         configs.append(
             OperationTestConfig(
-                lambda keys, vals: lax.sort_key_val(
-                    keys, vals, dimension=1, is_stable=True
-                ),
+                lambda keys, vals: lax.sort_key_val(keys, vals, dimension=1, is_stable=True),
                 lambda rng: rng.standard_normal((4, 6)).astype(numpy.float32),
                 lambda rng: numpy.arange(24).reshape(4, 6).astype(numpy.float32),
                 name="lax.sort_key_val.stable",
@@ -137,9 +135,7 @@ def make_sort_op_configs():
         # Value-only because gradients at ties are not well-defined.
         configs.append(
             OperationTestConfig(
-                lambda keys, vals: lax.sort_key_val(
-                    keys, vals, dimension=1, is_stable=True
-                ),
+                lambda keys, vals: lax.sort_key_val(keys, vals, dimension=1, is_stable=True),
                 lambda rng: numpy.zeros((4, 6), dtype=numpy.float32),
                 lambda rng: numpy.arange(24).reshape(4, 6).astype(numpy.float32),
                 name="lax.sort_key_val.stable.ties",
@@ -153,9 +149,7 @@ def make_sort_op_configs():
 
         configs.append(
             OperationTestConfig(
-                lambda k1, k2, v1, v2: lax.sort(
-                    (k1, k2, v1, v2), dimension=1, num_keys=2, is_stable=True
-                ),
+                lambda k1, k2, v1, v2: lax.sort((k1, k2, v1, v2), dimension=1, num_keys=2, is_stable=True),
                 lambda rng: rng.standard_normal((4, 6)).astype(numpy.float32),
                 lambda rng: rng.standard_normal((4, 6)).astype(numpy.float32),
                 lambda rng: rng.standard_normal((4, 6)).astype(numpy.float32),

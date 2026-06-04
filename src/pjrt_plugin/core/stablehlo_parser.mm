@@ -42,8 +42,17 @@ const std::unordered_set<std::string>& getSupportedOps() {
     static std::unordered_set<std::string> supported = []() {
         auto ops = jax_metallib::OpRegistry::GetRegisteredOps();
 
+        // The pre-parse walk in checkUnsupportedOps traverses every op in the
+        // module, including those inside composite decomposition function bodies.
+        // jax 0.10 lowers many higher-level ops (jnp.arcsin, jnp.argsort, …) as
+        // stablehlo.composite, which processCompositeOp handles at runtime by
+        // walking the referenced decomposition. So composite itself, plus the
+        // stablehlo.return terminator that closes a decomposition body, must
+        // pass the pre-parse check.
         ops.insert("func.return");
         ops.insert("func.call");
+        ops.insert("stablehlo.composite");
+        ops.insert("stablehlo.return");
         return ops;
     }();
     return supported;

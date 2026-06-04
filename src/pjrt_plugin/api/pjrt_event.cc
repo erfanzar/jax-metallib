@@ -16,7 +16,7 @@
 #include "pjrt_plugin/core/pjrt_types.h"
 
 PJRT_Error* MPS_Event_Destroy(PJRT_Event_Destroy_Args* args) {
-    delete args->event;
+    ReleasePjrtEvent(args->event);
     return nullptr;
 }
 

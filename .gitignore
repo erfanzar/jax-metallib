@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+build.*/
 develop-eggs/
 dist/
 downloads/
@@ -83,6 +84,15 @@ db.sqlite3-journal
 # Flask stuff:
 instance/
 .webassets-cache
+
+# Environment variables
+.env
+.env.local
+
+# SSL certificates
+*.pem
+*.key
+*.crt
 
 # Scrapy stuff:
 .scrapy

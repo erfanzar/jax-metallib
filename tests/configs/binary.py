@@ -6,141 +6,85 @@ from .util import OperationTestConfig, complex_standard_normal
 
 
 def make_binary_op_configs():
-    for complex in [False, True]:
-        with OperationTestConfig.module_name(
-            "binary-complex" if complex else "binary-real"
-        ):
+    for is_complex in [False, True]:
+        with OperationTestConfig.module_name("binary-complex" if is_complex else "binary-real"):
             yield from [
                 OperationTestConfig(
                     jnp.add,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 1), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 1), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.subtract,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 1), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 1), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.multiply,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 1), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 1), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.divide,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 1), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 1), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.dot,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (4, 5), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (4, 5), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.less,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.less_equal,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.equal,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.greater_equal,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.greater,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.broadcast_arrays,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 1), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 1), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
                 ),
                 OperationTestConfig(
                     jnp.minimum,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    differentiable_argnums=(),
                 ),
                 OperationTestConfig(
                     jnp.maximum,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (3, 4), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (3, 4), is_complex),
+                    differentiable_argnums=(),
                 ),
                 OperationTestConfig(
                     jnp.power,
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (5,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (5,), is_complex),
                     lambda rng: rng.gamma(5, size=(7, 1)),
                 ),
                 OperationTestConfig(
                     jnp.power,
                     lambda rng: rng.gamma(5, size=(7, 1)),
-                    lambda rng, complex=complex: complex_standard_normal(
-                        rng, (5,), complex
-                    ),
+                    lambda rng, is_complex=is_complex: complex_standard_normal(rng, (5,), is_complex),
                 ),
             ]
 
@@ -163,18 +107,21 @@ def make_binary_op_configs():
                 lambda rng: rng.standard_normal((3, 4)),
                 lambda rng: rng.standard_normal((3, 4)),
                 lambda rng: rng.standard_normal((3, 4)),
+                differentiable_argnums=(),
             ),
             OperationTestConfig(
                 jnp.clip,
                 lambda rng: rng.standard_normal((3, 4)),
                 None,
                 lambda rng: rng.standard_normal((3, 4)),
+                differentiable_argnums=(),
             ),
             OperationTestConfig(
                 jnp.clip,
                 lambda rng: rng.standard_normal((3, 4)),
                 lambda rng: rng.standard_normal((3, 4)),
                 None,
+                differentiable_argnums=(),
             ),
             OperationTestConfig(
                 lax.clamp,

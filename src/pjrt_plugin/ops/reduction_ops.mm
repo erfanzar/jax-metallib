@@ -213,6 +213,130 @@ bool IsScalarZero(mlir::Value value) {
 
 } // namespace
 
+constexpr int64_t kTreeReduceThreshold = 1024;
+constexpr int64_t kTreeReduceWindowSize = 256;
+
+int64_t GetTotalElements(NSArray<NSNumber*>* shape) {
+    if (!shape) return 0;
+    int64_t total = 1;
+    for (NSNumber* dim in shape) {
+        total *= [dim longLongValue];
+    }
+    return total;
+}
+
+MPSGraphTensor* CreateReduction(MPSGraph* graph, MPSGraphTensor* input, NSArray<NSNumber*>* axes,
+                                const std::string& reductionType) {
+    if (reductionType == "stablehlo.add") {
+        return [graph reductionSumWithTensor:input axes:axes name:nil];
+    } else if (reductionType == "stablehlo.multiply") {
+        return [graph reductionProductWithTensor:input axes:axes name:nil];
+    } else if (reductionType == "stablehlo.maximum") {
+        return [graph reductionMaximumWithTensor:input axes:axes name:nil];
+    } else if (reductionType == "stablehlo.minimum") {
+        return [graph reductionMinimumWithTensor:input axes:axes name:nil];
+    } else if (reductionType == "stablehlo.and") {
+        return [graph reductionAndWithTensor:input axes:axes name:nil];
+    } else if (reductionType == "stablehlo.or") {
+        return [graph reductionOrWithTensor:input axes:axes name:nil];
+    }
+    return nil;
+}
+
+MPSGraphTensor* TreeReduce(HandlerContext& ctx, MPSGraphTensor* input,
+                           NSArray<NSNumber*>* reduceAxes,
+                           const std::string& reductionType) {
+    int64_t totalElements = GetTotalElements(input.shape);
+    if (totalElements <= kTreeReduceThreshold) {
+        return nil;
+    }
+
+    NSArray<NSNumber*>* originalShape = input.shape;
+    NSUInteger rank = originalShape.count;
+    int64_t numReduceDims = (int64_t)reduceAxes.count;
+
+    if (numReduceDims == 0) {
+        return nil;
+    }
+
+    bool fullReduce = (numReduceDims == (int64_t)rank);
+
+    if (fullReduce) {
+        int64_t totalFlat = totalElements;
+        int64_t numWindowElements = kTreeReduceWindowSize;
+        int64_t numChunks = (totalFlat + numWindowElements - 1) / numWindowElements;
+
+        NSMutableArray<NSNumber*>* flatShape = [NSMutableArray arrayWithObject:@(totalFlat)];
+        MPSGraphTensor* flat = [ctx.graph reshapeTensor:input withShape:flatShape name:nil];
+
+        NSMutableArray<MPSGraphTensor*>* levelResults = [NSMutableArray array];
+
+        for (int64_t i = 0; i < numChunks; i++) {
+            int64_t start = i * numWindowElements;
+            int64_t end = start + numWindowElements;
+            if (end > totalFlat) end = totalFlat;
+
+            MPSGraphTensor* startTensor = [ctx.graph constantWithScalar:start dataType:MPSDataTypeInt64];
+            startTensor = [ctx.graph reshapeTensor:startTensor withShape:@[ @1 ] name:nil];
+            MPSGraphTensor* endTensor = [ctx.graph constantWithScalar:end dataType:MPSDataTypeInt64];
+            endTensor = [ctx.graph reshapeTensor:endTensor withShape:@[ @1 ] name:nil];
+
+            MPSGraphTensor* sliced = [ctx.graph sliceTensor:flat start:startTensor end:endTensor name:nil];
+
+            MPSGraphTensor* reduced = CreateReduction(ctx.graph, sliced, @[ @0 ], reductionType);
+            if (!reduced) return nil;
+
+            [levelResults addObject:reduced];
+        }
+
+        MPSGraphTensor* current = nil;
+        for (MPSGraphTensor* chunkResult in levelResults) {
+            if (!current) {
+                current = chunkResult;
+            } else {
+                current = CreateReduction(ctx.graph,
+                                          [ctx.graph concatenationTensor:@[ current, chunkResult ] axis:0 name:nil],
+                                          @[ @0 ], reductionType);
+            }
+        }
+
+        if (!current) return nil;
+
+        while (current.shape.count > 0 && [current.shape[0] longLongValue] > 1) {
+            int64_t currentSize = [current.shape[0] longLongValue];
+            int64_t nextSize = (currentSize + 1) / 2;
+
+            MPSGraphTensor* left = [ctx.graph sliceTensor:current
+                                                    start:@[ @0 ]
+                                                      end:@[ @(nextSize) ]
+                                                     name:nil];
+            MPSGraphTensor* right = [ctx.graph sliceTensor:current
+                                                     start:@[ @(nextSize) ]
+                                                       end:@[ @(currentSize) ]
+                                                      name:nil];
+
+            if ([right.shape[0] longLongValue] < nextSize) {
+                int64_t padding = nextSize - [right.shape[0] longLongValue];
+                MPSGraphTensor* paddingTensor = [ctx.graph constantWithScalar:0 dataType:current.dataType];
+                paddingTensor = [ctx.graph tileTensor:paddingTensor withValues:@[@(padding)] name:nil];
+                right = [ctx.graph concatenationTensor:@[ right, paddingTensor ] axis:0 name:nil];
+            }
+
+            current = CreateReduction(ctx.graph,
+                                      [ctx.graph concatenationTensor:@[ left, right ] axis:0 name:nil],
+                                      @[ @0 ], reductionType);
+        }
+
+        if ([current.shape[0] longLongValue] == 1) {
+            current = [ctx.graph reshapeTensor:current withShape:@[] name:nil];
+        }
+
+        return current;
+    }
+
+    return nil;
+}
+
 static ProcessResult HandleSingleResultReduce(HandlerContext& ctx) {
     auto reduceOp = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(ctx.op);
     if (!reduceOp) {
@@ -225,28 +349,35 @@ static ProcessResult HandleSingleResultReduce(HandlerContext& ctx) {
     }
 
     auto dimensions = reduceOp.getDimensions();
+    std::string reductionType = GetReductionOpType(reduceOp.getBody());
+
     NSMutableArray<NSNumber*>* axes = [NSMutableArray array];
     for (int64_t dim : dimensions) {
         [axes addObject:@(dim)];
     }
 
-    std::string reductionType = GetReductionOpType(reduceOp.getBody());
+    int64_t numReduceDims = (int64_t)dimensions.size();
+    MPSGraphTensor* treeResult = TreeReduce(ctx, input, axes, reductionType);
 
     MPSGraphTensor* result = nullptr;
-    if (reductionType == "stablehlo.add") {
-        result = [ctx.graph reductionSumWithTensor:input axes:axes name:nil];
-    } else if (reductionType == "stablehlo.multiply") {
-        result = [ctx.graph reductionProductWithTensor:input axes:axes name:nil];
-    } else if (reductionType == "stablehlo.maximum") {
-        result = [ctx.graph reductionMaximumWithTensor:input axes:axes name:nil];
-    } else if (reductionType == "stablehlo.minimum") {
-        result = [ctx.graph reductionMinimumWithTensor:input axes:axes name:nil];
-    } else if (reductionType == "stablehlo.and") {
-        result = [ctx.graph reductionAndWithTensor:input axes:axes name:nil];
-    } else if (reductionType == "stablehlo.or") {
-        result = [ctx.graph reductionOrWithTensor:input axes:axes name:nil];
+    if (treeResult) {
+        result = treeResult;
     } else {
-        return ProcessResult::Error("reduce: unsupported reduction type: " + reductionType);
+        if (reductionType == "stablehlo.add") {
+            result = [ctx.graph reductionSumWithTensor:input axes:axes name:nil];
+        } else if (reductionType == "stablehlo.multiply") {
+            result = [ctx.graph reductionProductWithTensor:input axes:axes name:nil];
+        } else if (reductionType == "stablehlo.maximum") {
+            result = [ctx.graph reductionMaximumWithTensor:input axes:axes name:nil];
+        } else if (reductionType == "stablehlo.minimum") {
+            result = [ctx.graph reductionMinimumWithTensor:input axes:axes name:nil];
+        } else if (reductionType == "stablehlo.and") {
+            result = [ctx.graph reductionAndWithTensor:input axes:axes name:nil];
+        } else if (reductionType == "stablehlo.or") {
+            result = [ctx.graph reductionOrWithTensor:input axes:axes name:nil];
+        } else {
+            return ProcessResult::Error("reduce: unsupported reduction type: " + reductionType);
+        }
     }
 
     NSArray<NSNumber*>* outputShape = GetOutputShape(ctx.op);

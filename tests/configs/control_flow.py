@@ -7,7 +7,7 @@ from .util import OperationTestConfig
 
 def make_control_flow_op_configs():
     with OperationTestConfig.module_name("control_flow"):
-        return [
+        yield from [
             # ==================== lax.cond (2-branch case) ====================
             OperationTestConfig(
                 lambda pred, x, y: lax.cond(pred, lambda: x + 1, lambda: y * 2),

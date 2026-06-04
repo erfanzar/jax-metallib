@@ -66,8 +66,8 @@ grads = f(x)
 | macOS       | 13.0+ (Ventura or later)               |
 | Hardware    | Apple Silicon (M1 / M2 / M3 / M4 / M5) |
 | Python      | 3.11, 3.12, or 3.13                    |
-| JAX         | 0.9.x                                  |
-| jaxlib      | 0.9.x                                  |
+| JAX         | 0.10.x                                 |
+| jaxlib      | 0.10.x                                 |
 
 ## Build from Source
 
@@ -94,8 +94,8 @@ The bootstrap script (`scripts/setup_deps.sh`) fetches and builds the following 
 
 | Dependency  | Version           | Purpose                                          |
 | ----------- | ----------------- | ------------------------------------------------ |
-| LLVM + MLIR | XLA pin `bb760b0` | MLIR infrastructure, StableHLO dialect support   |
-| StableHLO   | `127d2f2`         | IR parsing, serialization, dialect definitions   |
+| LLVM + MLIR | XLA pin `b6f37ab` | MLIR infrastructure, StableHLO dialect support   |
+| StableHLO   | `3a8886d`        | IR parsing, serialization, dialect definitions   |
 | Abseil      | 20250127.0        | C++ utilities (strings, status, synchronization) |
 | Protobuf    | 29.3              | Device assignment protocol buffer serialization  |
 
@@ -213,6 +213,12 @@ The plugin implements two execution models that are interleaved within a single 
 | `JAX_METALLIB_LIBRARY_PATH` | auto      | Override path to `libpjrt_plugin_silicon.dylib`             |
 | `MPS_LOG_LEVEL`             | `1`       | Logging verbosity: `0` error, `1` warn, `2` info, `3` debug |
 | `JAX_TEST_MODE`             | `compare` | Test mode: `compare` (CPU vs MPS), `mps`, or `cpu`          |
+| `JAX_METALLIB_GEMM_NO_MPP`        | —         | Disable MPP fallback for GEMM operations                      |
+| `JAX_METALLIB_GEMM_AUTOTUNE`      | —         | Enable GEMM autotuning                                        |
+| `JAX_METALLIB_AUTOTUNE_CACHE_DIR` | `~/.cache/jax-metallib` | Directory for autotuning cache              |
+| `JAX_METALLIB_GEMM_VARIANT`       | —         | Select GEMM implementation variant                            |
+| `JAX_METALLIB_ELEMWISE_AUTOTUNE`  | —         | Enable elementwise operation autotuning                       |
+| `JAX_METALLIB_COMPLETION_TIMEOUT_MS` | `30000` | Timeout for completion events in milliseconds                |
 
 ### Library Discovery
 

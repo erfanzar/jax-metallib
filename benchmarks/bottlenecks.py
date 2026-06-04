@@ -669,14 +669,14 @@ def main() -> None:
     def fmt_ms(s: float | None) -> str:
         if s is None:
             return ""
-        return f"{s*1e3:.3f}"
+        return f"{s * 1e3:.3f}"
 
     def ratio(mps_s: float | None, cpu_s: float | None) -> str:
         if mps_s is None or cpu_s is None:
             return ""
         if cpu_s == 0:
             return "inf"
-        return f"{mps_s/cpu_s:.2f}x"
+        return f"{mps_s / cpu_s:.2f}x"
 
     rows: list[tuple[float, str]] = []
     for op, d in by_op.items():
