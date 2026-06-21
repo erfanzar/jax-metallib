@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -788,7 +789,7 @@ def run_one_benchmark(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={"PATH": "/usr/bin:/usr/local/bin", "HOME": str(Path.home())},
+            env={"PATH": "/usr/bin:/usr/local/bin", "HOME": str(Path.home()), **{k: v for k, v in os.environ.items() if k.startswith("JAX_METALLIB")}},
         )
         if proc.returncode != 0:
             stderr = proc.stderr.strip()
@@ -851,7 +852,7 @@ def main():
                 [pybin, "-c", "import jax; print(jax.__version__)"],
                 text=True,
                 timeout=10,
-                env={"PATH": "/usr/bin:/usr/local/bin", "HOME": str(Path.home())},
+                env={"PATH": "/usr/bin:/usr/local/bin", "HOME": str(Path.home()), **{k: v for k, v in os.environ.items() if k.startswith("JAX_METALLIB")}},
             ).strip()
             print(f"{label}: JAX {out}")
         except Exception as e:

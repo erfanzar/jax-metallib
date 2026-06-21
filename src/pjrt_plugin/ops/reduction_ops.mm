@@ -281,7 +281,14 @@ MPSGraphTensor* TreeReduce(HandlerContext& ctx, MPSGraphTensor* input,
             MPSGraphTensor* endTensor = [ctx.graph constantWithScalar:end dataType:MPSDataTypeInt64];
             endTensor = [ctx.graph reshapeTensor:endTensor withShape:@[ @1 ] name:nil];
 
-            MPSGraphTensor* sliced = [ctx.graph sliceTensor:flat start:startTensor end:endTensor name:nil];
+            // The modern MPSGraph slice API is sliceTensor:tensor starts:ends:strides:name:
+            // with NSArray<NSNumber*> args (the older 3-arg sliceTensor:start:end: selector
+            // no longer exists on macOS 15+). The input `flat` is rank-1 here.
+            MPSGraphTensor* sliced = [ctx.graph sliceTensor:flat
+                                                     starts:@[ @(start) ]
+                                                       ends:@[ @(end) ]
+                                                    strides:@[ @1 ]
+                                                       name:nil];
 
             MPSGraphTensor* reduced = CreateReduction(ctx.graph, sliced, @[ @0 ], reductionType);
             if (!reduced) return nil;
@@ -294,8 +301,9 @@ MPSGraphTensor* TreeReduce(HandlerContext& ctx, MPSGraphTensor* input,
             if (!current) {
                 current = chunkResult;
             } else {
+                // Modern API: concatTensors:dimension:name: (the second keyword is 'dimension', not 'axis').
                 current = CreateReduction(ctx.graph,
-                                          [ctx.graph concatenationTensor:@[ current, chunkResult ] axis:0 name:nil],
+                                          [ctx.graph concatTensors:@[ current, chunkResult ] dimension:0 name:nil],
                                           @[ @0 ], reductionType);
             }
         }
@@ -306,24 +314,29 @@ MPSGraphTensor* TreeReduce(HandlerContext& ctx, MPSGraphTensor* input,
             int64_t currentSize = [current.shape[0] longLongValue];
             int64_t nextSize = (currentSize + 1) / 2;
 
+            // Modern API: sliceTensor:tensor starts:ends:strides:name: with NSArray args.
             MPSGraphTensor* left = [ctx.graph sliceTensor:current
-                                                    start:@[ @0 ]
-                                                      end:@[ @(nextSize) ]
+                                                   starts:@[ @0 ]
+                                                     ends:@[ @(nextSize) ]
+                                                  strides:@[ @1 ]
                                                      name:nil];
             MPSGraphTensor* right = [ctx.graph sliceTensor:current
-                                                     start:@[ @(nextSize) ]
-                                                       end:@[ @(currentSize) ]
+                                                    starts:@[ @(nextSize) ]
+                                                      ends:@[ @(currentSize) ]
+                                                   strides:@[ @1 ]
                                                       name:nil];
 
             if ([right.shape[0] longLongValue] < nextSize) {
                 int64_t padding = nextSize - [right.shape[0] longLongValue];
                 MPSGraphTensor* paddingTensor = [ctx.graph constantWithScalar:0 dataType:current.dataType];
                 paddingTensor = [ctx.graph tileTensor:paddingTensor withValues:@[@(padding)] name:nil];
-                right = [ctx.graph concatenationTensor:@[ right, paddingTensor ] axis:0 name:nil];
+                // Modern API: concatTensors:dimension:name:
+                right = [ctx.graph concatTensors:@[ right, paddingTensor ] dimension:0 name:nil];
             }
 
+            // Modern API: concatTensors:dimension:name:
             current = CreateReduction(ctx.graph,
-                                      [ctx.graph concatenationTensor:@[ left, right ] axis:0 name:nil],
+                                      [ctx.graph concatTensors:@[ left, right ] dimension:0 name:nil],
                                       @[ @0 ], reductionType);
         }
 
@@ -732,13 +745,36 @@ static ProcessResult HandleSelectAndScatter(HandlerContext& ctx) {
 #endif
     }
 
-    auto windowDimensionsOpt = op.getWindowDimensions();
-    auto windowStridesOpt = op.getWindowStrides();
-    if (!windowDimensionsOpt || !windowStridesOpt) {
-        return ProcessResult::Error("select_and_scatter: missing window_dimensions/window_strides");
+    // Read window_dimensions / window_strides from the Properties struct first
+    // (the OpaqueProperties path in newer StableHLO pins stores attrs as
+    // typed property fields, not in the NamedAttrList). Fall back to the
+    // NamedAttrList if Properties didn't yield values — the textual-IR path
+    // emits attrs in the dictionary form which we then need to read from
+    // getAttrOfType.
+    std::vector<int64_t> windowDimensions;
+    std::vector<int64_t> windowStrides;
+    // DenseI64ArrayAttr exposes its data via asArrayRef() (no STL iterators).
+    if (auto attr = op.getWindowDimensionsAttr()) {
+        auto ar = attr.asArrayRef();
+        windowDimensions.assign(ar.begin(), ar.end());
+    } else if (auto attr = ctx.op->getAttrOfType<mlir::DenseI64ArrayAttr>("window_dimensions")) {
+        auto ar = attr.asArrayRef();
+        windowDimensions.assign(ar.begin(), ar.end());
     }
-    auto windowDimensions = *windowDimensionsOpt;
-    auto windowStrides = *windowStridesOpt;
+    if (auto attr = op.getWindowStridesAttr()) {
+        auto ar = attr.asArrayRef();
+        windowStrides.assign(ar.begin(), ar.end());
+    } else if (auto attr = ctx.op->getAttrOfType<mlir::DenseI64ArrayAttr>("window_strides")) {
+        auto ar = attr.asArrayRef();
+        windowStrides.assign(ar.begin(), ar.end());
+    }
+    if (windowDimensions.empty()) {
+        return ProcessResult::Error("select_and_scatter: missing window_dimensions");
+    }
+    if (windowStrides.empty()) {
+        // Default to all-ones strides (matches the StableHLO spec default).
+        windowStrides.assign(windowDimensions.size(), 1);
+    }
     size_t rank = windowDimensions.size();
     bool isNHWC = (rank == 4 && windowStrides.size() == 4);
     bool isNWC = (rank == 3 && windowStrides.size() == 3);
@@ -748,7 +784,10 @@ static ProcessResult HandleSelectAndScatter(HandlerContext& ctx) {
 
     std::vector<std::pair<int64_t, int64_t>> padding;
     std::optional<mlir::DenseIntElementsAttr> paddingAttr;
-    if (auto attr = ctx.op->getAttrOfType<mlir::DenseIntElementsAttr>("padding")) {
+    // Same OpaqueProperties fallback as for window_dimensions above.
+    if (auto attr = op.getPaddingAttr()) {
+        paddingAttr = attr;
+    } else if (auto attr = ctx.op->getAttrOfType<mlir::DenseIntElementsAttr>("padding")) {
         paddingAttr = attr;
     }
     if (!ReadPaddingOrDefaultZeros(paddingAttr, rank, padding)) {

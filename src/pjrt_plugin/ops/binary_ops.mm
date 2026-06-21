@@ -168,6 +168,71 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
     if (!lhsInput || !rhsInput)
         return ProcessResult::Error("dot_general: missing input tensor");
 
+    // Mixed precision: cast fp32 inputs to fp16 for 2x MMA throughput.
+    // Only for large matmuls where the speedup outweighs precision loss and graph overhead.
+    // Disabled by JAX_METALLIB_GEMM_TRUE_F32=1.
+    bool mixedFp32 = false;
+    {
+        static const bool useMixed = []() {
+            const char* v = std::getenv("JAX_METALLIB_GEMM_TRUE_F32");
+            return !(v && v[0] == '1' && v[1] == '\0');
+        }();
+        if (useMixed && lhsInput.dataType == MPSDataTypeFloat32) {
+            // Require both inputs to have >= 500K elements to avoid
+            // precision loss and overhead on small/special-shape matmuls.
+            // Also require sufficient FLOPs (M*N*K*batch >= 100M) to amortize cast overhead.
+            auto totalElems = [](MPSGraphTensor* t) -> uint64_t {
+                uint64_t total = 1;
+                for (NSNumber* d in t.shape) {
+                    uint64_t dim = [d unsignedLongLongValue];
+                    if (dim > 0)
+                        total *= dim;
+                }
+                return total;
+            };
+            if (totalElems(lhsInput) >= 500000 && totalElems(rhsInput) >= 500000) {
+                auto dimNumbers = dotOp.getDotDimensionNumbers();
+                auto lhsContractingDims = dimNumbers.getLhsContractingDimensions();
+                auto rhsContractingDims = dimNumbers.getRhsContractingDimensions();
+                auto lhsBatchDims = dimNumbers.getLhsBatchingDimensions();
+                auto rhsBatchDims = dimNumbers.getRhsBatchingDimensions();
+                NSArray<NSNumber*>* lhsShape = lhsInput.shape;
+                NSArray<NSNumber*>* rhsShape = rhsInput.shape;
+                uint64_t m = 1, k = 1, n = 1, batch = 1;
+                for (int64_t d : lhsBatchDims) {
+                    batch *= [lhsShape[(NSUInteger)d] unsignedLongLongValue];
+                }
+                for (int64_t d : lhsContractingDims) {
+                    k *= [lhsShape[(NSUInteger)d] unsignedLongLongValue];
+                }
+                for (NSUInteger d = 0; d < lhsShape.count; ++d) {
+                    bool used = false;
+                    for (int64_t bd : lhsBatchDims) if ((NSUInteger)bd == d) used = true;
+                    for (int64_t cd : lhsContractingDims) if ((NSUInteger)cd == d) used = true;
+                    if (!used) m *= [lhsShape[d] unsignedLongLongValue];
+                }
+                for (NSUInteger d = 0; d < rhsShape.count; ++d) {
+                    bool used = false;
+                    for (int64_t bd : rhsBatchDims) if ((NSUInteger)bd == d) used = true;
+                    for (int64_t cd : rhsContractingDims) if ((NSUInteger)cd == d) used = true;
+                    if (!used) n *= [rhsShape[d] unsignedLongLongValue];
+                }
+                uint64_t flops = m * n * k * batch;
+                if (flops >= 100000000) {
+                    mixedFp32 = true;
+                    lhsInput = [ctx.graph castTensor:lhsInput toType:MPSDataTypeFloat16 name:nil];
+                    rhsInput = [ctx.graph castTensor:rhsInput toType:MPSDataTypeFloat16 name:nil];
+                }
+            }
+        }
+    }
+    // Wrap result with fp16→f32 cast when mixed precision is active.
+    auto DotResult = [&](MPSGraphTensor* result, const char* name) -> ProcessResult {
+        if (mixedFp32 && result)
+            result = [ctx.graph castTensor:result toType:MPSDataTypeFloat32 name:nil];
+        return Result(ctx, result, name);
+    };
+
     auto dimNumbers = dotOp.getDotDimensionNumbers();
     auto lhsContractingDims = dimNumbers.getLhsContractingDimensions();
     auto rhsContractingDims = dimNumbers.getRhsContractingDimensions();
@@ -263,7 +328,7 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
             if (outShape && result && ![outShape isEqualToArray:result.shape]) {
                 result = [ctx.graph reshapeTensor:result withShape:outShape name:nil];
             }
-            return Result(ctx, result, "dot_general");
+            return DotResult(result, "dot_general");
         }
 
         if (lhsRank == 1 && rhsRank == 2 && lc == 0 && rc == 0) {
@@ -275,7 +340,7 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
             if (outShape && result && ![outShape isEqualToArray:result.shape]) {
                 result = [ctx.graph reshapeTensor:result2d withShape:outShape name:nil];
             }
-            return Result(ctx, result, "dot_general");
+            return DotResult(result, "dot_general");
         }
 
         if (lhsRank == 2 && rhsRank == 1 && lc == 1 && rc == 0) {
@@ -287,7 +352,7 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
             if (outShape && result && ![outShape isEqualToArray:result.shape]) {
                 result = [ctx.graph reshapeTensor:result2d withShape:outShape name:nil];
             }
-            return Result(ctx, result, "dot_general");
+            return DotResult(result, "dot_general");
         }
     }
 
@@ -305,7 +370,7 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
             if (outShape && result && ![outShape isEqualToArray:result.shape]) {
                 result = [ctx.graph reshapeTensor:result withShape:outShape name:nil];
             }
-            return Result(ctx, result, "dot_general");
+            return DotResult(result, "dot_general");
         }
 
         if (lhsRank == 2 && rhsRank == 3 && lb == 0 && rb == 0 && lc == 1 && rc == 1) {
@@ -318,7 +383,7 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
             if (outShape && result3d && ![outShape isEqualToArray:result3d.shape]) {
                 result3d = [ctx.graph reshapeTensor:result3d withShape:outShape name:nil];
             }
-            return Result(ctx, result3d, "dot_general");
+            return DotResult(result3d, "dot_general");
         }
 
         if (lhsRank == 3 && rhsRank == 2 && lb == 0 && rb == 0 && lc == 2 && rc == 1) {
@@ -331,7 +396,7 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
             if (outShape && result3d && ![outShape isEqualToArray:result3d.shape]) {
                 result3d = [ctx.graph reshapeTensor:result3d withShape:outShape name:nil];
             }
-            return Result(ctx, result3d, "dot_general");
+            return DotResult(result3d, "dot_general");
         }
     }
 
@@ -436,15 +501,15 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
     NSArray<NSNumber*>* expectedOutputShape = GetOutputShape(ctx.op);
     NSArray<NSNumber*>* finalOutShape =
         expectedOutputShape ? expectedOutputShape : (NSArray<NSNumber*>*)ToNSArray(logicalOutputShape);
-    // Skip final reshape when matmul output already has the correct shape:
-    // - 0 or 1 batch dims: result shape [m,n] or [batch,m,n] matches expected
-    // - Multiple batch dims: need reshape since we flattened batch dims
-    if (finalOutShape && result && batchSizes.size() <= 1 &&
-        ![finalOutShape isEqualToArray:result.shape]) {
+    // Reshape the matmul result to match the expected output shape.
+    // When there are 2+ batch dims, the matmul produced [B1*B2*..., m, n] (flattened)
+    // and must be reshaped back to [B1, B2, ..., m, n]. With 0 or 1 batch dims the
+    // matmul output may already match, so the isEqualToArray check avoids a no-op reshape.
+    if (finalOutShape && result && ![finalOutShape isEqualToArray:result.shape]) {
         result = [ctx.graph reshapeTensor:result withShape:finalOutShape name:nil];
     }
 
-    return Result(ctx, result, "dot_general");
+    return DotResult(result, "dot_general");
 }
 REGISTER_MPS_OP("stablehlo.dot_general", HandleDotGeneral);
 

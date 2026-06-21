@@ -2054,7 +2054,21 @@ static bool IsEligibleReduceNativeOp(mlir::Operation* op, IntrinsicNativeKind ki
     if (outNumel * static_cast<uint64_t>(reduce_dim_size) != inNumel) {
         return false;
     }
-    return IsNeutralReduceInit(reduceOp.getInitValues()[0], kind);
+    if (!IsNeutralReduceInit(reduceOp.getInitValues()[0], kind)) {
+        return false;
+    }
+    // Size threshold for sum/max/min last-axis reductions: small reductions have
+    // high dispatch overhead relative to compute, so stay on the graph path.
+    if (kind == IntrinsicNativeKind::kReduceSumLastAxis ||
+        kind == IntrinsicNativeKind::kReduceMaxLastAxis ||
+        kind == IntrinsicNativeKind::kReduceMinLastAxis) {
+        uint64_t minElems = static_cast<uint64_t>(
+            EnvIntValue("JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS", 100000));
+        if (inNumel < minElems) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static IntrinsicNativeKind ClassifyConvertKind(mlir::Operation* op) {
@@ -2203,10 +2217,17 @@ static bool ClassifyDotGeneralNN(mlir::Operation* op, uint32_t* out_m, uint32_t*
         return false;
     }
     // For non-batched GEMM, require the env flag gate.
-    // For batched GEMM (batch > 1), always use native kernels — grid.z dispatch
-    // is dramatically faster than MPSGraph which runs batch-many separate evaluations.
+    // For batched GEMM (batch > 1): only force native when each individual matmul
+    // is large enough (M*N*K >= 1M FLOPs). Small batched matmuls are often faster
+    // on MPSGraph due to better batch scheduling and lower dispatch overhead.
     if (batch <= 1 && !EnvFlagEnabled("JAX_METALLIB_ENABLE_NATIVE_GEMM")) {
         return false;
+    }
+    if (batch > 1) {
+        uint64_t per_matmul_flops = static_cast<uint64_t>(M) * N * K;
+        if (per_matmul_flops < 1000000 && !EnvFlagEnabled("JAX_METALLIB_ENABLE_NATIVE_GEMM")) {
+            return false;
+        }
     }
     // Minimum alignment across all GEMM variants: M%32, N%32, K%16.
     // (Variants: 32x32x32, 64x64x32, 64x64x16, 64x32x32)
@@ -2905,9 +2926,10 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
             [cb waitUntilCompleted];
         }
 
-        // Benchmark
+        // Benchmark — wall-clock (includes dispatch overhead, same as MPSGraph)
         double total_time = 0.0;
         for (int it = 0; it < bench_iters; ++it) {
+            auto t0 = std::chrono::high_resolution_clock::now();
             id<MTLCommandBuffer> cb = [queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:pipeline];
@@ -2921,7 +2943,8 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
-            total_time += [cb GPUEndTime] - [cb GPUStartTime];
+            auto t1 = std::chrono::high_resolution_clock::now();
+            total_time += std::chrono::duration<double>(t1 - t0).count();
         }
         double avg_time = total_time / bench_iters;
 
@@ -2950,16 +2973,18 @@ static int AutotuneGemm(id<MTLDevice> device, int dtype, uint32_t M, uint32_t N,
                 [cb waitUntilCompleted];
             }
 
-            // Benchmark
+            // Benchmark — wall-clock (includes dispatch overhead, same as MPSGraph)
             double mpp_total_time = 0.0;
             for (int it = 0; it < bench_iters; ++it) {
+                auto t0 = std::chrono::high_resolution_clock::now();
                 id<MTLCommandBuffer> cb = [queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
                 DispatchMppGemm(enc, mppPipeline, tmpA, 0, tmpB, 0, tmpC, 0, M, N, K, dtype == 1);
                 [enc endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
-                mpp_total_time += [cb GPUEndTime] - [cb GPUStartTime];
+                auto t1 = std::chrono::high_resolution_clock::now();
+                mpp_total_time += std::chrono::duration<double>(t1 - t0).count();
             }
             double mpp_avg = mpp_total_time / bench_iters;
 
@@ -3189,9 +3214,10 @@ static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind, 
             [cb commit];
             [cb waitUntilCompleted];
         }
-        // Benchmark
+        // Benchmark — wall-clock (includes dispatch overhead, same as MPSGraph)
         double native_total = 0.0;
         for (int it = 0; it < bench_iters; ++it) {
+            auto t0 = std::chrono::high_resolution_clock::now();
             id<MTLCommandBuffer> cb = [queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:pipeline];
@@ -3212,7 +3238,8 @@ static bool AutotuneElementwise(id<MTLDevice> device, IntrinsicNativeKind kind, 
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
-            native_total += [cb GPUEndTime] - [cb GPUStartTime];
+            auto t1 = std::chrono::high_resolution_clock::now();
+            native_total += std::chrono::duration<double>(t1 - t0).count();
         }
         native_avg = native_total / bench_iters;
     }
@@ -5428,6 +5455,16 @@ static bool IsEligibleSortNativeOp(mlir::Operation* op) {
         }
     }
     if (descending) {
+        return false;
+    }
+    // Size threshold: small sorts are faster through MPSGraph.
+    uint64_t totalElems = 1;
+    for (int64_t d : inShape) {
+        totalElems *= static_cast<uint64_t>(d);
+    }
+    uint64_t cols = (inShape.size() == 2) ? static_cast<uint64_t>(inShape[1]) : static_cast<uint64_t>(inShape[0]);
+    uint64_t rows = (inShape.size() == 2) ? static_cast<uint64_t>(inShape[0]) : 1;
+    if (totalElems < 100000 && !(rows > 1 && cols > 256)) {
         return false;
     }
     return true;
