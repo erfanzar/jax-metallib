@@ -43,24 +43,34 @@ public:
     }
 
     void Await() const {
+        AwaitWithHint(0);
+    }
+
+    void AwaitWithHint(uint32_t expected_us) const {
         // Fast path: already complete.
         if (ready_.load(std::memory_order_acquire)) {
             return;
         }
-        // Spin for up to ~200us to avoid condvar wakeup latency (~15-20us).
-        // For typical GPU fences (100-200us), spinning catches completion
-        // without the kernel-level wakeup overhead of condition variables.
-        for (int i = 0; i < 100000; ++i) {
+        // Phase 1: short spin (5K iterations ~10us on ARM).
+        // Catches very fast GPU completions without any condvar overhead.
+        for (int i = 0; i < 5000; ++i) {
             if (ready_.load(std::memory_order_acquire)) {
                 return;
             }
-#if defined(__aarch64__) || defined(__arm64__)
-            __asm__ volatile("yield");
-#elif defined(__x86_64__)
-            __asm__ volatile("pause");
-#endif
+            SpinPause();
         }
-        // Slow path: condvar wait with timeout.
+        // Phase 2: medium spin (up to JAX_METALLIB_SPIN_ITERATIONS, default 50K).
+        // Skip if the hint suggests GPU work is expected to take longer than ~200us.
+        if (expected_us <= 200) {
+            int max_spin = GetMaxSpinIterations();
+            for (int i = 5000; i < max_spin; ++i) {
+                if (ready_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                SpinPause();
+            }
+        }
+        // Phase 3: condvar wait with timeout.
         const auto timeout_ms = []() -> int {
             const char* env = std::getenv("JAX_METALLIB_COMPLETION_TIMEOUT_MS");
             if (env) {
@@ -127,6 +137,27 @@ public:
     }
 
 private:
+    void SpinPause() const {
+#if defined(__aarch64__) || defined(__arm64__)
+        __asm__ volatile("yield");
+#elif defined(__x86_64__)
+        __asm__ volatile("pause");
+#endif
+    }
+
+    static int GetMaxSpinIterations() {
+        const char* env = std::getenv("JAX_METALLIB_SPIN_ITERATIONS");
+        if (env) {
+            try {
+                int val = std::stoi(env);
+                return val > 0 ? val : 50000;
+            } catch (...) {
+                return 50000;
+            }
+        }
+        return 50000;
+    }
+
     void FinishWithError(std::string error) {
         std::vector<std::function<void()>> callbacks;
         {

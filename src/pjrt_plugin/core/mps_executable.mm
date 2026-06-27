@@ -14,8 +14,6 @@
 
 #import "pjrt_plugin/core/mps_executable.h"
 
-#import <Metal/Metal.h>
-
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #import "pjrt_plugin/core/issue_url.h"
@@ -30,7 +28,6 @@
 #include "stablehlo/dialect/Version.h"
 
 #import <Accelerate/Accelerate.h>
-#include <dispatch/dispatch.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
@@ -38,6 +35,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <dispatch/dispatch.h>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -87,7 +85,9 @@ struct IntermediateCacheSet {
         bufs.clear();
     }
 
-    ~IntermediateCacheSet() { ReleaseAll(); }
+    ~IntermediateCacheSet() {
+        ReleaseAll();
+    }
 };
 
 struct GraphStep {
@@ -202,9 +202,9 @@ struct NativeStep {
     uint32_t baked_transpose_batch = 1;
 
     // Sort fields
-    uint32_t baked_sort_n = 0;          // elements per row (or total for 1D)
+    uint32_t baked_sort_n = 0; // elements per row (or total for 1D)
     uint32_t baked_sort_padded_n = 0;
-    uint32_t baked_sort_num_rows = 1;   // 1 for 1D sort, >1 for 2D row-wise sort
+    uint32_t baked_sort_num_rows = 1; // 1 for 1D sort, >1 for 2D row-wise sort
 
     // CPU Cholesky fields
     uint32_t baked_cholesky_n = 0;
@@ -487,10 +487,8 @@ static bool IsEligibleTransposeAliasOp(mlir::Operation* op) {
 
 // Native transpose: handles transposes that swap only the last 2 dims on f32 tensors.
 // These are NOT eligible for alias (result consumed internally), but can use a fast Metal kernel.
-static bool IsEligibleTransposeNativeOp(mlir::Operation* op,
-                                         uint32_t* out_rows = nullptr,
-                                         uint32_t* out_cols = nullptr,
-                                         uint32_t* out_batch = nullptr) {
+static bool IsEligibleTransposeNativeOp(mlir::Operation* op, uint32_t* out_rows = nullptr,
+                                        uint32_t* out_cols = nullptr, uint32_t* out_batch = nullptr) {
     auto transposeOp = mlir::dyn_cast_or_null<mlir::stablehlo::TransposeOp>(op);
     if (!transposeOp) {
         return false;
@@ -510,21 +508,26 @@ static bool IsEligibleTransposeNativeOp(mlir::Operation* op,
     auto perm = transposeOp.getPermutation();
     int64_t rank = static_cast<int64_t>(inShape.size());
     for (int64_t i = 0; i < rank - 2; ++i) {
-        if (perm[i] != i) return false;
+        if (perm[i] != i)
+            return false;
     }
     if (perm[rank - 2] != rank - 1 || perm[rank - 1] != rank - 2) {
         return false;
     }
     uint32_t rows = static_cast<uint32_t>(inShape[rank - 2]);
     uint32_t cols = static_cast<uint32_t>(inShape[rank - 1]);
-    if (rows == 0 || cols == 0) return false;
+    if (rows == 0 || cols == 0)
+        return false;
     uint32_t batch = 1;
     for (int64_t i = 0; i < rank - 2; ++i) {
         batch *= static_cast<uint32_t>(inShape[i]);
     }
-    if (out_rows) *out_rows = rows;
-    if (out_cols) *out_cols = cols;
-    if (out_batch) *out_batch = batch;
+    if (out_rows)
+        *out_rows = rows;
+    if (out_cols)
+        *out_cols = cols;
+    if (out_batch)
+        *out_batch = batch;
     return true;
 }
 
@@ -1642,8 +1645,7 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
             if (!reduceResult.hasOneUse())
                 continue;
             mlir::Operation* broadcastUser = *reduceResult.getUsers().begin();
-            auto broadcastOp =
-                mlir::dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(broadcastUser);
+            auto broadcastOp = mlir::dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(broadcastUser);
             if (!broadcastOp)
                 continue;
 
@@ -1652,8 +1654,7 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
             llvm::SmallVector<mlir::Operation*, 4> extraBroadcasts;
             while (broadcastedMax.hasOneUse()) {
                 mlir::Operation* user = *broadcastedMax.getUsers().begin();
-                auto nextBroadcast =
-                    mlir::dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(user);
+                auto nextBroadcast = mlir::dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(user);
                 if (!nextBroadcast)
                     break;
                 extraBroadcasts.push_back(nextBroadcast);
@@ -1706,8 +1707,7 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
 
             uint64_t inputNumel = 0;
             if (!GetStaticTensorInfo(softmax_input.getType(), nullptr, &inputNumel, nullptr) ||
-                inputNumel <
-                    (uint64_t)EnvIntValue("JAX_METALLIB_SOFTMAX_FUSION_MIN_ELEMENTS", 1024))
+                inputNumel < (uint64_t)EnvIntValue("JAX_METALLIB_SOFTMAX_FUSION_MIN_ELEMENTS", 1024))
                 continue;
 
             NumCandidate nc;
@@ -1911,6 +1911,16 @@ static IntrinsicNativeKind ClassifyReduceKind(mlir::Operation* op) {
         }
         return IntrinsicNativeKind::kReduceMeanLastAxis;
     }
+    // Plain last-axis sum: route to native per-row simd kernel (same family as
+    // the mean path, which wins 1.05-1.09x). IsEligibleReduceNativeOp re-validates
+    // axis/dtype/100K-element threshold. Max/min stay on MPSGraph (no headroom).
+    if (auto inType2 = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType())) {
+        auto dims2 = reduceOp.getDimensions();
+        if (dims2.size() == 1 && dims2[0] == inType2.getRank() - 1 &&
+            GetReduceBodyOpName(reduceOp) == "stablehlo.add") {
+            return IntrinsicNativeKind::kReduceSumLastAxis;
+        }
+    }
     // Plain reduce ops route to MPSGraph: the graph path fuses the entire
     // reduce into a single MPSGraphExecutable dispatch, avoiding the separate
     // command-buffer overhead of the native-only path.  Fused patterns
@@ -2030,10 +2040,9 @@ static bool IsEligibleReduceNativeOp(mlir::Operation* op, IntrinsicNativeKind ki
 
     int64_t axis = dims[0];
     int64_t rank = static_cast<int64_t>(inShape.size());
-    bool is_axis0_kind = (kind == IntrinsicNativeKind::kReduceSumAxis0 ||
-                          kind == IntrinsicNativeKind::kReduceMaxAxis0 ||
-                          kind == IntrinsicNativeKind::kReduceMinAxis0 ||
-                          kind == IntrinsicNativeKind::kReduceMeanAxis0);
+    bool is_axis0_kind =
+        (kind == IntrinsicNativeKind::kReduceSumAxis0 || kind == IntrinsicNativeKind::kReduceMaxAxis0 ||
+         kind == IntrinsicNativeKind::kReduceMinAxis0 || kind == IntrinsicNativeKind::kReduceMeanAxis0);
     if (is_axis0_kind) {
         if (axis != 0 || rank != 2) {
             return false;
@@ -2059,11 +2068,10 @@ static bool IsEligibleReduceNativeOp(mlir::Operation* op, IntrinsicNativeKind ki
     }
     // Size threshold for sum/max/min last-axis reductions: small reductions have
     // high dispatch overhead relative to compute, so stay on the graph path.
-    if (kind == IntrinsicNativeKind::kReduceSumLastAxis ||
-        kind == IntrinsicNativeKind::kReduceMaxLastAxis ||
+    if (kind == IntrinsicNativeKind::kReduceSumLastAxis || kind == IntrinsicNativeKind::kReduceMaxLastAxis ||
         kind == IntrinsicNativeKind::kReduceMinLastAxis) {
-        uint64_t minElems = static_cast<uint64_t>(
-            EnvIntValue("JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS", 100000));
+        uint64_t minElems =
+            static_cast<uint64_t>(EnvIntValue("JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS", 100000));
         if (inNumel < minElems) {
             return false;
         }
@@ -2350,43 +2358,58 @@ static bool ClassifyDotGeneralSmall(mlir::Operation* op, uint32_t* out_m, uint32
     }
 
     if (lhs_rank == 2) {
-        if (!lhsBatchDims.empty()) return false;
-        if (lhsContractingDims[0] != 1 || rhsContractingDims[0] != 0) return false;
-        if (lhsShape[1] != rhsShape[0]) return false;
+        if (!lhsBatchDims.empty())
+            return false;
+        if (lhsContractingDims[0] != 1 || rhsContractingDims[0] != 0)
+            return false;
+        if (lhsShape[1] != rhsShape[0])
+            return false;
         M = static_cast<uint32_t>(lhsShape[0]);
         K = static_cast<uint32_t>(lhsShape[1]);
         N = static_cast<uint32_t>(rhsShape[1]);
     } else {
         const int64_t expected_batch_dims = lhs_rank - 2;
-        if (static_cast<int64_t>(lhsBatchDims.size()) != expected_batch_dims) return false;
-        if (lhsContractingDims[0] != lhs_rank - 1 || rhsContractingDims[0] != rhs_rank - 2) return false;
+        if (static_cast<int64_t>(lhsBatchDims.size()) != expected_batch_dims)
+            return false;
+        if (lhsContractingDims[0] != lhs_rank - 1 || rhsContractingDims[0] != rhs_rank - 2)
+            return false;
         uint64_t batch64 = 1;
         for (int64_t i = 0; i < expected_batch_dims; ++i) {
-            if (lhsBatchDims[i] != i || rhsBatchDims[i] != i) return false;
-            if (lhsShape[i] != rhsShape[i] || lhsShape[i] <= 0) return false;
+            if (lhsBatchDims[i] != i || rhsBatchDims[i] != i)
+                return false;
+            if (lhsShape[i] != rhsShape[i] || lhsShape[i] <= 0)
+                return false;
             batch64 *= static_cast<uint64_t>(lhsShape[i]);
-            if (batch64 > std::numeric_limits<uint32_t>::max()) return false;
+            if (batch64 > std::numeric_limits<uint32_t>::max())
+                return false;
         }
         const int64_t m_dim = lhs_rank - 2;
         const int64_t k_lhs_dim = lhs_rank - 1;
         const int64_t k_rhs_dim = rhs_rank - 2;
         const int64_t n_dim = rhs_rank - 1;
-        if (lhsShape[k_lhs_dim] != rhsShape[k_rhs_dim]) return false;
+        if (lhsShape[k_lhs_dim] != rhsShape[k_rhs_dim])
+            return false;
         batch = static_cast<uint32_t>(batch64);
         M = static_cast<uint32_t>(lhsShape[m_dim]);
         K = static_cast<uint32_t>(lhsShape[k_lhs_dim]);
         N = static_cast<uint32_t>(rhsShape[n_dim]);
     }
 
-    if (M == 0 || N == 0 || K == 0) return false;
+    if (M == 0 || N == 0 || K == 0)
+        return false;
     // Only handle small matrices where naive one-thread-per-element is efficient.
     // Keep threshold low to avoid intercepting medium matrices (e.g. 64x64).
-    if (static_cast<uint64_t>(M) * N > 2048) return false;
+    if (static_cast<uint64_t>(M) * N > 2048)
+        return false;
 
-    if (out_m) *out_m = M;
-    if (out_n) *out_n = N;
-    if (out_k) *out_k = K;
-    if (out_batch) *out_batch = batch;
+    if (out_m)
+        *out_m = M;
+    if (out_n)
+        *out_n = N;
+    if (out_k)
+        *out_k = K;
+    if (out_batch)
+        *out_batch = batch;
     return true;
 }
 
@@ -2551,7 +2574,7 @@ static id<MTLComputePipelineState> GetFastNativePipeline(id<MTLDevice> device,
 
 // --- MX Quantized Kernel Pipeline Cache ---
 static id<MTLComputePipelineState> GetMxQuantizedPipeline(id<MTLDevice> device,
-                                                           const std::string& functionName) {
+                                                          const std::string& functionName) {
     static std::mutex mu;
     static std::unordered_map<uintptr_t, FastNativeKernelCacheEntry> cache;
 
@@ -2561,8 +2584,7 @@ static id<MTLComputePipelineState> GetMxQuantizedPipeline(id<MTLDevice> device,
         NSError* error = nil;
         entry.library = [device newLibraryWithSource:MxQuantizedKernelSource() options:nil error:&error];
         if (!entry.library) {
-            MPS_LOG_ERROR("mx-quantized: shader compile failed: %s\n",
-                          error.localizedDescription.UTF8String);
+            MPS_LOG_ERROR("mx-quantized: shader compile failed: %s\n", error.localizedDescription.UTF8String);
             return nil;
         }
     }
@@ -2582,8 +2604,8 @@ static id<MTLComputePipelineState> GetMxQuantizedPipeline(id<MTLDevice> device,
     id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:fn error:&error];
     [fn release];
     if (!pipeline) {
-        MPS_LOG_ERROR("mx-quantized: pipeline creation failed for %s: %s\n",
-                      functionName.c_str(), error.localizedDescription.UTF8String);
+        MPS_LOG_ERROR("mx-quantized: pipeline creation failed for %s: %s\n", functionName.c_str(),
+                      error.localizedDescription.UTF8String);
         return nil;
     }
     entry.pipelines.emplace(functionName, pipeline);
@@ -4301,10 +4323,9 @@ static id<MTLBuffer> NativeIntrinsicReduceHandler(id<MTLDevice> device, id<MTLCo
         outNumel > std::numeric_limits<uint32_t>::max()) {
         return nil;
     }
-    bool is_axis0 = (kind == IntrinsicNativeKind::kReduceSumAxis0 ||
-                     kind == IntrinsicNativeKind::kReduceMaxAxis0 ||
-                     kind == IntrinsicNativeKind::kReduceMinAxis0 ||
-                     kind == IntrinsicNativeKind::kReduceMeanAxis0);
+    bool is_axis0 =
+        (kind == IntrinsicNativeKind::kReduceSumAxis0 || kind == IntrinsicNativeKind::kReduceMaxAxis0 ||
+         kind == IntrinsicNativeKind::kReduceMinAxis0 || kind == IntrinsicNativeKind::kReduceMeanAxis0);
 
     uint32_t rows, cols;
     bool use_threadgroup;
@@ -4770,6 +4791,22 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
 
         if (reduceKind == IntrinsicNativeKind::kSoftmaxLastAxis) {
             const bool f16 = (dtype == MPSDataTypeFloat16);
+            // Use single-pass full softmax when cols fit in threadgroup memory
+            if (cols <= 8192) {
+                std::string fullKernelName = f16 ? "softmax_full_f16_tg" : "softmax_full_f32_tg";
+                id<MTLComputePipelineState> pFull = GetFastNativePipeline(device, fullKernelName);
+                if (pFull) {
+                    ns->baked_kind = NativeStep::BakedKind::kSoftmax;
+                    ns->baked_pipeline = pFull;
+                    ns->baked_softmax_pass2_pipeline = nil; // single-pass
+                    ns->baked_softmax_maxsum = nil;
+                    ns->baked_rows = rows;
+                    ns->baked_cols = cols;
+                    ComputeRowReduceDispatchConfig(pFull, rows, cols, &ns->baked_grid, &ns->baked_tg);
+                    return true;
+                }
+            }
+            // Fallback: 2-pass softmax for large cols (>8K)
             std::string pass1Name = f16 ? "softmax_pass1_f16_tg" : "softmax_pass1_f32_tg";
             std::string pass2Name = f16 ? "softmax_pass2_f16" : "softmax_pass2_f32";
             id<MTLComputePipelineState> p1 = GetFastNativePipeline(device, pass1Name);
@@ -5039,7 +5076,8 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
     // --- Sort baking ---
     if (IsEligibleSortNativeOp(op)) {
         std::vector<int64_t> inShape;
-        if (!GetStaticTensorInfo(op->getOperand(0).getType(), &inShape, nullptr, nullptr) || inShape.empty()) {
+        if (!GetStaticTensorInfo(op->getOperand(0).getType(), &inShape, nullptr, nullptr) ||
+            inShape.empty()) {
             return false;
         }
         uint32_t num_rows = 1;
@@ -5053,7 +5091,8 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
         }
 
         uint32_t padded_n = 1;
-        while (padded_n < n) padded_n <<= 1;
+        while (padded_n < n)
+            padded_n <<= 1;
 
         const char* kernelName = (num_rows > 1) ? "bitonic_sort_rows_asc_f32" : "bitonic_sort_asc_f32";
         id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kernelName);
@@ -5064,7 +5103,8 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
         // simdgroup execute in lockstep, making threadgroup_barrier essentially free.
         // Combined with bitwise-optimized inner loop, this gives best perf for small rows.
         NSUInteger tg_size = std::min((NSUInteger)32, std::min((NSUInteger)(padded_n / 2), (NSUInteger)1024));
-        if (tg_size == 0) tg_size = 1;
+        if (tg_size == 0)
+            tg_size = 1;
 
         ns->baked_kind = NativeStep::BakedKind::kSort;
         ns->baked_pipeline = pipeline;
@@ -5462,7 +5502,8 @@ static bool IsEligibleSortNativeOp(mlir::Operation* op) {
     for (int64_t d : inShape) {
         totalElems *= static_cast<uint64_t>(d);
     }
-    uint64_t cols = (inShape.size() == 2) ? static_cast<uint64_t>(inShape[1]) : static_cast<uint64_t>(inShape[0]);
+    uint64_t cols =
+        (inShape.size() == 2) ? static_cast<uint64_t>(inShape[1]) : static_cast<uint64_t>(inShape[0]);
     uint64_t rows = (inShape.size() == 2) ? static_cast<uint64_t>(inShape[0]) : 1;
     if (totalElems < 100000 && !(rows > 1 && cols > 256)) {
         return false;
@@ -5471,8 +5512,8 @@ static bool IsEligibleSortNativeOp(mlir::Operation* op) {
 }
 
 static id<MTLBuffer> NativeIntrinsicTransposeHandler(id<MTLDevice> device, id<MTLCommandBuffer> commandBuffer,
-                                                      mlir::Operation* op,
-                                                      const std::vector<id<MTLBuffer>>& inputs) {
+                                                     mlir::Operation* op,
+                                                     const std::vector<id<MTLBuffer>>& inputs) {
     if (!device || !commandBuffer || !op || inputs.empty() || !inputs[0]) {
         return nil;
     }
@@ -5500,14 +5541,14 @@ static id<MTLBuffer> NativeIntrinsicTransposeHandler(id<MTLDevice> device, id<MT
     [encoder setBytes:&cols length:sizeof(cols) atIndex:3];
     [encoder setThreadgroupMemoryLength:tg_mem atIndex:0];
     [encoder dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, batch)
-             threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
     [encoder endEncoding];
     return out;
 }
 
 static id<MTLBuffer> NativeIntrinsicSortHandler(id<MTLDevice> device, id<MTLCommandBuffer> commandBuffer,
-                                                 mlir::Operation* op,
-                                                 const std::vector<id<MTLBuffer>>& inputs) {
+                                                mlir::Operation* op,
+                                                const std::vector<id<MTLBuffer>>& inputs) {
     if (!device || !commandBuffer || !op || inputs.empty() || !inputs[0]) {
         return nil;
     }
@@ -5527,7 +5568,8 @@ static id<MTLBuffer> NativeIntrinsicSortHandler(id<MTLDevice> device, id<MTLComm
         n = static_cast<uint32_t>(inShape[1]);
     }
     uint32_t padded_n = 1;
-    while (padded_n < n) padded_n <<= 1;
+    while (padded_n < n)
+        padded_n <<= 1;
 
     const char* kernelName = (num_rows > 1) ? "bitonic_sort_rows_asc_f32" : "bitonic_sort_asc_f32";
     id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kernelName);
@@ -5542,7 +5584,8 @@ static id<MTLBuffer> NativeIntrinsicSortHandler(id<MTLDevice> device, id<MTLComm
     }
     NSUInteger tg_mem = (NSUInteger)padded_n * sizeof(float);
     NSUInteger tg_size = std::min((NSUInteger)32, std::min((NSUInteger)(padded_n / 2), (NSUInteger)1024));
-    if (tg_size == 0) tg_size = 1;
+    if (tg_size == 0)
+        tg_size = 1;
 
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
@@ -5555,7 +5598,7 @@ static id<MTLBuffer> NativeIntrinsicSortHandler(id<MTLDevice> device, id<MTLComm
     }
     [encoder setThreadgroupMemoryLength:tg_mem atIndex:0];
     [encoder dispatchThreadgroups:MTLSizeMake(num_rows, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
     [encoder endEncoding];
     return out;
 }
@@ -5671,7 +5714,6 @@ static bool OutputBufferPoolEnabled() {
     static const bool enabled = !EnvFlagEnabled("JAX_METALLIB_DISABLE_OUTPUT_BUFFER_POOL");
     return enabled;
 }
-
 
 // Thread-local single-element cache for output buffer reuse.
 // Avoids the global pool mutex on the hot path for repeated dispatches
@@ -6198,8 +6240,8 @@ static ProcessResult processCompositeOp(HandlerContext& ctx, mlir::stablehlo::Co
 
         MPSGraphTensor* argTensor = GetTensor(ctx.values, callArg);
         if (!argTensor) {
-            return ProcessResult::Error("Composite '" + compositeOp.getName().str() +
-                                        "' argument " + std::to_string(i) + " not found");
+            return ProcessResult::Error("Composite '" + compositeOp.getName().str() + "' argument " +
+                                        std::to_string(i) + " not found");
         }
         ctx.values[funcArg.getAsOpaquePointer()] = argTensor;
 
@@ -6224,8 +6266,8 @@ static ProcessResult processCompositeOp(HandlerContext& ctx, mlir::stablehlo::Co
         mlir::Value returnValue = calleeResult.return_values[i];
         MPSGraphTensor* returnTensor = GetTensor(ctx.values, returnValue);
         if (!returnTensor) {
-            return ProcessResult::Error("Composite '" + compositeOp.getName().str() +
-                                        "' return value " + std::to_string(i) + " not found");
+            return ProcessResult::Error("Composite '" + compositeOp.getName().str() + "' return value " +
+                                        std::to_string(i) + " not found");
         }
         ctx.values[compositeOp.getResult(i).getAsOpaquePointer()] = returnTensor;
 
@@ -7455,9 +7497,8 @@ std::atomic<bool>& GetCacheReleaseShutdown() {
 void CacheReleaseWorker() {
     std::unique_lock<std::mutex> lock(GetCacheReleaseQueueMutex());
     while (!GetCacheReleaseShutdown().load()) {
-        GetCacheReleaseCV().wait(lock, [] {
-            return GetCacheReleaseShutdown().load() || !GetCacheReleaseQueue().empty();
-        });
+        GetCacheReleaseCV().wait(
+            lock, [] { return GetCacheReleaseShutdown().load() || !GetCacheReleaseQueue().empty(); });
         if (GetCacheReleaseShutdown().load() && GetCacheReleaseQueue().empty()) {
             return;
         }
@@ -7531,7 +7572,7 @@ static CompletionEvent SubmitSyncBarrier(void* mtlCommandQueue) {
     CompletionEvent completion = MakePendingCompletionEvent();
     CompletionEvent captured = completion;
     [barrier addCompletedHandler:^(id<MTLCommandBuffer> /*completed*/) {
-        MarkCompletionFromCommandBuffer(captured, barrier);
+      MarkCompletionFromCommandBuffer(captured, barrier);
     }];
     [barrier commit];
     return completion;
@@ -7644,9 +7685,8 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
         // For single baked native step plans, skip scratch pool, generic step
         // loop, and deferred cleanup. Supports: elementwise, fused elementwise,
         // reduce, softmax, gather, GEMM, and sort.
-        if (plan_->steps.size() == 1 && plan_->graph_steps.empty() &&
-            plan_->output_slots.size() == 1 && plan_->steps[0].kind == Step::NATIVE &&
-            plan_->slots.size() <= 16) {
+        if (plan_->steps.size() == 1 && plan_->graph_steps.empty() && plan_->output_slots.size() == 1 &&
+            plan_->steps[0].kind == Step::NATIVE && plan_->slots.size() <= 16) {
             auto& ns_fp = plan_->native_steps[plan_->steps[0].index];
             const auto fp_kind = ns_fp.baked_kind;
             const bool fp_has_pipeline = (ns_fp.baked_pipeline != nil);
@@ -7655,10 +7695,8 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                 fp_has_pipeline &&
                 (fp_kind == NativeStep::BakedKind::kElementwise ||
                  fp_kind == NativeStep::BakedKind::kFusedElementwise ||
-                 fp_kind == NativeStep::BakedKind::kReduce ||
-                 fp_kind == NativeStep::BakedKind::kSoftmax ||
-                 fp_kind == NativeStep::BakedKind::kGatherRows ||
-                 fp_kind == NativeStep::BakedKind::kGEMM ||
+                 fp_kind == NativeStep::BakedKind::kReduce || fp_kind == NativeStep::BakedKind::kSoftmax ||
+                 fp_kind == NativeStep::BakedKind::kGatherRows || fp_kind == NativeStep::BakedKind::kGEMM ||
                  fp_kind == NativeStep::BakedKind::kSort);
             if (fp_eligible) {
                 bool fp_ok = true;
@@ -7667,8 +7705,8 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                 }
                 if (fp_ok) {
                     size_t out_bytes = plan_->slots[ns_fp.output_slot].byte_size;
-                    id<MTLBuffer> out_buf = (out_bytes > 0)
-                        ? AcquireReusableOutputBuffer(mtl_device, out_bytes) : nil;
+                    id<MTLBuffer> out_buf =
+                        (out_bytes > 0) ? AcquireReusableOutputBuffer(mtl_device, out_bytes) : nil;
                     if (out_buf) {
                         // Create command buffer. We use the default
                         // commandBufferWithDescriptor-less path with
@@ -7684,9 +7722,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         // would free/reuse an MTLBuffer that was still bound to
                         // the previous command buffer's compute encoder.
                         static const bool fp_unretained = false;
-                        id<MTLCommandBuffer> fp_cmd = fp_unretained
-                            ? [commandQueue commandBuffer]  // unused, kept for the type
-                            : [commandQueue commandBuffer];
+                        id<MTLCommandBuffer> fp_cmd =
+                            fp_unretained ? [commandQueue commandBuffer] // unused, kept for the type
+                                          : [commandQueue commandBuffer];
                         if (fp_cmd) {
                             static const bool fp_async =
                                 !EnvFlagEnabled("JAX_METALLIB_DISABLE_ASYNC_COMPLETION");
@@ -7704,14 +7742,14 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                 // Safe: MpsBuffer holds a shared_ptr keeping the event alive.
                                 CompletionEventState* fp_raw = fp_completion.get();
                                 [fp_cmd addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-                                    if (!completed || completed.status == MTLCommandBufferStatusCompleted) {
-                                        fp_raw->MarkReady();
-                                    } else {
-                                        NSString* desc = completed.error
-                                            ? completed.error.localizedDescription : @"unknown error";
-                                        fp_raw->MarkError("Metal command buffer error: " +
-                                                          std::string([desc UTF8String]));
-                                    }
+                                  if (!completed || completed.status == MTLCommandBufferStatusCompleted) {
+                                      fp_raw->MarkReady();
+                                  } else {
+                                      NSString* desc = completed.error ? completed.error.localizedDescription
+                                                                       : @"unknown error";
+                                      fp_raw->MarkError("Metal command buffer error: " +
+                                                        std::string([desc UTF8String]));
+                                  }
                                 }];
                             }
                             id<MTLComputeCommandEncoder> fp_enc = [fp_cmd computeCommandEncoder];
@@ -7730,25 +7768,31 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                     if (ns_fp.input_slots.size() == 1) {
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
                                         [fp_enc setBuffer:out_buf offset:0 atIndex:1];
-                                        [fp_enc setBytes:&ns_fp.baked_n length:sizeof(ns_fp.baked_n) atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_n
+                                                  length:sizeof(ns_fp.baked_n)
+                                                 atIndex:2];
                                     } else if (ns_fp.input_slots.size() == 2) {
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[1]] offset:0 atIndex:1];
                                         [fp_enc setBuffer:out_buf offset:0 atIndex:2];
-                                        [fp_enc setBytes:&ns_fp.baked_n length:sizeof(ns_fp.baked_n) atIndex:3];
+                                        [fp_enc setBytes:&ns_fp.baked_n
+                                                  length:sizeof(ns_fp.baked_n)
+                                                 atIndex:3];
                                     } else if (ns_fp.input_slots.size() == 3) {
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[1]] offset:0 atIndex:1];
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[2]] offset:0 atIndex:2];
                                         [fp_enc setBuffer:out_buf offset:0 atIndex:3];
-                                        [fp_enc setBytes:&ns_fp.baked_n length:sizeof(ns_fp.baked_n) atIndex:4];
+                                        [fp_enc setBytes:&ns_fp.baked_n
+                                                  length:sizeof(ns_fp.baked_n)
+                                                 atIndex:4];
                                     }
                                     if (ns_fp.baked_use_stride) {
                                         [fp_enc dispatchThreadgroups:ns_fp.baked_grid
-                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                               threadsPerThreadgroup:ns_fp.baked_tg];
                                     } else {
                                         [fp_enc dispatchThreads:ns_fp.baked_grid
-                                                threadsPerThreadgroup:ns_fp.baked_tg];
+                                            threadsPerThreadgroup:ns_fp.baked_tg];
                                     }
                                     fp_encoded = true;
                                     break;
@@ -7761,14 +7805,15 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                             [fp_enc setBuffer:fp_slot[s] offset:0 atIndex:buf_idx++];
                                         }
                                         [fp_enc setBuffer:out_buf offset:0 atIndex:buf_idx++];
-                                        [fp_enc setBytes:&ns_fp.baked_n length:sizeof(ns_fp.baked_n)
+                                        [fp_enc setBytes:&ns_fp.baked_n
+                                                  length:sizeof(ns_fp.baked_n)
                                                  atIndex:buf_idx++];
                                         if (ns_fp.baked_use_stride) {
                                             [fp_enc dispatchThreadgroups:ns_fp.baked_grid
-                                                         threadsPerThreadgroup:ns_fp.baked_tg];
+                                                   threadsPerThreadgroup:ns_fp.baked_tg];
                                         } else {
                                             [fp_enc dispatchThreads:ns_fp.baked_grid
-                                                    threadsPerThreadgroup:ns_fp.baked_tg];
+                                                threadsPerThreadgroup:ns_fp.baked_tg];
                                         }
                                         fp_encoded = true;
                                     }
@@ -7777,14 +7822,18 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                 case NativeStep::BakedKind::kReduce: {
                                     [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
                                     [fp_enc setBuffer:out_buf offset:0 atIndex:1];
-                                    [fp_enc setBytes:&ns_fp.baked_rows length:sizeof(ns_fp.baked_rows) atIndex:2];
-                                    [fp_enc setBytes:&ns_fp.baked_cols length:sizeof(ns_fp.baked_cols) atIndex:3];
+                                    [fp_enc setBytes:&ns_fp.baked_rows
+                                              length:sizeof(ns_fp.baked_rows)
+                                             atIndex:2];
+                                    [fp_enc setBytes:&ns_fp.baked_cols
+                                              length:sizeof(ns_fp.baked_cols)
+                                             atIndex:3];
                                     if (ns_fp.baked_reduce_threadgroup) {
                                         [fp_enc dispatchThreadgroups:ns_fp.baked_grid
-                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                               threadsPerThreadgroup:ns_fp.baked_tg];
                                     } else {
                                         [fp_enc dispatchThreads:ns_fp.baked_grid
-                                                threadsPerThreadgroup:ns_fp.baked_tg];
+                                            threadsPerThreadgroup:ns_fp.baked_tg];
                                     }
                                     fp_encoded = true;
                                     break;
@@ -7795,31 +7844,41 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                         // Uses threadgroup memory to cache row data.
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
                                         [fp_enc setBuffer:out_buf offset:0 atIndex:1];
-                                        [fp_enc setBytes:&ns_fp.baked_rows length:sizeof(ns_fp.baked_rows) atIndex:2];
-                                        [fp_enc setBytes:&ns_fp.baked_cols length:sizeof(ns_fp.baked_cols) atIndex:3];
+                                        [fp_enc setBytes:&ns_fp.baked_rows
+                                                  length:sizeof(ns_fp.baked_rows)
+                                                 atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_cols
+                                                  length:sizeof(ns_fp.baked_cols)
+                                                 atIndex:3];
                                         NSUInteger tg_mem = (NSUInteger)ns_fp.baked_cols * sizeof(float);
                                         [fp_enc setThreadgroupMemoryLength:tg_mem atIndex:0];
                                         [fp_enc dispatchThreadgroups:ns_fp.baked_grid
-                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                               threadsPerThreadgroup:ns_fp.baked_tg];
                                         fp_encoded = true;
                                     } else if (ns_fp.baked_softmax_maxsum) {
                                         // 2-pass full softmax
                                         // Pass 1: compute max+sum per row
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
                                         [fp_enc setBuffer:ns_fp.baked_softmax_maxsum offset:0 atIndex:1];
-                                        [fp_enc setBytes:&ns_fp.baked_rows length:sizeof(ns_fp.baked_rows) atIndex:2];
-                                        [fp_enc setBytes:&ns_fp.baked_cols length:sizeof(ns_fp.baked_cols) atIndex:3];
+                                        [fp_enc setBytes:&ns_fp.baked_rows
+                                                  length:sizeof(ns_fp.baked_rows)
+                                                 atIndex:2];
+                                        [fp_enc setBytes:&ns_fp.baked_cols
+                                                  length:sizeof(ns_fp.baked_cols)
+                                                 atIndex:3];
                                         [fp_enc dispatchThreadgroups:ns_fp.baked_grid
-                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                               threadsPerThreadgroup:ns_fp.baked_tg];
                                         [fp_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                                         // Pass 2: normalize
                                         [fp_enc setComputePipelineState:ns_fp.baked_softmax_pass2_pipeline];
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
                                         [fp_enc setBuffer:ns_fp.baked_softmax_maxsum offset:0 atIndex:1];
                                         [fp_enc setBuffer:out_buf offset:0 atIndex:2];
-                                        [fp_enc setBytes:&ns_fp.baked_cols length:sizeof(ns_fp.baked_cols) atIndex:3];
+                                        [fp_enc setBytes:&ns_fp.baked_cols
+                                                  length:sizeof(ns_fp.baked_cols)
+                                                 atIndex:3];
                                         [fp_enc dispatchThreads:ns_fp.baked_softmax_pass2_grid
-                                                threadsPerThreadgroup:ns_fp.baked_softmax_pass2_tg];
+                                            threadsPerThreadgroup:ns_fp.baked_softmax_pass2_tg];
                                         fp_encoded = true;
                                     }
                                     break;
@@ -7830,17 +7889,20 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[1]] offset:0 atIndex:1];
                                         [fp_enc setBuffer:out_buf offset:0 atIndex:2];
                                         [fp_enc setBytes:&ns_fp.baked_gather_num_indices
-                                                  length:sizeof(ns_fp.baked_gather_num_indices) atIndex:3];
+                                                  length:sizeof(ns_fp.baked_gather_num_indices)
+                                                 atIndex:3];
                                         [fp_enc setBytes:&ns_fp.baked_gather_cols
-                                                  length:sizeof(ns_fp.baked_gather_cols) atIndex:4];
+                                                  length:sizeof(ns_fp.baked_gather_cols)
+                                                 atIndex:4];
                                         [fp_enc setBytes:&ns_fp.baked_gather_table_rows
-                                                  length:sizeof(ns_fp.baked_gather_table_rows) atIndex:5];
+                                                  length:sizeof(ns_fp.baked_gather_table_rows)
+                                                 atIndex:5];
                                         if (ns_fp.baked_use_stride) {
                                             [fp_enc dispatchThreadgroups:ns_fp.baked_grid
-                                                         threadsPerThreadgroup:ns_fp.baked_tg];
+                                                   threadsPerThreadgroup:ns_fp.baked_tg];
                                         } else {
                                             [fp_enc dispatchThreads:ns_fp.baked_grid
-                                                    threadsPerThreadgroup:ns_fp.baked_tg];
+                                                threadsPerThreadgroup:ns_fp.baked_tg];
                                         }
                                         fp_encoded = true;
                                     }
@@ -7853,19 +7915,23 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[1]] offset:0 atIndex:1];
                                         [fp_enc setBuffer:out_buf offset:0 atIndex:2];
                                         [fp_enc setBytes:&ns_fp.baked_gemm_m
-                                                  length:sizeof(ns_fp.baked_gemm_m) atIndex:3];
+                                                  length:sizeof(ns_fp.baked_gemm_m)
+                                                 atIndex:3];
                                         [fp_enc setBytes:&ns_fp.baked_gemm_n
-                                                  length:sizeof(ns_fp.baked_gemm_n) atIndex:4];
+                                                  length:sizeof(ns_fp.baked_gemm_n)
+                                                 atIndex:4];
                                         [fp_enc setBytes:&ns_fp.baked_gemm_k
-                                                  length:sizeof(ns_fp.baked_gemm_k) atIndex:5];
+                                                  length:sizeof(ns_fp.baked_gemm_k)
+                                                 atIndex:5];
                                         if (isNaive) {
-                                            MTLSize naive_grid = MTLSizeMake(
-                                                ns_fp.baked_gemm_n, ns_fp.baked_gemm_m, ns_fp.baked_gemm_batch);
+                                            MTLSize naive_grid =
+                                                MTLSizeMake(ns_fp.baked_gemm_n, ns_fp.baked_gemm_m,
+                                                            ns_fp.baked_gemm_batch);
                                             [fp_enc dispatchThreads:naive_grid
-                                                    threadsPerThreadgroup:ns_fp.baked_tg];
+                                                threadsPerThreadgroup:ns_fp.baked_tg];
                                         } else {
                                             [fp_enc dispatchThreadgroups:ns_fp.baked_grid
-                                                         threadsPerThreadgroup:ns_fp.baked_tg];
+                                                   threadsPerThreadgroup:ns_fp.baked_tg];
                                         }
                                         fp_encoded = true;
                                     }
@@ -7876,17 +7942,21 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                         [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
                                         [fp_enc setBuffer:out_buf offset:0 atIndex:1];
                                         [fp_enc setBytes:&ns_fp.baked_sort_n
-                                                  length:sizeof(ns_fp.baked_sort_n) atIndex:2];
+                                                  length:sizeof(ns_fp.baked_sort_n)
+                                                 atIndex:2];
                                         [fp_enc setBytes:&ns_fp.baked_sort_padded_n
-                                                  length:sizeof(ns_fp.baked_sort_padded_n) atIndex:3];
+                                                  length:sizeof(ns_fp.baked_sort_padded_n)
+                                                 atIndex:3];
                                         if (ns_fp.baked_sort_num_rows > 1) {
                                             [fp_enc setBytes:&ns_fp.baked_sort_n
-                                                      length:sizeof(ns_fp.baked_sort_n) atIndex:4];
+                                                      length:sizeof(ns_fp.baked_sort_n)
+                                                     atIndex:4];
                                         }
-                                        NSUInteger tg_mem = (NSUInteger)ns_fp.baked_sort_padded_n * sizeof(float);
+                                        NSUInteger tg_mem =
+                                            (NSUInteger)ns_fp.baked_sort_padded_n * sizeof(float);
                                         [fp_enc setThreadgroupMemoryLength:tg_mem atIndex:0];
                                         [fp_enc dispatchThreadgroups:ns_fp.baked_grid
-                                                     threadsPerThreadgroup:ns_fp.baked_tg];
+                                               threadsPerThreadgroup:ns_fp.baked_tg];
                                         fp_encoded = true;
                                     }
                                     break;
@@ -7927,8 +7997,8 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             }
                         }
                         // Encoder/cmd creation failed — recycle buffer and fall through.
-                        RecycleReusableOutputBuffer(
-                            (__bridge void*)mtl_device, out_bytes, (__bridge void*)out_buf);
+                        RecycleReusableOutputBuffer((__bridge void*)mtl_device, out_bytes,
+                                                    (__bridge void*)out_buf);
                     }
                 }
             }
@@ -8110,20 +8180,25 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     }
 
                     @try {
+                        // Use executionDescriptor.completionHandler to get async completion
+                        // notification directly from MPSGraphExecutable, eliminating the
+                        // separate no-op barrier command buffer (~150-300us savings).
+                        MPSGraphExecutableExecutionDescriptor* execDesc =
+                            [[MPSGraphExecutableExecutionDescriptor alloc] init];
+                        CompletionEvent ready = MakePendingCompletionEvent();
+                        CompletionEvent captured = ready;
+                        execDesc.completionHandler =
+                            ^(NSArray<MPSGraphTensorData*>* results, NSError* error) {
+                              if (error) {
+                                  captured->MarkError([[error localizedDescription] UTF8String]);
+                              } else {
+                                  captured->MarkReady();
+                              }
+                            };
                         [exec runWithMTLCommandQueue:commandQueue
                                          inputsArray:inputsArray
                                         resultsArray:resultsArray
-                                 executionDescriptor:nil];
-
-                        // The MPSGraphExecutable direct run dispatches work to the
-                        // command queue but doesn't expose the underlying
-                        // MPSCommandBuffer. To prevent the next eager Execute()
-                        // from freeing/reusing MTLBuffers while the GPU is still
-                        // executing this dispatch, submit a no-op command buffer
-                        // to the same queue and chain a completion handler on it.
-                        // Because the Metal command queue is serial, the handler
-                        // only fires after runWithMTLCommandQueue's work is done.
-                        CompletionEvent ready = SubmitSyncBarrier((__bridge void*)commandQueue);
+                                 executionDescriptor:execDesc];
 
                         executed_direct_run = true;
                         for (SlotId slot : gs.exec_target_slots) {
@@ -8148,8 +8223,8 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
             static const bool use_unretained_default =
                 !EnvFlagEnabled("JAX_METALLIB_DISABLE_NATIVE_UNRETAINED_CMDBUF");
             const bool use_unretained = use_unretained_default && !plan_->needs_retained_cmd_bufs;
-            static const int max_ops_per_cmd = EnvIntValue("JAX_METALLIB_MAX_OPS_PER_CMDBUF", 48);
-            static const int max_mb_per_cmd = EnvIntValue("JAX_METALLIB_MAX_MB_PER_CMDBUF", 48);
+            static const int max_ops_per_cmd = EnvIntValue("JAX_METALLIB_MAX_OPS_PER_CMDBUF", 256);
+            static const int max_mb_per_cmd = EnvIntValue("JAX_METALLIB_MAX_MB_PER_CMDBUF", 256);
 
             const bool queue_supports_unretained = [&] {
                 static int cached = -1;
@@ -8306,7 +8381,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         size_t row_bytes = sort_n * sizeof(float);
                         memcpy(dst, src, (size_t)num_rows * row_bytes);
                         dispatch_apply((size_t)num_rows, DISPATCH_APPLY_AUTO, ^(size_t row) {
-                            vDSP_vsort(dst + row * sort_n, sort_n, 1);
+                          vDSP_vsort(dst + row * sort_n, sort_n, 1);
                         });
                     }
                     slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
@@ -8332,7 +8407,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     float* dst = (float*)[slot_bufs[ns.output_slot] contents];
                     // Copy input to output (spotrf_ works in-place)
                     memcpy(dst, src, (size_t)n * n * sizeof(float));
-                    char uplo = ns.baked_cholesky_lower ? 'U' : 'L'; // Swap L↔U: LAPACK is column-major, JAX is row-major
+                    char uplo = ns.baked_cholesky_lower
+                                    ? 'U'
+                                    : 'L'; // Swap L↔U: LAPACK is column-major, JAX is row-major
                     int n_int = (int)n;
                     int info = 0;
                     spotrf_(&uplo, &n_int, dst, &n_int, &info);
@@ -8378,10 +8455,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     float* A = (float*)[slot_bufs[ns.input_slots[0]] contents];
                     float* B = (float*)[slot_bufs[ns.input_slots[1]] contents];
                     float* C = (float*)[slot_bufs[ns.output_slot] contents];
-                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                                (int)ns.baked_gemm_m, (int)ns.baked_gemm_n, (int)ns.baked_gemm_k,
-                                1.0f, A, (int)ns.baked_gemm_k, B, (int)ns.baked_gemm_n,
-                                0.0f, C, (int)ns.baked_gemm_n);
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)ns.baked_gemm_m,
+                                (int)ns.baked_gemm_n, (int)ns.baked_gemm_k, 1.0f, A, (int)ns.baked_gemm_k, B,
+                                (int)ns.baked_gemm_n, 0.0f, C, (int)ns.baked_gemm_n);
                     slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
                     continue;
                 }
@@ -8503,8 +8579,12 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             // Single-pass softmax_numerator
                             [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
                             [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
-                            [nativeComputeEncoder setBytes:&ns.baked_rows length:sizeof(ns.baked_rows) atIndex:2];
-                            [nativeComputeEncoder setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
+                            [nativeComputeEncoder setBytes:&ns.baked_rows
+                                                    length:sizeof(ns.baked_rows)
+                                                   atIndex:2];
+                            [nativeComputeEncoder setBytes:&ns.baked_cols
+                                                    length:sizeof(ns.baked_cols)
+                                                   atIndex:3];
                             NSUInteger tg_mem = (NSUInteger)ns.baked_cols * sizeof(float);
                             [nativeComputeEncoder setThreadgroupMemoryLength:tg_mem atIndex:0];
                             [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
@@ -8513,8 +8593,12 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             // 2-pass full softmax
                             [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
                             [nativeComputeEncoder setBuffer:ns.baked_softmax_maxsum offset:0 atIndex:1];
-                            [nativeComputeEncoder setBytes:&ns.baked_rows length:sizeof(ns.baked_rows) atIndex:2];
-                            [nativeComputeEncoder setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
+                            [nativeComputeEncoder setBytes:&ns.baked_rows
+                                                    length:sizeof(ns.baked_rows)
+                                                   atIndex:2];
+                            [nativeComputeEncoder setBytes:&ns.baked_cols
+                                                    length:sizeof(ns.baked_cols)
+                                                   atIndex:3];
                             [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
                                                  threadsPerThreadgroup:ns.baked_tg];
                             [nativeComputeEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -8522,7 +8606,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
                             [nativeComputeEncoder setBuffer:ns.baked_softmax_maxsum offset:0 atIndex:1];
                             [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:2];
-                            [nativeComputeEncoder setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
+                            [nativeComputeEncoder setBytes:&ns.baked_cols
+                                                    length:sizeof(ns.baked_cols)
+                                                   atIndex:3];
                             [nativeComputeEncoder dispatchThreads:ns.baked_softmax_pass2_grid
                                             threadsPerThreadgroup:ns.baked_softmax_pass2_tg];
                         } else {
@@ -8732,13 +8818,17 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[1]] offset:0 atIndex:1];
                         [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:2];
                         [nativeComputeEncoder setBytes:&ns.baked_gemm_m
-                                                length:sizeof(ns.baked_gemm_m) atIndex:3];
+                                                length:sizeof(ns.baked_gemm_m)
+                                               atIndex:3];
                         [nativeComputeEncoder setBytes:&ns.baked_gemm_n
-                                                length:sizeof(ns.baked_gemm_n) atIndex:4];
+                                                length:sizeof(ns.baked_gemm_n)
+                                               atIndex:4];
                         [nativeComputeEncoder setBytes:&ns.baked_gemm_k
-                                                length:sizeof(ns.baked_gemm_k) atIndex:5];
+                                                length:sizeof(ns.baked_gemm_k)
+                                               atIndex:5];
                         if (isNaive) {
-                            MTLSize naive_grid = MTLSizeMake(ns.baked_gemm_n, ns.baked_gemm_m, ns.baked_gemm_batch);
+                            MTLSize naive_grid =
+                                MTLSizeMake(ns.baked_gemm_n, ns.baked_gemm_m, ns.baked_gemm_batch);
                             [nativeComputeEncoder dispatchThreads:naive_grid
                                             threadsPerThreadgroup:ns.baked_tg];
                         } else {
@@ -8766,9 +8856,11 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
                         [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
                         [nativeComputeEncoder setBytes:&ns.baked_transpose_rows
-                                                length:sizeof(ns.baked_transpose_rows) atIndex:2];
+                                                length:sizeof(ns.baked_transpose_rows)
+                                               atIndex:2];
                         [nativeComputeEncoder setBytes:&ns.baked_transpose_cols
-                                                length:sizeof(ns.baked_transpose_cols) atIndex:3];
+                                                length:sizeof(ns.baked_transpose_cols)
+                                               atIndex:3];
                         NSUInteger tg_mem = 32 * 33 * sizeof(float);
                         [nativeComputeEncoder setThreadgroupMemoryLength:tg_mem atIndex:0];
                         [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
@@ -8792,12 +8884,16 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         [nativeComputeEncoder setComputePipelineState:ns.baked_pipeline];
                         [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
                         [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
-                        [nativeComputeEncoder setBytes:&ns.baked_sort_n length:sizeof(ns.baked_sort_n) atIndex:2];
+                        [nativeComputeEncoder setBytes:&ns.baked_sort_n
+                                                length:sizeof(ns.baked_sort_n)
+                                               atIndex:2];
                         [nativeComputeEncoder setBytes:&ns.baked_sort_padded_n
                                                 length:sizeof(ns.baked_sort_padded_n)
                                                atIndex:3];
                         if (ns.baked_sort_num_rows > 1) {
-                            [nativeComputeEncoder setBytes:&ns.baked_sort_n length:sizeof(ns.baked_sort_n) atIndex:4];
+                            [nativeComputeEncoder setBytes:&ns.baked_sort_n
+                                                    length:sizeof(ns.baked_sort_n)
+                                                   atIndex:4];
                         }
                         NSUInteger tg_mem = (NSUInteger)ns.baked_sort_padded_n * sizeof(float);
                         [nativeComputeEncoder setThreadgroupMemoryLength:tg_mem atIndex:0];
@@ -9117,7 +9213,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             if (out_bytes > 0) {
                                 slot_bufs[ns.output_slot] =
                                     [mtl_device newBufferWithLength:out_bytes
-                                                           options:ComputeBufferResourceOptions()];
+                                                            options:ComputeBufferResourceOptions()];
                             }
                         }
                         const float* src = (const float*)[slot_bufs[ns.input_slots[0]] contents];
@@ -9131,7 +9227,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             size_t row_bytes = sort_n * sizeof(float);
                             memcpy(dst, src, (size_t)num_rows_mixed * row_bytes);
                             dispatch_apply((size_t)num_rows_mixed, DISPATCH_APPLY_AUTO, ^(size_t row) {
-                                vDSP_vsort(dst + row * sort_n, sort_n, 1);
+                              vDSP_vsort(dst + row * sort_n, sort_n, 1);
                             });
                         }
                         slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
@@ -9159,19 +9255,22 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             if (out_bytes > 0) {
                                 slot_bufs[ns.output_slot] =
                                     [mtl_device newBufferWithLength:out_bytes
-                                                           options:ComputeBufferResourceOptions()];
+                                                            options:ComputeBufferResourceOptions()];
                             }
                         }
                         uint32_t n = ns.baked_cholesky_n;
                         const float* src = (const float*)[slot_bufs[ns.input_slots[0]] contents];
                         float* dst = (float*)[slot_bufs[ns.output_slot] contents];
                         memcpy(dst, src, (size_t)n * n * sizeof(float));
-                        char uplo = ns.baked_cholesky_lower ? 'U' : 'L'; // Swap L↔U: LAPACK is column-major, JAX is row-major
+                        char uplo = ns.baked_cholesky_lower
+                                        ? 'U'
+                                        : 'L'; // Swap L↔U: LAPACK is column-major, JAX is row-major
                         int n_int = (int)n;
                         int info = 0;
                         spotrf_(&uplo, &n_int, dst, &n_int, &info);
                         if (info != 0) {
-                            for (uint32_t i = 0; i < n * n; ++i) dst[i] = NAN;
+                            for (uint32_t i = 0; i < n * n; ++i)
+                                dst[i] = NAN;
                         } else {
                             if (ns.baked_cholesky_lower) {
                                 for (uint32_t row = 0; row < n; ++row)
@@ -9208,16 +9307,15 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             if (out_bytes > 0) {
                                 slot_bufs[ns.output_slot] =
                                     [mtl_device newBufferWithLength:out_bytes
-                                                           options:ComputeBufferResourceOptions()];
+                                                            options:ComputeBufferResourceOptions()];
                             }
                         }
                         float* A = (float*)[slot_bufs[ns.input_slots[0]] contents];
                         float* B = (float*)[slot_bufs[ns.input_slots[1]] contents];
                         float* C = (float*)[slot_bufs[ns.output_slot] contents];
-                        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                                    (int)ns.baked_gemm_m, (int)ns.baked_gemm_n, (int)ns.baked_gemm_k,
-                                    1.0f, A, (int)ns.baked_gemm_k, B, (int)ns.baked_gemm_n,
-                                    0.0f, C, (int)ns.baked_gemm_n);
+                        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)ns.baked_gemm_m,
+                                    (int)ns.baked_gemm_n, (int)ns.baked_gemm_k, 1.0f, A, (int)ns.baked_gemm_k,
+                                    B, (int)ns.baked_gemm_n, 0.0f, C, (int)ns.baked_gemm_n);
                         slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
                         continue;
                     }
@@ -9265,8 +9363,24 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         bool baked_ok = true;
                         switch (ns.baked_kind) {
                         case NativeStep::BakedKind::kSoftmax: {
-                            if (ns.input_slots.empty() || !ns.baked_softmax_maxsum ||
-                                !ns.baked_softmax_pass2_pipeline) {
+                            if (ns.input_slots.empty()) {
+                                endMixedNativeEncoder();
+                                return ExecutionResult::Error(
+                                    "Baked softmax missing input slot (mixed path)");
+                            }
+                            if (!ns.baked_softmax_pass2_pipeline) {
+                                // Single-pass full softmax or softmax numerator
+                                [enc setComputePipelineState:ns.baked_pipeline];
+                                [enc setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                                [enc setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
+                                [enc setBytes:&ns.baked_rows length:sizeof(ns.baked_rows) atIndex:2];
+                                [enc setBytes:&ns.baked_cols length:sizeof(ns.baked_cols) atIndex:3];
+                                NSUInteger tg_mem = (NSUInteger)ns.baked_cols * sizeof(float);
+                                [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+                                [enc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
+                                break;
+                            }
+                            if (!ns.baked_softmax_maxsum) {
                                 endMixedNativeEncoder();
                                 return ExecutionResult::Error("Baked softmax missing state (mixed path)");
                             }
@@ -9414,7 +9528,8 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             [enc setBytes:&ns.baked_gemm_n length:sizeof(ns.baked_gemm_n) atIndex:4];
                             [enc setBytes:&ns.baked_gemm_k length:sizeof(ns.baked_gemm_k) atIndex:5];
                             if (isNaive) {
-                                MTLSize naive_grid = MTLSizeMake(ns.baked_gemm_n, ns.baked_gemm_m, ns.baked_gemm_batch);
+                                MTLSize naive_grid =
+                                    MTLSizeMake(ns.baked_gemm_n, ns.baked_gemm_m, ns.baked_gemm_batch);
                                 [enc dispatchThreads:naive_grid threadsPerThreadgroup:ns.baked_tg];
                             } else {
                                 [enc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
@@ -9436,13 +9551,14 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             [trEnc setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
                             [trEnc setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
                             [trEnc setBytes:&ns.baked_transpose_rows
-                                        length:sizeof(ns.baked_transpose_rows) atIndex:2];
+                                     length:sizeof(ns.baked_transpose_rows)
+                                    atIndex:2];
                             [trEnc setBytes:&ns.baked_transpose_cols
-                                        length:sizeof(ns.baked_transpose_cols) atIndex:3];
+                                     length:sizeof(ns.baked_transpose_cols)
+                                    atIndex:3];
                             NSUInteger tg_mem = 32 * 33 * sizeof(float);
                             [trEnc setThreadgroupMemoryLength:tg_mem atIndex:0];
-                            [trEnc dispatchThreadgroups:ns.baked_grid
-                                     threadsPerThreadgroup:ns.baked_tg];
+                            [trEnc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
                             break;
                         }
                         case NativeStep::BakedKind::kSort: {
@@ -9462,15 +9578,14 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             [sortEnc setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
                             [sortEnc setBytes:&ns.baked_sort_n length:sizeof(ns.baked_sort_n) atIndex:2];
                             [sortEnc setBytes:&ns.baked_sort_padded_n
-                                        length:sizeof(ns.baked_sort_padded_n)
-                                       atIndex:3];
+                                       length:sizeof(ns.baked_sort_padded_n)
+                                      atIndex:3];
                             if (ns.baked_sort_num_rows > 1) {
                                 [sortEnc setBytes:&ns.baked_sort_n length:sizeof(ns.baked_sort_n) atIndex:4];
                             }
                             NSUInteger tg_mem = (NSUInteger)ns.baked_sort_padded_n * sizeof(float);
                             [sortEnc setThreadgroupMemoryLength:tg_mem atIndex:0];
-                            [sortEnc dispatchThreadgroups:ns.baked_grid
-                                     threadsPerThreadgroup:ns.baked_tg];
+                            [sortEnc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
                             break;
                         }
                         default:

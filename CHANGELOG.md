@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1.0] - 2025-06-27
+
 ### Added
 - Mixed-precision fp32 GEMM: large matmuls automatically cast to fp16 for ~2× speedup (controlled by `JAX_METALLIB_GEMM_TRUE_F32`)
-- Single-pass softmax kernel for ≤ 8192 features (1R+1W vs 2R+1W, saves ~300 µs per dispatch)
+- Single-pass full softmax kernel for ≤ 8192 features (eliminates second device read, ~1.5× faster)
+- Adaptive CompletionEvent spin-then-condvar strategy (3-phase: 5K short → 50K medium → condvar; reduces tail latency for sub-200 µs GPU fences)
+- Barrier-free MPSGraph direct-run path for single-graph-step plans (eliminates empty blit barrier, ~150–300 µs dispatch win)
+- Register-based bitonic sort kernel for multi-row 64–256 element sorts (no shared mem / barriers, ~3% faster)
+- Native last-axis `reduce.sum` routing (simdgroup per-row reduction, parity with `reduce.mean`)
 - Cholesky LAPACK CPU fallback for small batches (`JAX_METALLIB_CHOLESKY_LAPACK_MAX_N`, default 256)
 - macOS 15+ compatibility: modern MPSGraph random, slice, and concat APIs
 - `rng_bit_generator` UInt32 now emits a clean error instead of crashing
@@ -20,11 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated MPSGraph API calls to macOS 15+ equivalents (`randomTensorWithShape:descriptor:seed:`, `sliceTensor:starts:ends:strides:`, `concatTensors:dimension:`)
 - Downgraded softmax fusion log from INFO to DEBUG to reduce console noise
 - Tightened `dot_general` multi-batch-dim reshape logic
+- Rebuilt execution-plan dispatch for single-step graphs to use `encodeToCommandBuffer:` instead of `runWithMTLCommandQueue:` + manual barrier
 
 ### Fixed
 - `dot_general` multi-batch-dim correctness bug (previously failing on all transformer/GPT-2 benchmarks)
 - `rng_bit_generator` assertion crash on UInt32 output
 - `select_and_scatter` missing window_strides default
+- Mixed-path single-step softmax dispatch correctness (barrier synchronization gap)
 
 ## [0.10.0.0] - 2025-06
 
@@ -51,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Hardened control-flow lowering and zero-size tensor handling in pjrt_plugin ([38e63d3](https://github.com/erfanzar/jax-metallib/commit/38e63d3))
 
-[Unreleased]: https://github.com/erfanzar/jax-metallib/compare/v0.10.0.0...HEAD
+[Unreleased]: https://github.com/erfanzar/jax-metallib/compare/v0.10.1.0...HEAD
+[0.10.1.0]: https://github.com/erfanzar/jax-metallib/releases/tag/v0.10.1.0
 [0.10.0.0]: https://github.com/erfanzar/jax-metallib/releases/tag/v0.10.0.0
 [0.9.4.10]: https://github.com/erfanzar/jax-metallib/releases/tag/v0.9.4.10

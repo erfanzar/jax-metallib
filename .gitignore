@@ -230,6 +230,10 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Agent workspace
+.agents/
+eternal-army/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

@@ -1,6 +1,6 @@
 [project]
 name = "jax-metallib"
-version = "0.10.0.0"
+version = "0.10.1.0"
 description = "JAX backend for Apple M series of chips"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1609,6 +1609,170 @@ kernel void softmax_pass2_f16(device const half* x [[buffer(0)]],
   y[gid] = (half)(exp((float)x[gid] - m) / s);
 }
 
+// --- Single-pass full softmax: max + sum_exp + normalize in one kernel ---
+// Reads each row once into threadgroup memory, computes max and sum_exp,
+// then normalizes and writes output. Memory traffic = 1R + 1W
+// instead of 2R + 1W for the 2-pass approach.
+// Requires threadgroup memory >= cols * sizeof(float) (max 8K cols).
+kernel void softmax_full_f32_tg(device const float* x [[buffer(0)]],
+                                 device float* y [[buffer(1)]],
+                                 constant uint& rows [[buffer(2)]],
+                                 constant uint& cols [[buffer(3)]],
+                                 threadgroup float* shared [[threadgroup(0)]],
+                                 uint tid [[thread_index_in_threadgroup]],
+                                 uint row [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]],
+                                 uint simd_group [[simdgroup_index_in_threadgroup]],
+                                 uint tg_size [[threads_per_threadgroup]]) {
+  if (row >= rows) return;
+  uint base = row * cols;
+
+  // Phase 1: Load row into threadgroup memory AND find local max + sum_exp.
+  float local_max = -INFINITY;
+  float local_sum = 0.0f;
+  for (uint i = tid; i < cols; i += tg_size) {
+    float v = x[base + i];
+    shared[i] = v;
+    if (v > local_max) {
+      local_sum = local_sum * exp(local_max - v) + 1.0f;
+      local_max = v;
+    } else {
+      local_sum += exp(v - local_max);
+    }
+  }
+
+  // Reduce max + sum across SIMD groups (online softmax reduction).
+  for (ushort offset = 16; offset >= 1; offset >>= 1) {
+    float other_max = simd_shuffle_down(local_max, offset);
+    float other_sum = simd_shuffle_down(local_sum, offset);
+    float new_max = max(local_max, other_max);
+    if (new_max == -INFINITY) {
+      local_sum = 0.0f;
+    } else {
+      local_sum = local_sum * exp(local_max - new_max) + other_sum * exp(other_max - new_max);
+    }
+    local_max = new_max;
+  }
+
+  constexpr uint kMaxSimdGroups = 32;
+  threadgroup float partial_max[kMaxSimdGroups];
+  threadgroup float partial_sum[kMaxSimdGroups];
+  if (lane == 0) {
+    partial_max[simd_group] = local_max;
+    partial_sum[simd_group] = local_sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float row_max, row_sum;
+  if (simd_group == 0) {
+    uint num_simd = (tg_size + 31) >> 5;
+    float m = (lane < num_simd) ? partial_max[lane] : -INFINITY;
+    float s = (lane < num_simd) ? partial_sum[lane] : 0.0f;
+    for (ushort offset = 16; offset >= 1; offset >>= 1) {
+      float om = simd_shuffle_down(m, offset);
+      float os = simd_shuffle_down(s, offset);
+      float nm = max(m, om);
+      if (nm == -INFINITY) {
+        s = 0.0f;
+      } else {
+        s = s * exp(m - nm) + os * exp(om - nm);
+      }
+      m = nm;
+    }
+    if (lane == 0) {
+      partial_max[0] = m;
+      partial_sum[0] = s;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  row_max = partial_max[0];
+  row_sum = partial_sum[0];
+
+  // Phase 2: Read from threadgroup memory (free!) and write normalized output.
+  float inv_sum = 1.0f / row_sum;
+  for (uint i = tid; i < cols; i += tg_size) {
+    y[base + i] = exp(shared[i] - row_max) * inv_sum;
+  }
+}
+
+kernel void softmax_full_f16_tg(device const half* x [[buffer(0)]],
+                                 device half* y [[buffer(1)]],
+                                 constant uint& rows [[buffer(2)]],
+                                 constant uint& cols [[buffer(3)]],
+                                 threadgroup float* shared [[threadgroup(0)]],
+                                 uint tid [[thread_index_in_threadgroup]],
+                                 uint row [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]],
+                                 uint simd_group [[simdgroup_index_in_threadgroup]],
+                                 uint tg_size [[threads_per_threadgroup]]) {
+  if (row >= rows) return;
+  uint base = row * cols;
+
+  float local_max = -INFINITY;
+  float local_sum = 0.0f;
+  for (uint i = tid; i < cols; i += tg_size) {
+    float v = (float)x[base + i];
+    shared[i] = v;
+    if (v > local_max) {
+      local_sum = local_sum * exp(local_max - v) + 1.0f;
+      local_max = v;
+    } else {
+      local_sum += exp(v - local_max);
+    }
+  }
+
+  for (ushort offset = 16; offset >= 1; offset >>= 1) {
+    float other_max = simd_shuffle_down(local_max, offset);
+    float other_sum = simd_shuffle_down(local_sum, offset);
+    float new_max = max(local_max, other_max);
+    if (new_max == -INFINITY) {
+      local_sum = 0.0f;
+    } else {
+      local_sum = local_sum * exp(local_max - new_max) + other_sum * exp(other_max - new_max);
+    }
+    local_max = new_max;
+  }
+
+  constexpr uint kMaxSimdGroups = 32;
+  threadgroup float partial_max[kMaxSimdGroups];
+  threadgroup float partial_sum[kMaxSimdGroups];
+  if (lane == 0) {
+    partial_max[simd_group] = local_max;
+    partial_sum[simd_group] = local_sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float row_max, row_sum;
+  if (simd_group == 0) {
+    uint num_simd = (tg_size + 31) >> 5;
+    float m = (lane < num_simd) ? partial_max[lane] : -INFINITY;
+    float s = (lane < num_simd) ? partial_sum[lane] : 0.0f;
+    for (ushort offset = 16; offset >= 1; offset >>= 1) {
+      float om = simd_shuffle_down(m, offset);
+      float os = simd_shuffle_down(s, offset);
+      float nm = max(m, om);
+      if (nm == -INFINITY) {
+        s = 0.0f;
+      } else {
+        s = s * exp(m - nm) + os * exp(om - nm);
+      }
+      m = nm;
+    }
+    if (lane == 0) {
+      partial_max[0] = m;
+      partial_sum[0] = s;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  row_max = partial_max[0];
+  row_sum = partial_sum[0];
+
+  float inv_sum = 1.0f / row_sum;
+  for (uint i = tid; i < cols; i += tg_size) {
+    y[base + i] = (half)(exp(shared[i] - row_max) * inv_sum);
+  }
+}
+
 // --- Fused softmax numerator: exp(x - max(x, axis=-1, keepdims=True)) ---
 // Single kernel: reads each row once into threadgroup memory, finds max,
 // then computes exp(x - max) and writes output. Memory traffic = 1R + 1W
@@ -2451,7 +2615,8 @@ kernel void gemm_naive_f16(device const half* A [[buffer(0)]], device const half
         for (int ai = 0; ai < cfg.acc_rows; ai++) {
             for (int bj = 0; bj < cfg.acc_cols; bj++) {
                 snprintf(buf, sizeof(buf),
-                         "  simdgroup_store(acc[%d][%d], C + batch_z * M * N + (bm + sg_row * %du + %du) * N + bn + sg_col * "
+                         "  simdgroup_store(acc[%d][%d], C + batch_z * M * N + (bm + sg_row * %du + %du) * N "
+                         "+ bn + sg_col * "
                          "%du + %du, N);\n",
                          ai, bj, cfg.acc_rows * 8, ai * 8, cfg.acc_cols * 8, bj * 8);
                 s += buf;
