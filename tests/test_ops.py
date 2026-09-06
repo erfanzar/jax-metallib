@@ -176,19 +176,19 @@ def test_op_grad(op_config: OperationTestConfig, jit: bool) -> None:
             jax.tree.map_with_path(assert_allclose_with_path, *results)
 
 
-@pytest.mark.xfail(reason="Native intrinsic ordering bug: broadcast_in_dim before divide in HLO", strict=True)
 def test_native_intrinsic_ordering_bug() -> None:
-    """Regression test for native intrinsic kernel ordering bug.
+    """Regression test for the native intrinsic kernel ordering bug.
 
     When intrinsic native kernels are enabled and the StableHLO IR has
     broadcast_in_dim + multiply + log ops *before* the divide that produces a
-    value used by later multiply ops, the mixed execution path produces
-    incorrect results.  This is because the native kernel dispatch in the mixed
-    graph+native path does not correctly handle the case where intermediate
-    results are produced by ops that appear later in the SSA order.
+    value used by later multiply ops, the mixed execution path produced
+    incorrect results (native kernel dispatch did not handle intermediates
+    produced later in SSA order).
 
-    The test XFAILs until the C++ backend fix lands; once it passes, the xfail
-    will turn into a hard failure reminding us to remove the marker.
+    Since the JAX 0.11 port, intrinsic-native kernels are disabled by default
+    (the native path also over-releases a buffer on eager grad chains), so this
+    currently exercises the MPSGraph path and passes. Re-add a strict xfail if
+    the native path is re-enabled before its ordering bug is fixed.
     """
     if TEST_MODE == "cpu":
         pytest.skip("MPS-specific test")

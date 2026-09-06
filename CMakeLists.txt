@@ -28,6 +28,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # macOS specific settings
 set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum macOS version")
 
+# Use Accelerate's modern LAPACK entry points. Required: linalg_ops.mm uses
+# __LAPACK_int / spotrf_ from the new interface (CLAPACK is deprecated).
+if(APPLE)
+    add_compile_options(-DACCELERATE_NEW_LAPACK)
+endif()
+
 # Explicitly set sysroot so compile_commands.json works with any clang-tidy
 execute_process(
     COMMAND xcrun --show-sdk-path
@@ -150,6 +156,7 @@ find_library(STABLEHLO_ASSEMBLY_FORMAT_LIB StablehloAssemblyFormat HINTS ${CMAKE
 find_library(STABLEHLO_BROADCAST_UTILS_LIB StablehloBroadcastUtils HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
 find_library(STABLEHLO_BROADCAST_LOWERING_LIB StablehloBroadcastLowering HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
 find_library(STABLEHLO_PASSES_LIB StablehloPasses HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
+find_library(STABLEHLO_REPLICA_GROUP_UTILS_LIB StablehloReplicaGroupUtils HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
 find_library(STABLEHLO_OPTIMIZATION_PASSES_LIB StablehloOptimizationPasses HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
 find_library(STABLEHLO_PASS_UTILS_LIB StablehloPassUtils HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
 find_library(STABLEHLO_TYPE_CONVERSION_LIB StablehloTypeConversion HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
@@ -194,6 +201,13 @@ set(PJRT_SOURCES
 )
 
 add_library(pjrt_plugin_silicon SHARED ${PJRT_SOURCES})
+
+# Link-time optimization (experimental; measurable on dispatch-heavy paths).
+if(JAX_METALLIB_ENABLE_LTO)
+    cmake_policy(SET CMP0069 NEW)
+    set_property(TARGET pjrt_plugin_silicon PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    message(STATUS "LTO enabled for pjrt_plugin_silicon")
+endif()
 
 target_include_directories(pjrt_plugin_silicon PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -240,6 +254,7 @@ set(STABLEHLO_LIBS "")
 foreach(lib
     STABLEHLO_SERIALIZATION_LIB
     STABLEHLO_PASSES_LIB
+    STABLEHLO_REPLICA_GROUP_UTILS_LIB
     STABLEHLO_OPTIMIZATION_PASSES_LIB
     STABLEHLO_PASS_UTILS_LIB
     STABLEHLO_TYPE_CONVERSION_LIB

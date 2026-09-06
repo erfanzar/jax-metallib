@@ -17,8 +17,8 @@
 
 #include "llvm/Support/raw_ostream.h"
 
-// Use the new Accelerate LAPACK interface (avoids deprecation warnings).
-#define ACCELERATE_NEW_LAPACK
+// ACCELERATE_NEW_LAPACK is defined globally via CMake (avoids the deprecated
+// CLAPACK interface and the local macro-redefinition warning).
 #import <Accelerate/Accelerate.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #include <cstdint>

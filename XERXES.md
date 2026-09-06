@@ -13,7 +13,7 @@ jax-metallib is a native PJRT (Pluggable Device Runtime) plugin that lets JAX ex
 - **120 StableHLO ops** registered across 15 op category files
 - **3 execution paths**: MPSGraph compilation, native Metal kernels for perf-critical ops, JIT fusion of elementwise chains into custom MSL kernels
 - **Platform**: macOS 13.0+ (15+ recommended), Apple Silicon only
-- **JAX version**: 0.10.x
+- **JAX version**: 0.11.x
 
 ---
 
@@ -208,7 +208,8 @@ Full list: 40+ tuning flags in `src/pjrt_plugin/core/mps_executable.mm` and `REA
 - **Per-op dispatch overhead ~250–550 µs**: Small tensors (<10K elements) are often faster on CPU. The GPU wins at scale (matmul >4K×5K, sort >100K, conv >1K channels).
 - **macOS 15+ strongly recommended**: Some MPSGraph APIs used on 13–14 are deprecated and replaced with modern equivalents on 15+. The `randomTensorWithShape:descriptor:seed:` and `sliceTensor:starts:ends:strides:` APIs require macOS 15+.
 - **Mixed-precision GEMM**: Large fp32 matmuls (≥500K elements, ≥100M FLOPs) auto-cast to fp16 for speed. Set `JAX_METALLIB_GEMM_TRUE_F32=1` for exact precision.
-- **Native intrinsic ordering bug**: `broadcast_in_dim` before `divide` in HLO can produce wrong results in mixed graph+native path. This is caught by `test_native_intrinsic_ordering_bug` (xfail strict).
+- **Native intrinsic kernels are disabled by default on JAX 0.11** (`JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS=1` to opt in): eager dispatch exposed a `CFRelease(nil)` abort on eliminated output slots (fixed in 0.11.1.0) and fused-chain scheduling defects — the broadcast-ordering wrong-results bug is fixed (chains now split at externally-consumed intermediates), but a slot-aliasing defect remains for some MultivariateNormal log-prob gradients under the opt-in flag. `test_native_intrinsic_ordering_bug` guards the ordering pattern.
+- **Bumping JAX**: pins come from the JAX release's `MODULE.bazel` `archive_override` (XLA commit), XLA's `third_party/stablehlo/workspace.bzl` (StableHLO commit), and that StableHLO commit's `build_tools/llvm_version.txt` (LLVM commit). After changing pins, `setup_deps.sh --force` is mandatory — stale installed headers shadow fresh builds.
 - **Metal has no `atomic_half`**: Scatter-add uses non-atomic read-add-write; duplicate indices may lose updates.
 - **UInt32 `rng_bit_generator` unsupported**: MPSGraph asserts on UInt32 random dtype. Use `jax.random.bits` instead.
 - **Build fragility**: LLVM/MLIR/StableHLO are pinned to exact commits. Bumping JAX versions requires matching StableHLO/XLA/LLVM commits.

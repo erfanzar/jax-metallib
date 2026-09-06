@@ -69,9 +69,9 @@ grads = f(x)
 | ----------- | -------------------------------------- |
 | macOS       | 13.0+ (Ventura) or 15+ (recommended)   |
 | Hardware    | Apple Silicon (M1 / M2 / M3 / M4 / M5) |
-| Python      | 3.11, 3.12, or 3.13                    |
-| JAX         | 0.10.x                                 |
-| jaxlib      | 0.10.x                                 |
+| Python      | 3.12 or 3.13                           |
+| JAX         | 0.11.x                                 |
+| jaxlib      | 0.11.x                                 |
 
 > **Note:** macOS 15+ is recommended for the best compatibility. Some MPSGraph APIs used on macOS 13–14 have been deprecated and replaced with modern equivalents on macOS 15+.
 
@@ -100,8 +100,8 @@ The bootstrap script (`scripts/setup_deps.sh`) fetches and builds the following 
 
 | Dependency  | Version | Purpose                                          |
 | ----------- | ------- | ------------------------------------------------ |
-| LLVM + MLIR | `5e14916` (override) | MLIR infrastructure, StableHLO dialect support. The XLA-pinned LLVM predates the `OpaqueProperties` API that StableHLO now requires, so the build uses an override commit. |
-| StableHLO   | `0dc0fd71` | IR parsing, serialization, dialect definitions   |
+| LLVM + MLIR | `6d1ace5` (override) | MLIR infrastructure, StableHLO dialect support. The build uses the LLVM commit integrated by the pinned StableHLO revision so MLIR's C++ API matches what StableHLO expects. |
+| StableHLO   | `7b1b157` | IR parsing, serialization, dialect definitions   |
 | Abseil      | 20250127.0 | C++ utilities (strings, status, synchronization) |
 | Protobuf    | 29.3 | Device assignment protocol buffer serialization  |
 
@@ -254,9 +254,12 @@ The plugin exposes many tuning flags for power users and debugging. These are st
 | `JAX_METALLIB_LAYERNORM_FUSION_MIN_ELEMENTS` | `131072` | Min elements for LayerNorm fusion |
 | `JAX_METALLIB_SOFTMAX_FUSION_MIN_ELEMENTS` | `1024` | Min elements for Softmax fusion |
 | `JAX_METALLIB_STRIDE_MIN_NUMEL` | `1048576` | Min elements for strided kernels |
+| `JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS` | `32768` | Min elements before last-axis sum/max/min reduces run on the native kernel (13× faster than MPSGraph at 64K+) |
+| `JAX_METALLIB_DISABLE_MIXED_INTRINSIC_NATIVE` | — | Force mixed graph+native plans back to all-graph (mixed plans are default-on; large reduces run natively) |
 | `JAX_METALLIB_MAX_OPS_PER_CMDBUF` | `48` | Max ops per command buffer |
 | `JAX_METALLIB_MAX_MB_PER_CMDBUF` | `48` | Max MB per command buffer |
-| `JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS` | — | Disable all native intrinsic kernels (LayerNorm, Softmax, GEMM, etc.) |
+| `JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS` | — | Opt into native intrinsic kernels (disabled by default — known ordering bug under JAX 0.11, see known limitations) |
+| `JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS` | — | Disable all native intrinsic kernels (LayerNorm, Softmax, GEMM, etc.); wins over the enable flag |
 | `JAX_METALLIB_DISABLE_NATIVE_GEMM` | — | Disable native GEMM interception |
 | `JAX_METALLIB_ENABLE_NATIVE_GEMM` | — | Force-enable native GEMM |
 | `JAX_METALLIB_DISABLE_LAYERNORM_FUSION` | — | Disable native LayerNorm fusion |
@@ -375,6 +378,7 @@ The benchmark suite includes per-op micro-benchmarks, representative anchor work
 - **`rng_bit_generator` with `UInt32` output** is not supported by MPSGraph and will raise a clean error. Use `jax.random.bits` (which lowers to a function-form Threefry call) or a different dtype.
 - **Dispatch overhead floor:** ~250–550 µs per op launch means very small tensors (below ~10K elements) are often faster on CPU. This is a fundamental GPU driver characteristic, not a plugin bug.
 - **Cholesky LAPACK fallback** is only active for `float32` inputs and `n ≤ 2048`. For larger inputs or non-float32 dtypes, the native MPS GPU kernel is always used.
+- **Native intrinsic kernels are disabled by default on JAX 0.11.** JAX 0.11's eager dispatch exposed a `CFRelease(nil)` abort on eliminated output slots (fixed in 0.11.1.0 via placeholder buffers) and two fused-chain scheduling defects — a broadcast-ordering bug (fixed in 0.11.1.0 by splitting fused chains at externally-consumed intermediates) and a remaining slot-aliasing defect that yields wrong results for some MultivariateNormal log-prob gradients. All ops run through MPSGraph by default, which is correct. Opt into the native path with `JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS=1` only for experiments.
 
 ## Python API
 
@@ -469,7 +473,7 @@ tests/
   test_int64_constant_splats.py Regression: int64 precision above 2^53
   test_metal_kernel.py          Custom kernel API tests
   test_quantized.py             MX quantization tests
-  configs/                      Per-category test configurations (17 modules)
+  configs/                      Per-category test configurations (15 modules)
 benchmarks/
   bench.py                      Benchmark harness (list/run, JSONL output)
   bottlenecks.py                Per-op micro-benchmarks

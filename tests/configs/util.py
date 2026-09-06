@@ -172,24 +172,32 @@ class OperationTestConfig:
         grad_vals = []
         for returnnum in range(num_return_values or 1):
 
-            def target(*args, returnnum=returnnum, **kwargs):
-                result = func(*args, **kwargs)
-                if num_return_values is None:
-                    assert isinstance(result, jnp.ndarray), f"Output of '{func}' is not a tensor."
-                else:
-                    result = result[returnnum]
+            # Build `target` via a closure (not a keyword-only default) so its
+            # signature stays bindable for frameworks that introspect it, e.g.
+            # flax.nnx.grad's resolve_kwargs rejects keyword-only parameters.
+            def make_target(returnnum):
+                def grad_target(*args, **kwargs):
+                    result = func(*args, **kwargs)
+                    if num_return_values is None:
+                        assert isinstance(result, jnp.ndarray), f"Output of '{func}' is not a tensor."
+                    else:
+                        result = result[returnnum]
 
-                # FIXME: Reduce to the magnitude if the function is complex-valued so we
-                # don't have to deal with complex derivatives. This isn't ideal but
-                # pragmatic.
-                if result.dtype == jnp.complex64:
-                    result = jnp.abs(result)
+                    # FIXME: Reduce to the magnitude if the function is complex-valued so we
+                    # don't have to deal with complex derivatives. This isn't ideal but
+                    # pragmatic.
+                    if result.dtype == jnp.complex64:
+                        result = jnp.abs(result)
 
-                # Reduce to the mean if the output is not a scalar; we can only
-                # differentiate scalars.
-                if result.shape != ():
-                    result = result.mean()
-                return result
+                    # Reduce to the mean if the output is not a scalar; we can only
+                    # differentiate scalars.
+                    if result.shape != ():
+                        result = result.mean()
+                    return result
+
+                return grad_target
+
+            target = make_target(returnnum)
 
             grad_func = self.grad_transform(target, argnums=argnum)
             lowered = None

@@ -1,13 +1,13 @@
 [project]
 name = "jax-metallib"
-version = "0.10.1.0"
+version = "0.11.1.0"
 description = "JAX backend for Apple M series of chips"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "jax>=0.10.0,<0.11",
-    "jaxlib>=0.10.0,<0.11",
+    "jax>=0.11.0,<0.12",
+    "jaxlib>=0.11.0,<0.12",
     "pyobjc-core>=12.1",
     "pyobjc-framework-metal>=12.1",
     "pyobjc-framework-metalperformanceshaders>=12.1",
@@ -47,7 +47,7 @@ wheel.packages = ["src/jax_plugins"]
 wheel.install-dir = "jax_plugins/silicon"
 
 [tool.cibuildwheel]
-build = ["cp311-macosx_arm64", "cp312-macosx_arm64", "cp313-macosx_arm64"]
+build = ["cp312-macosx_arm64", "cp313-macosx_arm64"]
 environment = { CMAKE_PREFIX_PATH = "$HOME/.local/jax-metallib-deps" }
 before-all = "./scripts/setup_deps.sh"
 
@@ -68,12 +68,12 @@ dev = [
 
 [tool.black]
 line-length = 121
-target-version = ["py311"]
+target-version = ["py312"]
 preview = true
 
 [tool.ruff]
 line-length = 121
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]

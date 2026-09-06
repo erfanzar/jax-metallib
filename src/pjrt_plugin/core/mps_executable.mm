@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <dispatch/dispatch.h>
 #include <limits>
 #include <map>
@@ -208,6 +209,7 @@ struct NativeStep {
 
     // CPU Cholesky fields
     uint32_t baked_cholesky_n = 0;
+    uint32_t baked_cholesky_batch = 1;
     bool baked_cholesky_lower = true;
 
     std::unique_ptr<FusedElementwiseInfo> fused_info;
@@ -270,6 +272,20 @@ static bool EnvFlagEnabled(const char* name) {
     }
 
     return !(v[0] == '0' && v[1] == '\0');
+}
+
+// Intrinsic-native kernels are DISABLED by default. Under JAX 0.11's eager
+// dispatch, the fused-chain path still has a slot-aliasing defect (a graph-step
+// target sharing a slot with a fused-chain output) that yields wrong results
+// for some MultivariateNormal log-prob gradients when enabled. The CFRelease(nil)
+// abort and the broadcast-ordering wrong-results are fixed (0.11.1.0). Opt in
+// with JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS=1 for experiments;
+// JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS=1 always wins.
+static bool IntrinsicNativeKernelsEnabled() {
+    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS")) {
+        return false;
+    }
+    return EnvFlagEnabled("JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS");
 }
 
 static int EnvIntValue(const char* name, int default_value) {
@@ -993,7 +1009,7 @@ static bool IsReduceMeanPattern(mlir::Operation* reduceOp,
 
 static void FuseReduceMeanPatterns(mlir::Block& block) {
     if (EnvFlagEnabled("JAX_METALLIB_DISABLE_REDUCE_MEAN_FUSION") ||
-        EnvFlagEnabled("JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS")) {
+        !IntrinsicNativeKernelsEnabled()) {
         return;
     }
 
@@ -1359,7 +1375,7 @@ static bool IsLayerNormPattern(mlir::Operation* reduceSumOp,
 
 static void FuseLayerNormPatterns(mlir::Block& block) {
     if (EnvFlagEnabled("JAX_METALLIB_DISABLE_LAYERNORM_FUSION") ||
-        EnvFlagEnabled("JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS")) {
+        !IntrinsicNativeKernelsEnabled()) {
         return;
     }
 
@@ -1582,8 +1598,12 @@ static bool IsSoftmaxPattern(mlir::Operation* reduceMaxOp,
 }
 
 static void FuseSoftmaxPatterns(mlir::Block& block) {
+    // NOTE: the fused softmax lowering produces a shape-invalid MPSGraph for
+    // 2-D inputs (e.g. softmax(4096x64) aborts in mps.reshape verification),
+    // so this pass must follow the intrinsic-kernel gate. Do not revert to
+    // checking the raw DISABLE flag.
     if (EnvFlagEnabled("JAX_METALLIB_DISABLE_SOFTMAX_FUSION") ||
-        EnvFlagEnabled("JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS")) {
+        !IntrinsicNativeKernelsEnabled()) {
         return;
     }
 
@@ -2071,7 +2091,7 @@ static bool IsEligibleReduceNativeOp(mlir::Operation* op, IntrinsicNativeKind ki
     if (kind == IntrinsicNativeKind::kReduceSumLastAxis || kind == IntrinsicNativeKind::kReduceMaxLastAxis ||
         kind == IntrinsicNativeKind::kReduceMinLastAxis) {
         uint64_t minElems =
-            static_cast<uint64_t>(EnvIntValue("JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS", 100000));
+            static_cast<uint64_t>(EnvIntValue("JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS", 32768));
         if (inNumel < minElems) {
             return false;
         }
@@ -2699,6 +2719,10 @@ static std::string GetAutotuneCachePath() {
     return dir + "/autotune_cache.bin";
 }
 
+// Format version of autotune_cache.bin. Bump when AutotuneKey/ElemAutotuneKey
+// layouts, variant numbering, or field types change.
+static constexpr uint32_t kAutotuneCacheVersion = 2;
+
 static void SaveAutotuneCacheToDisk() {
     if (EnvFlagEnabled("JAX_METALLIB_DISABLE_AUTOTUNE_CACHE_PERSIST"))
         return;
@@ -2709,6 +2733,13 @@ static void SaveAutotuneCacheToDisk() {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f)
         return;
+
+    // Header: magic + format version. Bump kAutotuneCacheVersion whenever the
+    // key/value layouts or variant numbering change; loaders discard
+    // mismatched files instead of silently misreading stale entries.
+    const char magic[4] = {'J', 'X', 'M', 'T'};
+    fwrite(magic, 1, sizeof(magic), f);
+    fwrite(&kAutotuneCacheVersion, sizeof(kAutotuneCacheVersion), 1, f);
 
     // Write GEMM cache
     {
@@ -2750,6 +2781,23 @@ static void LoadAutotuneCacheFromDisk(uintptr_t device_id) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f)
         return;
+
+    // Header check: discard unversioned or mismatched files (e.g. caches
+    // written by older plugin builds — they must not steer kernel selection).
+    const char kMagic[4] = {'J', 'X', 'M', 'T'};
+    char magic[4] = {0, 0, 0, 0};
+    uint32_t version = 0;
+    if (fread(magic, 1, sizeof(magic), f) != sizeof(magic) ||
+        std::memcmp(magic, kMagic, sizeof(magic)) != 0) {
+        fclose(f);
+        MPS_LOG_DEBUG("autotune cache %s: missing magic, ignoring\n", path.c_str());
+        return;
+    }
+    if (fread(&version, sizeof(version), 1, f) != 1 || version != kAutotuneCacheVersion) {
+        fclose(f);
+        MPS_LOG_DEBUG("autotune cache %s: version mismatch (%u), ignoring\n", path.c_str(), version);
+        return;
+    }
 
     // Read GEMM cache
     uint32_t gemm_count = 0;
@@ -4371,6 +4419,53 @@ static id<MTLBuffer> NativeIntrinsicReduceHandler(id<MTLDevice> device, id<MTLCo
     [encoder setBytes:&rows length:sizeof(rows) atIndex:2];
     [encoder setBytes:&cols length:sizeof(cols) atIndex:3];
     if (use_threadgroup) {
+        // A single threadgroup serializes on one SM; for huge single-row
+        // reductions, split the columns across G threadgroups into partials,
+        // then combine with a second dispatch of the same kernel (~10-100x).
+        NSUInteger tg_split = MIN((NSUInteger)1024, (NSUInteger)pipeline.maxTotalThreadsPerThreadgroup);
+        if (tg_split == 0) {
+            tg_split = 1;
+        }
+        uint32_t groups = 0;
+        if (rows == 1 && dtype == MPSDataTypeFloat32 && cols >= 4096) {
+            const uint32_t candidates[] = {1024u, 512u, 256u, 128u, 64u, 32u, 16u};
+            for (uint32_t g : candidates) {
+                if (cols % g == 0 && cols / g >= 512) {
+                    groups = g;
+                    break;
+                }
+            }
+        }
+        if (groups > 0) {
+            id<MTLBuffer> partials = AcquireReusableOutputBuffer(device, groups * sizeof(float));
+            if (!partials) {
+                return nil;
+            }
+            uint32_t rows_g = groups;
+            uint32_t cols_g = cols / groups;
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:inputs[0] offset:0 atIndex:0];
+            [encoder setBuffer:partials offset:0 atIndex:1];
+            [encoder setBytes:&rows_g length:sizeof(rows_g) atIndex:2];
+            [encoder setBytes:&cols_g length:sizeof(cols_g) atIndex:3];
+            [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tg_split, 1, 1)];
+            [encoder endEncoding];
+            // Combine: reduce the G partials into the scalar output.
+            id<MTLComputeCommandEncoder> enc2 = [commandBuffer computeCommandEncoder];
+            const bool combine_tg = groups >= 512;
+            id<MTLComputePipelineState> combine_pipeline =
+                GetFastNativePipeline(device, ReduceKernelFunctionName(kind, dtype, combine_tg));
+            if (!combine_pipeline) {
+                return nil;
+            }
+            [enc2 setComputePipelineState:combine_pipeline];
+            [enc2 setBuffer:partials offset:0 atIndex:0];
+            [enc2 setBuffer:out offset:0 atIndex:1];
+            EncodeRowReduceDispatch(enc2, combine_pipeline, 1, groups);
+            [enc2 endEncoding];
+            return out;
+        }
         EncodeRowReduceDispatch(encoder, pipeline, rows, cols);
     } else {
         uint32_t dispatch_count = is_axis0 ? cols : rows;
@@ -5040,9 +5135,13 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
                 return false;
             }
 
-            // CPU BLAS fallback for tiny f32 matmuls — avoids GPU dispatch overhead
+            // CPU BLAS fallback for small f32 matmuls — avoids GPU dispatch overhead.
+            // 128x128x128 (2.1M) measures ~7.8ms on the GPU naive path vs ~0.1ms on
+            // the CPU; the crossover vs the mixed-fp16 GPU path sits near ~4.5M.
+            static const uint64_t cpu_blas_max_mnk =
+                static_cast<uint64_t>(EnvIntValue("JAX_METALLIB_CPU_BLAS_MAX_MNK", 4500000));
             uint64_t flops = (uint64_t)gM * gN * gK;
-            if (dtype == MPSDataTypeFloat32 && gBatch == 1 && flops < 200000) {
+            if (dtype == MPSDataTypeFloat32 && gBatch == 1 && flops < cpu_blas_max_mnk) {
                 ns->baked_kind = NativeStep::BakedKind::kCpuBLAS;
                 ns->baked_gemm_m = gM;
                 ns->baked_gemm_n = gN;
@@ -5122,15 +5221,21 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
         if (choleskyOp) {
             auto resultType = mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
             auto shape = resultType.getShape();
-            if (shape.size() == 2 && resultType.getElementType().isF32()) {
+            if (shape.size() >= 2 && resultType.getElementType().isF32()) {
                 int64_t n = shape.back();
-                if (shape[shape.size() - 2] == n && n > 0 && n <= 256) {
+                int64_t batch = 1;
+                for (int64_t d = 0; d + 2 < static_cast<int64_t>(shape.size()); ++d) {
+                    batch *= shape[d];
+                }
+                if (shape[shape.size() - 2] == n && n > 0 && n <= 256 && batch > 0 &&
+                    batch <= 1024) {
                     bool lower = true;
                     if (choleskyOp.getLowerAttr()) {
                         lower = choleskyOp.getLower();
                     }
                     ns->baked_kind = NativeStep::BakedKind::kCpuCholesky;
                     ns->baked_cholesky_n = static_cast<uint32_t>(n);
+                    ns->baked_cholesky_batch = static_cast<uint32_t>(batch);
                     ns->baked_cholesky_lower = lower;
                     return true;
                 }
@@ -5604,7 +5709,27 @@ static id<MTLBuffer> NativeIntrinsicSortHandler(id<MTLDevice> device, id<MTLComm
 }
 
 static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
-    if (!op || EnvFlagEnabled("JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS")) {
+    if (!op) {
+        return nullptr;
+    }
+    // Large last-axis sum/mean reductions route natively EVEN when the
+    // intrinsic-kernel family is gated off: the TG reduce kernel is 13-100x
+    // faster than the MPSGraph reduce path at these sizes (2822us -> 372us at
+    // 65536; 84ms -> ~300us at 1M), and this route does not use the fused-chain
+    // elimination machinery where the intrinsic-family defects live.
+    if (!IntrinsicNativeKernelsEnabled()) {
+        auto reduceOp = mlir::dyn_cast_or_null<mlir::stablehlo::ReduceOp>(op);
+        if (reduceOp && GetReduceBodyOpName(reduceOp) == "stablehlo.add" &&
+            reduceOp->getNumOperands() == 2 && reduceOp->getNumResults() == 1) {
+            auto inType = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType());
+            auto dims = reduceOp.getDimensions();
+            if (inType && inType.hasStaticShape() && dims.size() == 1 &&
+                dims[0] == static_cast<int64_t>(inType.getRank()) - 1) {
+                if (IsEligibleReduceNativeOp(op, IntrinsicNativeKind::kReduceSumLastAxis)) {
+                    return NativeIntrinsicReduceHandler;
+                }
+            }
+        }
         return nullptr;
     }
     if (!ShouldRouteToIntrinsicNative(op)) {
@@ -5719,12 +5844,19 @@ static bool OutputBufferPoolEnabled() {
 // Avoids the global pool mutex on the hot path for repeated dispatches
 // of the same shape (the common case in JAX benchmarks and training loops).
 struct TLOutputBufSlot {
-    void* device_key = nullptr;
-    size_t bucket = 0;
-    void* metal_buffer = nullptr; // CFRetained when non-null
+    static constexpr int kRingSize = 4;
+    struct Entry {
+        void* device_key = nullptr;
+        size_t bucket = 0;
+        void* metal_buffer = nullptr; // CFRetained when non-null
+    };
+    Entry entries[kRingSize];
+    int next = 0;
     ~TLOutputBufSlot() {
-        if (metal_buffer) {
-            CFRelease(metal_buffer);
+        for (auto& e : entries) {
+            if (e.metal_buffer) {
+                CFRelease(e.metal_buffer);
+            }
         }
     }
 };
@@ -5744,15 +5876,18 @@ static id<MTLBuffer> AcquireReusableOutputBuffer(id<MTLDevice> device, size_t by
     const size_t bucket = RoundUpToPow2(byte_size);
     void* dev_key = (__bridge void*)device;
 
-    // Thread-local fast path: check single-element cache first (no mutex).
+    // Thread-local fast path: scan the ring first (no mutex).
     auto& tls = GetTLOutputSlot();
-    if (tls.metal_buffer && tls.device_key == dev_key && tls.bucket == bucket) {
-        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)tls.metal_buffer;
-        tls.metal_buffer = nullptr;
-        if ([buf length] >= byte_size) {
-            return buf;
+    for (auto& e : tls.entries) {
+        if (e.metal_buffer && e.device_key == dev_key && e.bucket == bucket) {
+            id<MTLBuffer> buf = (__bridge id<MTLBuffer>)e.metal_buffer;
+            e.metal_buffer = nullptr;
+            if ([buf length] >= byte_size) {
+                return buf;
+            }
+            CFRelease((__bridge CFTypeRef)buf);
+            break;
         }
-        CFRelease((__bridge CFTypeRef)buf);
     }
 
     ReusableOutputPool& pool = GetReusableOutputPool();
@@ -5789,14 +5924,16 @@ static void RecycleReusableOutputBuffer(void* device_key, size_t byte_size, void
     const size_t actual_len = (size_t)[buf length];
     const size_t bucket = RoundUpToPow2(actual_len > 0 ? actual_len : byte_size);
 
-    // Thread-local fast path: store in single-element cache.
+    // Thread-local fast path: store in the ring (evict oldest to the bin).
     auto& tls = GetTLOutputSlot();
-    void* evicted = tls.metal_buffer;
-    void* evicted_dk = tls.device_key;
-    size_t evicted_bk = tls.bucket;
-    tls.device_key = device_key;
-    tls.bucket = bucket;
-    tls.metal_buffer = metal_buffer;
+    auto& slot = tls.entries[tls.next];
+    tls.next = (tls.next + 1) % TLOutputBufSlot::kRingSize;
+    void* evicted = slot.metal_buffer;
+    void* evicted_dk = slot.device_key;
+    size_t evicted_bk = slot.bucket;
+    slot.device_key = device_key;
+    slot.bucket = bucket;
+    slot.metal_buffer = metal_buffer;
     if (!evicted) {
         return;
     }
@@ -6501,7 +6638,6 @@ bool MpsExecutable::BuildExecutionPlan() {
         std::unordered_set<mlir::Operation*> demoted_elem_ops;
 
         for (int build_pass = 0; build_pass < 2; ++build_pass) {
-
             plan = std::make_unique<ExecutionPlan>();
 
             if (!build_segments(true, demoted_elem_ops.empty() ? nullptr : &demoted_elem_ops)) {
@@ -6510,7 +6646,12 @@ bool MpsExecutable::BuildExecutionPlan() {
 
             const int mixed_intrinsic_segment_threshold =
                 EnvIntValue("JAX_METALLIB_MIXED_INTRINSIC_SEGMENT_THRESHOLD", 1);
-            const bool keep_mixed_intrinsics = EnvFlagEnabled("JAX_METALLIB_ENABLE_MIXED_INTRINSIC_NATIVE");
+            // Mixed graph+native plans are the default: large last-axis
+            // reductions run natively (8-190x faster than the MPSGraph reduce
+            // path). Opt out with JAX_METALLIB_DISABLE_MIXED_INTRINSIC_NATIVE=1
+            // if a workload exposes a fused-chain defect.
+            const bool keep_mixed_intrinsics =
+                !EnvFlagEnabled("JAX_METALLIB_DISABLE_MIXED_INTRINSIC_NATIVE");
             bool has_graph_segment = false;
             bool has_native_segment = false;
             bool has_explicit_native_segment = false;
@@ -6932,6 +7073,7 @@ bool MpsExecutable::BuildExecutionPlan() {
                                     }
                                 }
 
+
                                 std::unordered_map<void*, SlotId> targetTensorToSlot;
                                 targetTensorToSlot.reserve(gs.targets.size());
                                 for (const auto& [slot, tensor_ptr] : gs.targets) {
@@ -7043,6 +7185,26 @@ bool MpsExecutable::BuildExecutionPlan() {
                 std::vector<ChainRange> chains;
 
                 size_t chain_start = 0;
+                // Slot -> positions of steps that read it (native inputs and
+                // graph feeds). Used to keep fused chains from eliminating an
+                // intermediate that a later step still consumes.
+                std::unordered_map<SlotId, std::vector<size_t>> slot_consumers;
+                for (size_t si = 0; si < plan->steps.size(); ++si) {
+                    const auto& step = plan->steps[si];
+                    if (step.kind == Step::NATIVE) {
+                        for (SlotId s : plan->native_steps[step.index].input_slots) {
+                            slot_consumers[s].push_back(si);
+                        }
+                    } else if (step.kind == Step::GRAPH) {
+                        for (auto& feed : plan->graph_steps[step.index].feeds) {
+                            slot_consumers[feed.first].push_back(si);
+                        }
+                        for (SlotId s : plan->graph_steps[step.index].exec_feed_slots) {
+                            slot_consumers[s].push_back(si);
+                        }
+                    }
+                }
+
                 bool in_chain = false;
                 MPSDataType chain_dtype = MPSDataTypeInvalid;
                 uint64_t chain_numel = 0;
@@ -7051,7 +7213,45 @@ bool MpsExecutable::BuildExecutionPlan() {
 
                 auto flush_chain = [&](size_t chain_end) {
                     if (in_chain && chain_end - chain_start >= 2) {
-                        chains.push_back({chain_start, chain_end});
+                        // Split so that no interior output is consumed outside
+                        // its chain: such a slot would be marked eliminated and
+                        // never written, while the external reader (e.g. a second
+                        // fused chain after an intervening graph step) would read
+                        // zeros.
+                        size_t run_start = chain_start;
+                        for (size_t p = run_start; p < chain_end; ++p) {
+                            const auto& st = plan->steps[p];
+                            SlotId out_slot = (st.kind == Step::NATIVE)
+                                                  ? plan->native_steps[st.index].output_slot
+                                                  : -1;
+                            bool externally_consumed = false;
+                            if (out_slot >= 0) {
+                                auto it = slot_consumers.find(out_slot);
+                                if (it != slot_consumers.end()) {
+                                    for (size_t cpos : it->second) {
+                                        if (cpos < run_start || cpos >= chain_end) {
+                                            externally_consumed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (externally_consumed) {
+                                // The op at `p` has a reader outside this run, so
+                                // it can never be an interior member. Emit the
+                                // prefix if it is a real chain, and always skip
+                                // past `p`: absorbing it (e.g. as the first member)
+                                // would leave its output eliminated while the
+                                // external reader still needs the buffer.
+                                if (p + 1 - run_start >= 2) {
+                                    chains.push_back({run_start, p + 1});
+                                }
+                                run_start = p + 1;
+                            }
+                        }
+                        if (chain_end - run_start >= 2) {
+                            chains.push_back({run_start, chain_end});
+                        }
                     }
                     in_chain = false;
                     chain_ns_indices.clear();
@@ -7340,6 +7540,7 @@ bool MpsExecutable::BuildExecutionPlan() {
                                 }
                             }
                         }
+
                     }
                     plan->slot_is_eliminated = std::move(elim);
 
@@ -7576,6 +7777,42 @@ static CompletionEvent SubmitSyncBarrier(void* mtlCommandQueue) {
     }];
     [barrier commit];
     return completion;
+}
+
+// Batched small-matrix Cholesky via LAPACK spotrf_ on the host. `lower`
+// selects the kept triangle; the non-factored triangle is zeroed and any
+// non-PD batch is filled with NaN (matching the GPU kernel's behavior).
+static void RunCpuCholeskyBatch(float* dst, const float* src, uint32_t n, uint32_t batch,
+                                bool lower) {
+    const size_t mat_floats = static_cast<size_t>(n) * n;
+    memcpy(dst, src, mat_floats * batch * sizeof(float));
+    const char uplo = lower ? 'U' : 'L'; // LAPACK is column-major, JAX is row-major
+    int n_int = static_cast<int>(n);
+    for (uint32_t b = 0; b < batch; ++b) {
+        float* m = dst + static_cast<size_t>(b) * mat_floats;
+        int info = 0;
+        spotrf_(&uplo, &n_int, m, &n_int, &info);
+        if (info != 0) {
+            // Non-posdef or error: fill with NaN to match GPU behavior
+            for (uint32_t i = 0; i < mat_floats; ++i) {
+                m[i] = NAN;
+            }
+            continue;
+        }
+        if (lower) {
+            for (uint32_t row = 0; row < n; ++row) {
+                for (uint32_t col = row + 1; col < n; ++col) {
+                    m[row * n + col] = 0.0f;
+                }
+            }
+        } else {
+            for (uint32_t row = 1; row < n; ++row) {
+                for (uint32_t col = 0; col < row; ++col) {
+                    m[row * n + col] = 0.0f;
+                }
+            }
+        }
+    }
 }
 
 ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, MpsDevice* device) {
@@ -8402,38 +8639,10 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     if (!ensure_output_buffer(ns.output_slot)) {
                         return ExecutionResult::Error("Failed to allocate CPU Cholesky output");
                     }
-                    uint32_t n = ns.baked_cholesky_n;
-                    const float* src = (const float*)[slot_bufs[ns.input_slots[0]] contents];
-                    float* dst = (float*)[slot_bufs[ns.output_slot] contents];
-                    // Copy input to output (spotrf_ works in-place)
-                    memcpy(dst, src, (size_t)n * n * sizeof(float));
-                    char uplo = ns.baked_cholesky_lower
-                                    ? 'U'
-                                    : 'L'; // Swap L↔U: LAPACK is column-major, JAX is row-major
-                    int n_int = (int)n;
-                    int info = 0;
-                    spotrf_(&uplo, &n_int, dst, &n_int, &info);
-                    if (info != 0) {
-                        // Non-posdef or error: fill output with NaN to match GPU behavior
-                        for (uint32_t i = 0; i < n * n; ++i) {
-                            dst[i] = NAN;
-                        }
-                    } else {
-                        // Zero the non-factored triangle
-                        if (ns.baked_cholesky_lower) {
-                            for (uint32_t row = 0; row < n; ++row) {
-                                for (uint32_t col = row + 1; col < n; ++col) {
-                                    dst[row * n + col] = 0.0f;
-                                }
-                            }
-                        } else {
-                            for (uint32_t row = 1; row < n; ++row) {
-                                for (uint32_t col = 0; col < row; ++col) {
-                                    dst[row * n + col] = 0.0f;
-                                }
-                            }
-                        }
-                    }
+                    RunCpuCholeskyBatch((float*)[slot_bufs[ns.output_slot] contents],
+                                        (const float*)[slot_bufs[ns.input_slots[0]] contents],
+                                        ns.baked_cholesky_n, ns.baked_cholesky_batch,
+                                        ns.baked_cholesky_lower);
                     slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
                     continue;
                 }
@@ -8917,6 +9126,20 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     if (needs_cmd && !ensure_cmd_buf()) {
                         return ExecutionResult::Error("Failed to create native command buffer");
                     }
+                    // Handlers may read input buffers on the CPU (e.g. the
+                    // Cholesky LAPACK fallback). Commit and wait for any
+                    // pending GPU work in this execution first so host reads
+                    // observe finished writes.
+                    if (needs_cmd && cmdBuf && ops_in_cmd > 0) {
+                        [cmdBuf commit];
+                        [cmdBuf waitUntilCompleted];
+                        MarkCompletionFromCommandBuffer(current_cmd_completion, cmdBuf);
+                        submitted_events.push_back(current_cmd_completion);
+                        cmdBuf = nil;
+                        current_cmd_completion.reset();
+                        ops_in_cmd = 0;
+                        bytes_in_cmd = 0;
+                    }
                     id<MTLBuffer> output =
                         ns.handler(mtl_device, needs_cmd ? cmdBuf : nil, ns.op, input_bufs);
                     if (!output) {
@@ -9258,30 +9481,10 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                                             options:ComputeBufferResourceOptions()];
                             }
                         }
-                        uint32_t n = ns.baked_cholesky_n;
-                        const float* src = (const float*)[slot_bufs[ns.input_slots[0]] contents];
-                        float* dst = (float*)[slot_bufs[ns.output_slot] contents];
-                        memcpy(dst, src, (size_t)n * n * sizeof(float));
-                        char uplo = ns.baked_cholesky_lower
-                                        ? 'U'
-                                        : 'L'; // Swap L↔U: LAPACK is column-major, JAX is row-major
-                        int n_int = (int)n;
-                        int info = 0;
-                        spotrf_(&uplo, &n_int, dst, &n_int, &info);
-                        if (info != 0) {
-                            for (uint32_t i = 0; i < n * n; ++i)
-                                dst[i] = NAN;
-                        } else {
-                            if (ns.baked_cholesky_lower) {
-                                for (uint32_t row = 0; row < n; ++row)
-                                    for (uint32_t col = row + 1; col < n; ++col)
-                                        dst[row * n + col] = 0.0f;
-                            } else {
-                                for (uint32_t row = 1; row < n; ++row)
-                                    for (uint32_t col = 0; col < row; ++col)
-                                        dst[row * n + col] = 0.0f;
-                            }
-                        }
+                        RunCpuCholeskyBatch((float*)[slot_bufs[ns.output_slot] contents],
+                                            (const float*)[slot_bufs[ns.input_slots[0]] contents],
+                                            ns.baked_cholesky_n, ns.baked_cholesky_batch,
+                                            ns.baked_cholesky_lower);
                         slot_producer_events[(size_t)ns.output_slot] = MakeReadyCompletionEvent();
                         continue;
                     }
@@ -9617,6 +9820,21 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     // Non-baked handler creates its own encoder, so flush ours first.
                     endMixedNativeEncoder();
 
+                    // Handlers may read input buffers on the CPU (e.g. the
+                    // Cholesky LAPACK fallback). Commit and block until all
+                    // pending GPU work completes so those host reads observe
+                    // finished writes (same discipline as the baked CPU paths).
+                    if (cmdBuf) {
+                        [cmdBuf commit];
+                        [cmdBuf waitUntilCompleted];
+                        MarkCompletionFromCommandBuffer(cmd_completion, cmdBuf);
+                        cmdBuf = [MPSCommandBuffer commandBufferFromCommandQueue:commandQueue];
+                        if (!cmdBuf) {
+                            return ExecutionResult::Error("Failed to recreate cmdBuf after CPU handler sync");
+                        }
+                        cmd_completion = CompletionEventForCommandBuffer(cmdBuf, async_completion);
+                    }
+
                     mixed_input_bufs.clear();
                     for (auto slot : ns.input_slots) {
                         mixed_input_bufs.push_back(slot_bufs[slot]);
@@ -9679,6 +9897,26 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                 if (buf_len > out_byte_size) {
                     out_byte_size = buf_len;
                 }
+            }
+
+            if (!buf) {
+                // Eliminated (constant-folded away) output slot: no buffer was
+                // produced. Hand back a zeroed placeholder instead of wrapping
+                // or releasing nil — CFRelease(nil) aborts the process.
+                id<MTLBuffer> placeholder = [mtl_device newBufferWithLength:out_byte_size > 0
+                                                                                ? out_byte_size
+                                                                                : 4
+                                                                    options:MTLResourceStorageModeShared];
+                if (!placeholder) {
+                    return ExecutionResult::Error(
+                        "Failed to allocate placeholder buffer for eliminated output slot " +
+                        std::to_string(slot));
+                }
+                result.buffers.push_back(std::make_unique<MpsBuffer>(device, (__bridge void*)placeholder,
+                                                                     dtype, dims, MpsBuffer::BufferReleaser{},
+                                                                     MakeReadyCompletionEvent()));
+                CFRelease((__bridge CFTypeRef)placeholder);
+                continue;
             }
 
             // Transpose aliases: create strided view — no copy needed.

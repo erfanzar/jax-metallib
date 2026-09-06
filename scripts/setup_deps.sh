@@ -19,25 +19,29 @@ PREFIX="${PREFIX:-$HOME/.local/jax-metallib-deps}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 BUILD_DIR="${BUILD_DIR:-/tmp/jax-metallib-deps-build}"
 
-# Pin to versions matching jaxlib 0.10.0 for bytecode compatibility
+# Pin to versions matching jaxlib 0.11.1 for bytecode compatibility
 # These are extracted from:
-#   - JAX revision.bzl @ a33ed614c58ee8a10d0b7536c50c2609c38500c1 (JAX 0.10.0)
-#   - XLA third_party/stablehlo/workspace.bzl @ b6f37ab7767f428fd6f993de5e211643d47d4deb
+#   - JAX MODULE.bazel archive_override @ jax-v0.11.1
+#     (openxla/xla archive dcf304bc5dca1932b99f740b911dbd73631a1a69)
+#   - XLA third_party/stablehlo/workspace.bzl @ dcf304bc5dca1932b99f740b911dbd73631a1a69
 #
-# LLVM pin note: StableHLO 3a8886d integrates LLVM at 8918319 (April 2025), but
-# that LLVM predates the OpaqueProperties MLIR type. Bumping to the next
-# StableHLO integrate (0dc0fd71, April 9 2026) which integrates LLVM at
-# 5e14916fa6ab — that LLVM has the matching PropertyRef API (post-PR #185157
-# rename from OpaqueProperties). XLA b6f37ab is left as-is for the bytecode
-# shape; only the build-time LLVM pin needs to match what StableHLO's source
-# code expects.
-XLA_COMMIT="${XLA_COMMIT:-b6f37ab7767f428fd6f993de5e211643d47d4deb}"
-STABLEHLO_COMMIT="${STABLEHLO_COMMIT:-0dc0fd71ccb5eab0f6edc7a8cab0a489a83a91f2}"
-LLVM_COMMIT_OVERRIDE="${LLVM_COMMIT_OVERRIDE:-5e14916fa6ab8dbafd06f4d3b7b8f9eb3abb767d}"
+# LLVM pin note: StableHLO 7b1b157 integrates LLVM at 6d1ace547c9f (per its
+# build_tools/llvm_version.txt). Using StableHLO's own integrated LLVM keeps the
+# MLIR C++ API (PropertyRef etc.) exactly what StableHLO's source expects —
+# XLA's Bazel-pinned LLVM may drift from it. XLA dcf304bc defines the PJRT C API
+# header; only the build-time LLVM pin needs to match StableHLO.
+XLA_COMMIT="${XLA_COMMIT:-dcf304bc5dca1932b99f740b911dbd73631a1a69}"
+STABLEHLO_COMMIT="${STABLEHLO_COMMIT:-7b1b15781ccbd770f50c7eef4b0c3e03834649fd}"
+LLVM_COMMIT_OVERRIDE="${LLVM_COMMIT_OVERRIDE:-6d1ace547c9f9ecf7df9ab87e2db74b5bd3f199d}"
 
 # Abseil and Protobuf versions (protobuf depends on abseil)
 ABSEIL_VERSION="${ABSEIL_VERSION:-20250127.0}"
 PROTOBUF_VERSION="${PROTOBUF_VERSION:-29.3}"
+
+# SHA256 checksums for the release tarballs above (supply-chain guard: the
+# download is verified before extraction). Override together with the version.
+ABSEIL_SHA256="${ABSEIL_SHA256:-16242f394245627e508ec6bb296b433c90f8d914f73b9c026fddb905e27276e8}"
+PROTOBUF_SHA256="${PROTOBUF_SHA256:-008a11cc56f9b96679b4c285fd05f46d317d685be3ab524b2a310be0fbad987e}"
 
 # Parse arguments
 FORCE_REBUILD=false
@@ -68,6 +72,10 @@ if [ "$FORCE_REBUILD" = true ]; then
     rm -rf "$PREFIX/lib/cmake/mlir" "$PREFIX/lib/cmake/llvm"
     rm -f "$PREFIX/lib/libStablehloOps.a"
     rm -f "$PREFIX/lib/libprotobuf.a" "$PREFIX/lib/libabsl_base.a"
+    # Remove installed headers too: stale generated StableHLO headers shadow the
+    # fresh ones via -I order and break the new build (e.g. tablegen enum
+    # helpers referencing APIs that the newer LLVM removed).
+    rm -rf "$PREFIX/include/stablehlo" "$PREFIX/include/llvm" "$PREFIX/include/mlir"
     rm -rf "$BUILD_DIR/llvm-build" "$BUILD_DIR/stablehlo-build"
     rm -rf "$BUILD_DIR/abseil-build" "$BUILD_DIR/protobuf-build"
 fi
@@ -152,7 +160,9 @@ ABSEIL_BUILD_DIR="$BUILD_DIR/abseil-build"
 if [ ! -f "$PREFIX/lib/libabsl_base.a" ]; then
     echo "=== Downloading Abseil $ABSEIL_VERSION ==="
     if [ ! -d "$ABSEIL_DIR" ]; then
-        curl -L "https://github.com/abseil/abseil-cpp/archive/refs/tags/$ABSEIL_VERSION.tar.gz" | tar xz -C "$BUILD_DIR"
+        curl -L -o "$BUILD_DIR/abseil-$ABSEIL_VERSION.tar.gz" "https://github.com/abseil/abseil-cpp/archive/refs/tags/$ABSEIL_VERSION.tar.gz"
+        echo "$ABSEIL_SHA256  $BUILD_DIR/abseil-$ABSEIL_VERSION.tar.gz" | shasum -a 256 -c - >/dev/null
+        tar xzf "$BUILD_DIR/abseil-$ABSEIL_VERSION.tar.gz" -C "$BUILD_DIR"
         mv "$BUILD_DIR/abseil-cpp-$ABSEIL_VERSION" "$ABSEIL_DIR"
     fi
 
@@ -178,7 +188,9 @@ PROTOBUF_BUILD_DIR="$BUILD_DIR/protobuf-build"
 if [ ! -f "$PREFIX/lib/libprotobuf.a" ]; then
     echo "=== Downloading Protobuf $PROTOBUF_VERSION ==="
     if [ ! -d "$PROTOBUF_DIR" ]; then
-        curl -L "https://github.com/protocolbuffers/protobuf/archive/refs/tags/v$PROTOBUF_VERSION.tar.gz" | tar xz -C "$BUILD_DIR"
+        curl -L -o "$BUILD_DIR/protobuf-$PROTOBUF_VERSION.tar.gz" "https://github.com/protocolbuffers/protobuf/archive/refs/tags/v$PROTOBUF_VERSION.tar.gz"
+        echo "$PROTOBUF_SHA256  $BUILD_DIR/protobuf-$PROTOBUF_VERSION.tar.gz" | shasum -a 256 -c - >/dev/null
+        tar xzf "$BUILD_DIR/protobuf-$PROTOBUF_VERSION.tar.gz" -C "$BUILD_DIR"
         mv "$BUILD_DIR/protobuf-$PROTOBUF_VERSION" "$PROTOBUF_DIR"
     fi
 

@@ -233,6 +233,12 @@ cython_debug/
 # Agent workspace
 .agents/
 eternal-army/
+.claude/
+
+# Local-only tooling / scratch (not for distribution)
+list/
+build-debug/
+.venv-jax-mps*/
 
 # Marimo
 marimo/_static/

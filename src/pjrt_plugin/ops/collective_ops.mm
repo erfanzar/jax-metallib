@@ -31,7 +31,10 @@ int64_t GetNumReplicasFromModule(mlir::ModuleOp module) {
     return 1;
 }
 
-bool IsSingleReplicaGroups(mlir::DenseIntElementsAttr replicaGroups, std::string& errorOut) {
+bool IsSingleReplicaGroups(mlir::Attribute replicaGroupsAttr, std::string& errorOut) {
+    // Newer StableHLO exposes getReplicaGroups() as a generic mlir::Attribute;
+    // cast to the dense-elements form when present.
+    auto replicaGroups = mlir::dyn_cast<mlir::DenseIntElementsAttr>(replicaGroupsAttr);
     if (!replicaGroups) {
 
         return true;
@@ -64,7 +67,7 @@ bool IsSingleReplicaGroups(mlir::DenseIntElementsAttr replicaGroups, std::string
     return true;
 }
 
-ProcessResult ValidateSingleReplicaCollective(HandlerContext& ctx, mlir::DenseIntElementsAttr replicaGroups,
+ProcessResult ValidateSingleReplicaCollective(HandlerContext& ctx, mlir::Attribute replicaGroups,
                                               const char* opNameForError) {
     int64_t numReplicas = GetNumReplicasFromModule(ctx.module);
     if (numReplicas != 1) {

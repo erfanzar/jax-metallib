@@ -46,6 +46,9 @@ def test_int64_constant_splat_matches_cpu():
 
     env = os.environ.copy()
     env["JAX_ENABLE_X64"] = "1"
+    # The child compares the cpu and mps backends explicitly; JAX 0.11 rejects
+    # `backend=` for platforms excluded by JAX_PLATFORMS, so make both explicit.
+    env["JAX_PLATFORMS"] = "cpu,mps"
     proc = subprocess.run(
         [sys.executable, "-c", code],
         env=env,

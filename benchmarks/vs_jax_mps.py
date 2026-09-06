@@ -26,6 +26,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _benchmark_env() -> dict[str, str]:
+    """Minimal child-process env: system PATH plus JAX_METALLIB* passthrough."""
+    return {
+        "PATH": "/usr/bin:/usr/local/bin",
+        "HOME": str(Path.home()),
+        **{k: v for k, v in os.environ.items() if k.startswith("JAX_METALLIB")},
+    }
+
+
 # Shared preamble injected into every subprocess
 _PREAMBLE = textwrap.dedent(
     """\
@@ -789,7 +798,7 @@ def run_one_benchmark(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={"PATH": "/usr/bin:/usr/local/bin", "HOME": str(Path.home()), **{k: v for k, v in os.environ.items() if k.startswith("JAX_METALLIB")}},
+            env=_benchmark_env(),
         )
         if proc.returncode != 0:
             stderr = proc.stderr.strip()
@@ -852,7 +861,7 @@ def main():
                 [pybin, "-c", "import jax; print(jax.__version__)"],
                 text=True,
                 timeout=10,
-                env={"PATH": "/usr/bin:/usr/local/bin", "HOME": str(Path.home()), **{k: v for k, v in os.environ.items() if k.startswith("JAX_METALLIB")}},
+                env=_benchmark_env(),
             ).strip()
             print(f"{label}: JAX {out}")
         except Exception as e:
