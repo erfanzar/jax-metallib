@@ -132,14 +132,14 @@ def make_sort_op_configs():
             )
         )
         # Stability stress test: all keys equal, values should preserve original order.
-        # Value-only because gradients at ties are not well-defined.
+        # The keys are fixed; sorting remains differentiable in the values.
         configs.append(
             OperationTestConfig(
                 lambda keys, vals: lax.sort_key_val(keys, vals, dimension=1, is_stable=True),
                 lambda rng: numpy.zeros((4, 6), dtype=numpy.float32),
                 lambda rng: numpy.arange(24).reshape(4, 6).astype(numpy.float32),
                 name="lax.sort_key_val.stable.ties",
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
             )
         )
 
