@@ -21,6 +21,7 @@
 #include "pjrt_plugin/core/completion_event.h"
 #include "pjrt_plugin/core/mps_buffer.h"
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -93,7 +94,9 @@ private:
     mlir::func::FuncOp entry_func_;
 
     std::mutex plan_mutex_;
-    bool plan_built_ = false;
+    // Atomic: Execute() reads this outside plan_mutex_ on the lazy-build fast
+    // path, so a plain bool would be a data race with the publishing store.
+    std::atomic<bool> plan_built_{false};
     std::unique_ptr<ExecutionPlan> plan_;
 };
 

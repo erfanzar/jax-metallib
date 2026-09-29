@@ -70,6 +70,10 @@ static ProcessResult HandleRng(HandlerContext& ctx) {
     }
 
     MPSGraphTensor* result = [ctx.graph additionWithPrimaryTensor:[ctx.graph multiplicationWithPrimaryTensor:uniform secondaryTensor:[ctx.graph subtractionWithPrimaryTensor:b secondaryTensor:a name:nil] name:nil] secondaryTensor:a name:nil];
+    // randomTensorWithShape: returns a tensor whose static shape is -1; the
+    // plugin sized the result from it and aborted with "MPSNDArray ...
+    // dimension length > INT_MAX". Pin the StableHLO result shape.
+    result = [ctx.graph reshapeTensor:result withShape:shape name:nil];
 
     return Result(ctx, result, "rng");
 }
