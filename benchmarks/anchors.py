@@ -155,6 +155,83 @@ def _register() -> None:
             ),
         )
     )
+    register_case(
+        BenchCase(
+            name="anchor.reduce_last_axis_small",
+            description="standalone last-axis sum on float32 [512,512]",
+            build=lambda rng: (
+                lambda x: jnp.sum(x, axis=-1),
+                (jnp.asarray(rng.standard_normal((512, 512), dtype=np.float32)),),
+                {},
+            ),
+        )
+    )
+    register_case(
+        BenchCase(
+            name="anchor.reduce_last_axis_large",
+            description="standalone last-axis sum on float32 [16,256,512] (control for native reduction routing)",
+            build=lambda rng: (
+                lambda x: jnp.sum(x, axis=-1),
+                (jnp.asarray(rng.standard_normal((16, 256, 512), dtype=np.float32)),),
+                {},
+            ),
+        )
+    )
+    register_case(
+        BenchCase(
+            name="anchor.sliding_max_f32",
+            description="right-padded float32 sliding max, window 33 on [32768]",
+            build=lambda rng: (
+                lambda x: lax.reduce_window(x, jnp.asarray(-jnp.inf, x.dtype), lax.max, (33,), (1,), ((0, 32),)),
+                (jnp.asarray(rng.standard_normal((32768,), dtype=np.float32)),),
+                {},
+            ),
+        )
+    )
+    register_case(
+        BenchCase(
+            name="anchor.sliding_max_f16",
+            description="right-padded float16 sliding max, window 33 on [32768]",
+            build=lambda rng: (
+                lambda x: lax.reduce_window(x, jnp.asarray(-jnp.inf, x.dtype), lax.max, (33,), (1,), ((0, 32),)),
+                (jnp.asarray(rng.standard_normal((32768,), dtype=np.float32), dtype=jnp.float16),),
+                {},
+            ),
+        )
+    )
+    register_case(
+        BenchCase(
+            name="anchor.pad_interior_rows",
+            description="interior pad along rows of a float32 [512,512] tensor",
+            build=lambda rng: (
+                lambda x: lax.pad(x, jnp.asarray(0.0, x.dtype), ((0, 0, 1), (0, 0, 0))),
+                (jnp.asarray(rng.standard_normal((512, 512), dtype=np.float32)),),
+                {},
+            ),
+        )
+    )
+    register_case(
+        BenchCase(
+            name="anchor.pad_interior_rows_large",
+            description="interior pad along rows of a float32 [2048,2048] tensor",
+            build=lambda rng: (
+                lambda x: lax.pad(x, jnp.asarray(0.0, x.dtype), ((0, 0, 1), (0, 0, 0))),
+                (jnp.asarray(rng.standard_normal((2048, 2048), dtype=np.float32)),),
+                {},
+            ),
+        )
+    )
+    register_case(
+        BenchCase(
+            name="anchor.pad_interior_2d",
+            description="interior pad on both axes with positive edges, float32 [256,256]",
+            build=lambda rng: (
+                lambda x: lax.pad(x, jnp.asarray(0.0, x.dtype), ((1, 1, 1), (2, 2, 1))),
+                (jnp.asarray(rng.standard_normal((256, 256), dtype=np.float32)),),
+                {},
+            ),
+        )
+    )
 
 
 _register()
