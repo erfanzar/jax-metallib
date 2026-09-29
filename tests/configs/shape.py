@@ -8,28 +8,36 @@ def make_shape_op_configs():
     # Flip and transpose ops for both real and complex inputs
     for is_complex in [False, True]:
         with OperationTestConfig.module_name("shape-complex" if is_complex else "shape-real"):
+            # Complex inputs are differentiable, but the default selector only
+            # picks float32 arrays; opt them in explicitly.
+            argnums = (0,) if is_complex else None
             yield from [
                 OperationTestConfig(
                     jnp.flip,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=argnums,
                 ),
                 OperationTestConfig(
                     jnp.fliplr,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17, 13), is_complex),
+                    differentiable_argnums=argnums,
                 ),
                 OperationTestConfig(
                     jnp.flipud,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17, 13), is_complex),
+                    differentiable_argnums=argnums,
                 ),
                 OperationTestConfig(
                     jnp.transpose,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17, 8, 9), is_complex),
+                    differentiable_argnums=argnums,
                 ),
                 OperationTestConfig(
                     jnp.transpose,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17, 8, 9), is_complex),
                     (1, 0, 2),
                     static_argnums=(1,),
+                    differentiable_argnums=argnums,
                 ),
             ]
 
@@ -75,6 +83,13 @@ def make_shape_op_configs():
                 ),
                 lambda rng: rng.normal(size=(3, 2)).astype("float32"),
                 name="pad_interior_2d",
+            ),
+            OperationTestConfig(
+                lambda x, padding: lax.pad(x, padding, [(0, 0, 1), (0, 0, 0)]),
+                lambda rng: rng.normal(size=(7, 11)).astype("float32"),
+                lambda rng: jnp.asarray(-1.25, dtype=jnp.float32),
+                differentiable_argnums=(0,),
+                name="pad_interior_rows_runtime_value",
             ),
             OperationTestConfig(
                 lambda x: lax.pad(

@@ -30,6 +30,13 @@ def make_slice_op_configs():
                 name="dynamic_slice_runtime_start",
             ),
             OperationTestConfig(
+                lambda x, row, col: lax.dynamic_slice(x, (row, col), (2, 3)),
+                lambda rng: rng.normal(size=(5, 7)).astype(numpy.float32),
+                numpy.int32(-3),
+                numpy.int32(10),
+                name="dynamic_slice_runtime_2d",
+            ),
+            OperationTestConfig(
                 lambda x: lax.dynamic_slice(x, (-3,), (4,)),
                 lambda rng: rng.normal(size=(10,)).astype(numpy.float32),
                 name="dynamic_slice_oob_negative",
