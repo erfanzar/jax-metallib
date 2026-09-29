@@ -13,50 +13,62 @@ def make_unary_op_configs():
                 OperationTestConfig(
                     jnp.abs,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.cos,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.exp,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.negative,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.sign,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.sin,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.square,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.tan,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.tanh,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.real,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.imag,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.log,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.log1p,
@@ -65,10 +77,12 @@ def make_unary_op_configs():
                         if is_complex
                         else rng.gamma(5, size=(17,)) - 1
                     ),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
                 OperationTestConfig(
                     jnp.sqrt,
                     lambda rng, is_complex=is_complex: complex_standard_normal(rng, (17,), is_complex),
+                    differentiable_argnums=(0,) if is_complex else None,
                 ),
             ]
     yield from [

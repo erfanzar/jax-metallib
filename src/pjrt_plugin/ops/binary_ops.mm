@@ -19,24 +19,236 @@
 
 namespace jax_metallib {
 
-REGISTER_MLIR_BINARY_OP("stablehlo.add", addition, add);
-REGISTER_MLIR_BINARY_OP("stablehlo.subtract", subtraction, subtract);
-REGISTER_MLIR_BINARY_OP("stablehlo.multiply", multiplication, multiply);
-REGISTER_MLIR_BINARY_OP("stablehlo.divide", division, divide);
-REGISTER_MLIR_BINARY_OP("stablehlo.maximum", maximum, maximum);
-REGISTER_MLIR_BINARY_OP("stablehlo.minimum", minimum, minimum);
+// MPSGraph 8-bit integer add/subtract/multiply saturated instead of wrapping
+// (e.g. int8 -128 + -128 gave -128, not 0), while 16/32-bit arithmetic and
+// int32 -> 8-bit conversion wrapped correctly. Widen 8-bit operands to int32,
+// compute there, and convert back to get two's-complement wraparound.
+static bool IsEightBitInt(MPSDataType t) {
+    return t == MPSDataTypeInt8 || t == MPSDataTypeUInt8;
+}
+
+template <typename Op>
+static ProcessResult HandleWrappingBinary(HandlerContext& ctx, const char* name, Op op) {
+    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
+    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    if (!lhs || !rhs)
+        return ProcessResult::Error(std::string(name) + ": missing input tensor");
+    MPSDataType dtype = lhs.dataType;
+    if (IsEightBitInt(dtype) && rhs.dataType == dtype) {
+        MPSGraphTensor* l = [ctx.graph castTensor:lhs toType:MPSDataTypeInt32 name:nil];
+        MPSGraphTensor* r = [ctx.graph castTensor:rhs toType:MPSDataTypeInt32 name:nil];
+        MPSGraphTensor* wide = op(l, r);
+        return Result(ctx, [ctx.graph castTensor:wide toType:dtype name:nil], name);
+    }
+    return Result(ctx, op(lhs, rhs), name);
+}
+
+static ProcessResult HandleAdd(HandlerContext& ctx) {
+    return HandleWrappingBinary(ctx, "add", [&](MPSGraphTensor* a, MPSGraphTensor* b) {
+        return [ctx.graph additionWithPrimaryTensor:a secondaryTensor:b name:nil];
+    });
+}
+REGISTER_MPS_OP("stablehlo.add", HandleAdd);
+
+static ProcessResult HandleSubtract(HandlerContext& ctx) {
+    return HandleWrappingBinary(ctx, "subtract", [&](MPSGraphTensor* a, MPSGraphTensor* b) {
+        return [ctx.graph subtractionWithPrimaryTensor:a secondaryTensor:b name:nil];
+    });
+}
+REGISTER_MPS_OP("stablehlo.subtract", HandleSubtract);
+// Integer x*x came back saturated and float32-rounded under JIT (int16/int32/
+// uint32), consistent with MPSGraph rewriting it into a float square. MPSGraph
+// also proves operands equal after its own folding (x*(x+0), duplicate casts),
+// so the plugin cannot detect every square. Compute every integer multiply as
+// lhs*(rhs+1) - lhs: identical modulo 2**n, and never a literal square.
+static ProcessResult HandleMultiply(HandlerContext& ctx) {
+    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
+    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    if (!lhs || !rhs)
+        return ProcessResult::Error("multiply: missing input tensor");
+    MPSDataType dtype = lhs.dataType;
+    const bool isInteger = dtype == MPSDataTypeInt8 || dtype == MPSDataTypeInt16 ||
+                           dtype == MPSDataTypeInt32 || dtype == MPSDataTypeInt64 ||
+                           dtype == MPSDataTypeUInt8 || dtype == MPSDataTypeUInt16 ||
+                           dtype == MPSDataTypeUInt32 || dtype == MPSDataTypeUInt64;
+    if (isInteger && rhs.dataType == dtype) {
+        // 8-bit multiplies saturate; compute in int32 and wrap on conversion.
+        const bool narrow = IsEightBitInt(dtype);
+        MPSDataType work = narrow ? MPSDataTypeInt32 : dtype;
+        MPSGraphTensor* l = narrow ? [ctx.graph castTensor:lhs toType:work name:nil] : lhs;
+        MPSGraphTensor* r = narrow ? [ctx.graph castTensor:rhs toType:work name:nil] : rhs;
+        MPSGraphTensor* one = [ctx.graph constantWithScalar:1 dataType:work];
+        MPSGraphTensor* next = [ctx.graph additionWithPrimaryTensor:r secondaryTensor:one name:nil];
+        MPSGraphTensor* prod = [ctx.graph multiplicationWithPrimaryTensor:l secondaryTensor:next name:nil];
+        MPSGraphTensor* out = [ctx.graph subtractionWithPrimaryTensor:prod secondaryTensor:l name:nil];
+        if (narrow) {
+            out = [ctx.graph castTensor:out toType:dtype name:nil];
+        }
+        return Result(ctx, out, "multiply");
+    }
+    MPSGraphTensor* out = [ctx.graph multiplicationWithPrimaryTensor:lhs secondaryTensor:rhs name:nil];
+    return Result(ctx, out, "multiply");
+}
+REGISTER_MPS_OP("stablehlo.multiply", HandleMultiply);
+// Integer divide on MPS: 8-bit returned garbage (int8 100/5 -> 0, -1/2 -> -1;
+// uint8 254/3 -> 0) while 16/32-bit truncated correctly, and x / 0 returned
+// sign-dependent values for every width where XLA defines all ones (-1 signed,
+// max unsigned). Divide by a safe divisor (0 -> 1), 8-bit in int32 with a
+// wrapping cast back (int8 -128/-1 -> -128), then select all ones where the
+// divisor was 0.
+static ProcessResult HandleDivide(HandlerContext& ctx) {
+    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
+    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    if (!lhs || !rhs)
+        return ProcessResult::Error("divide: missing input tensor");
+    MPSGraph* g = ctx.graph;
+    const MPSDataType dtype = lhs.dataType;
+    const bool isInteger = dtype == MPSDataTypeInt8 || dtype == MPSDataTypeInt16 ||
+                           dtype == MPSDataTypeInt32 || dtype == MPSDataTypeInt64 ||
+                           dtype == MPSDataTypeUInt8 || dtype == MPSDataTypeUInt16 ||
+                           dtype == MPSDataTypeUInt32 || dtype == MPSDataTypeUInt64;
+    if (!isInteger || rhs.dataType != dtype) {
+        return Result(ctx, [g divisionWithPrimaryTensor:lhs secondaryTensor:rhs name:nil], "divide");
+    }
+    MPSGraphTensor* zero = [g constantWithScalar:0 dataType:dtype];
+    MPSGraphTensor* isZero = [g equalWithPrimaryTensor:rhs secondaryTensor:zero name:nil];
+    MPSGraphTensor* safe = [g selectWithPredicateTensor:isZero
+                                    truePredicateTensor:[g constantWithScalar:1 dataType:dtype]
+                                   falsePredicateTensor:rhs
+                                                   name:nil];
+    MPSGraphTensor* quot = nil;
+    if (IsEightBitInt(dtype)) {
+        MPSGraphTensor* l = [g castTensor:lhs toType:MPSDataTypeInt32 name:nil];
+        MPSGraphTensor* r = [g castTensor:safe toType:MPSDataTypeInt32 name:nil];
+        quot = [g castTensor:[g divisionWithPrimaryTensor:l secondaryTensor:r name:nil]
+                      toType:dtype
+                        name:nil];
+    } else {
+        quot = [g divisionWithPrimaryTensor:lhs secondaryTensor:safe name:nil];
+    }
+    MPSGraphTensor* allOnes = [g bitwiseNOTWithTensor:zero name:nil];
+    MPSGraphTensor* out = [g selectWithPredicateTensor:isZero
+                                   truePredicateTensor:allOnes
+                                  falsePredicateTensor:quot
+                                                  name:nil];
+    return Result(ctx, out, "divide");
+}
+REGISTER_MPS_OP("stablehlo.divide", HandleDivide);
+// StableHLO maximum/minimum propagate NaN. MPSGraph maximum/minimum returned
+// the non-NaN operand for float32/bfloat16, so jnp.maximum, relu and clip
+// silently hid NaNs. Use the NaN-propagating variants for floating types.
+static bool IsRealFloatDtype(MPSDataType t) {
+    return t == MPSDataTypeFloat32 || t == MPSDataTypeFloat16 || t == MPSDataTypeBFloat16;
+}
+
+static MPSGraphTensor* NaNMax(MPSGraph* g, MPSGraphTensor* a, MPSGraphTensor* b) {
+    if (IsRealFloatDtype(a.dataType)) {
+        return [g maximumWithNaNPropagationWithPrimaryTensor:a secondaryTensor:b name:nil];
+    }
+    return [g maximumWithPrimaryTensor:a secondaryTensor:b name:nil];
+}
+
+static MPSGraphTensor* NaNMin(MPSGraph* g, MPSGraphTensor* a, MPSGraphTensor* b) {
+    if (IsRealFloatDtype(a.dataType)) {
+        return [g minimumWithNaNPropagationWithPrimaryTensor:a secondaryTensor:b name:nil];
+    }
+    return [g minimumWithPrimaryTensor:a secondaryTensor:b name:nil];
+}
+
+static ProcessResult HandleMaximum(HandlerContext& ctx) {
+    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
+    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    if (!lhs || !rhs)
+        return ProcessResult::Error("maximum: missing input tensor");
+    return Result(ctx, NaNMax(ctx.graph, lhs, rhs), "maximum");
+}
+REGISTER_MPS_OP("stablehlo.maximum", HandleMaximum);
+
+static ProcessResult HandleMinimum(HandlerContext& ctx) {
+    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
+    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    if (!lhs || !rhs)
+        return ProcessResult::Error("minimum: missing input tensor");
+    return Result(ctx, NaNMin(ctx.graph, lhs, rhs), "minimum");
+}
+REGISTER_MPS_OP("stablehlo.minimum", HandleMinimum);
 REGISTER_MLIR_BINARY_OP("stablehlo.remainder", modulo, remainder);
 REGISTER_MLIR_BINARY_OP("stablehlo.power", power, power);
 REGISTER_MLIR_BINARY_OP("stablehlo.atan2", atan2, atan2);
+
+static bool IsIntegerMatmulDtype(MPSDataType t) {
+    return t == MPSDataTypeInt8 || t == MPSDataTypeUInt8 || t == MPSDataTypeInt16 || t == MPSDataTypeUInt16 ||
+           t == MPSDataTypeInt32 || t == MPSDataTypeUInt32;
+}
+
+// MPSGraph matmul rejects integer operands with a fatal assertion that aborts
+// the process. Compute integer matmuls exactly in int32 instead: broadcast
+// multiply [.., M, K, 1] x [.., 1, K, N] and sum over K (int32 multiply and
+// sum wrap modulo 2**32 like CPU), then convert to the result dtype.
+// Accepts rank-1 (vector) or equal-rank 2/3 operands.
+static MPSGraphTensor* IntegerMatMul(MPSGraph* g, MPSGraphTensor* a, MPSGraphTensor* b, MPSDataType outType) {
+    auto toWork = [&](MPSGraphTensor* t) -> MPSGraphTensor* {
+        if (t.dataType == MPSDataTypeInt32)
+            return t;
+        if (t.dataType == MPSDataTypeUInt32)
+            return [g reinterpretCastTensor:t toType:MPSDataTypeInt32 name:nil];
+        return [g castTensor:t toType:MPSDataTypeInt32 name:nil];
+    };
+    a = toWork(a);
+    b = toWork(b);
+    if (a.shape.count == 1)
+        a = [g reshapeTensor:a withShape:@[@1, a.shape[0]] name:nil];
+    if (b.shape.count == 1)
+        b = [g reshapeTensor:b withShape:@[b.shape[0], @1] name:nil];
+    if (a.shape.count != b.shape.count || a.shape.count < 2)
+        return nil;
+    NSMutableArray<NSNumber*>* aShape = [NSMutableArray arrayWithArray:a.shape];
+    [aShape addObject:@1];
+    NSMutableArray<NSNumber*>* bShape = [NSMutableArray arrayWithArray:b.shape];
+    [bShape insertObject:@1 atIndex:bShape.count - 2];
+    a = [g reshapeTensor:a withShape:aShape name:nil];
+    b = [g reshapeTensor:b withShape:bShape name:nil];
+    MPSGraphTensor* prod = [g multiplicationWithPrimaryTensor:a secondaryTensor:b name:nil];
+    MPSGraphTensor* sum = [g reductionSumWithTensor:prod axis:(NSInteger)prod.shape.count - 2 name:nil];
+    NSMutableArray<NSNumber*>* outShape = [NSMutableArray arrayWithArray:prod.shape];
+    [outShape removeObjectAtIndex:outShape.count - 2];
+    sum = [g reshapeTensor:sum withShape:outShape name:nil];
+    if (outType == MPSDataTypeInvalid || outType == MPSDataTypeInt32)
+        return sum;
+    if (outType == MPSDataTypeUInt32)
+        return [g reinterpretCastTensor:sum toType:MPSDataTypeUInt32 name:nil];
+    return [g castTensor:sum toType:outType name:nil];
+}
 
 static ProcessResult HandleDot(HandlerContext& ctx) {
     MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
     MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
     if (!lhs || !rhs)
         return ProcessResult::Error("dot: missing input tensor");
+    if (IsIntegerMatmulDtype(lhs.dataType) && IsIntegerMatmulDtype(rhs.dataType)) {
+        MPSGraphTensor* result = IntegerMatMul(ctx.graph, lhs, rhs, GetResultMpsType(ctx.op));
+        NSArray<NSNumber*>* outShape = GetOutputShape(ctx.op);
+        if (result && outShape && ![outShape isEqualToArray:result.shape]) {
+            result = [ctx.graph reshapeTensor:result withShape:outShape name:nil];
+        }
+        return Result(ctx, result, "dot");
+    }
+    // float16 matmul overflowed to inf near the float16 max; compute in
+    // float32 and cast back (see HandleDotGeneral).
+    const bool widenF16 = lhs.dataType == MPSDataTypeFloat16 && rhs.dataType == MPSDataTypeFloat16;
+    if (widenF16) {
+        lhs = [ctx.graph castTensor:lhs toType:MPSDataTypeFloat32 name:nil];
+        rhs = [ctx.graph castTensor:rhs toType:MPSDataTypeFloat32 name:nil];
+    }
     MPSGraphTensor* result = [ctx.graph matrixMultiplicationWithPrimaryTensor:lhs
                                                               secondaryTensor:rhs
                                                                          name:nil];
+    if (widenF16 && result) {
+        MPSDataType outType = GetResultMpsType(ctx.op);
+        if (outType == MPSDataTypeInvalid)
+            outType = MPSDataTypeFloat16;
+        result = [ctx.graph castTensor:result toType:outType name:nil];
+    }
     return Result(ctx, result, "dot");
 }
 REGISTER_MPS_OP("stablehlo.dot", HandleDot);
@@ -226,12 +438,35 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
             }
         }
     }
+    // MPSGraph float16 matmul returned +/-inf for results between ~60000 and
+    // the float16 max (e.g. 60000 * 1.0 with K=1) where CPU is exact. Widen
+    // native float16 operands to float32 (exact) and cast the result back to
+    // the declared result type. This sits after the fp32->fp16 mixed-precision
+    // block, which only triggers on float32 inputs, so it cannot re-narrow.
+    // Measured cost: none at >= 1024^3, ~+60 us at 256^3.
+    bool widenedF16 = false;
+    if (!mixedFp32 && lhsInput.dataType == MPSDataTypeFloat16 && rhsInput.dataType == MPSDataTypeFloat16) {
+        lhsInput = [ctx.graph castTensor:lhsInput toType:MPSDataTypeFloat32 name:nil];
+        rhsInput = [ctx.graph castTensor:rhsInput toType:MPSDataTypeFloat32 name:nil];
+        widenedF16 = true;
+    }
     // Wrap result with fp16→f32 cast when mixed precision is active.
     auto DotResult = [&](MPSGraphTensor* result, const char* name) -> ProcessResult {
         if (mixedFp32 && result)
             result = [ctx.graph castTensor:result toType:MPSDataTypeFloat32 name:nil];
+        if (widenedF16 && result) {
+            MPSDataType outType = GetResultMpsType(ctx.op);
+            if (outType == MPSDataTypeInvalid)
+                outType = MPSDataTypeFloat16;
+            if (result.dataType != outType)
+                result = [ctx.graph castTensor:result toType:outType name:nil];
+        }
         return Result(ctx, result, name);
     };
+    // Integer dots skip the float matmul fast paths and use the canonical
+    // rank-2/3 general path below with IntegerMatMul.
+    const bool integerDot =
+        IsIntegerMatmulDtype(lhsInput.dataType) && IsIntegerMatmulDtype(rhsInput.dataType);
 
     auto dimNumbers = dotOp.getDotDimensionNumbers();
     auto lhsContractingDims = dimNumbers.getLhsContractingDimensions();
@@ -316,7 +551,7 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
         }
     }
 
-    if (lhsBatchDims.empty() && rhsBatchDims.empty() && lhsContractingDims.size() == 1 &&
+    if (!integerDot && lhsBatchDims.empty() && rhsBatchDims.empty() && lhsContractingDims.size() == 1 &&
         rhsContractingDims.size() == 1) {
         int64_t lc = lhsContractingDims[0];
         int64_t rc = rhsContractingDims[0];
@@ -356,8 +591,8 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
         }
     }
 
-    if (lhsBatchDims.size() == 1 && rhsBatchDims.size() == 1 && lhsContractingDims.size() == 1 &&
-        rhsContractingDims.size() == 1) {
+    if (!integerDot && lhsBatchDims.size() == 1 && rhsBatchDims.size() == 1 &&
+        lhsContractingDims.size() == 1 && rhsContractingDims.size() == 1) {
         int64_t lb = lhsBatchDims[0];
         int64_t rb = rhsBatchDims[0];
         int64_t lc = lhsContractingDims[0];
@@ -490,9 +725,10 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
         rhs = [ctx.graph reshapeTensor:rhs withShape:rhsMatShapeArray name:nil];
     }
 
-    MPSGraphTensor* result = [ctx.graph matrixMultiplicationWithPrimaryTensor:lhs
-                                                              secondaryTensor:rhs
-                                                                         name:nil];
+    MPSGraphTensor* result = integerDot ? IntegerMatMul(ctx.graph, lhs, rhs, GetResultMpsType(ctx.op))
+                                        : [ctx.graph matrixMultiplicationWithPrimaryTensor:lhs
+                                                                           secondaryTensor:rhs
+                                                                                      name:nil];
 
     std::vector<int64_t> logicalOutputShape = batchSizes;
     logicalOutputShape.insert(logicalOutputShape.end(), lhsFreeSizes.begin(), lhsFreeSizes.end());
@@ -577,6 +813,16 @@ static ProcessResult HandleClamp(HandlerContext& ctx) {
     if (!minVal || !operand || !maxVal)
         return ProcessResult::Error("clamp: missing input tensor");
 
+    if (IsRealFloatDtype(operand.dataType)) {
+        // clampWithTensor dropped NaN operands; clamp = min(max(x, lo), hi) with NaN propagation.
+        MPSGraphTensor* lo = minVal.dataType == operand.dataType
+                                 ? minVal
+                                 : [ctx.graph castTensor:minVal toType:operand.dataType name:nil];
+        MPSGraphTensor* hi = maxVal.dataType == operand.dataType
+                                 ? maxVal
+                                 : [ctx.graph castTensor:maxVal toType:operand.dataType name:nil];
+        return Result(ctx, NaNMin(ctx.graph, NaNMax(ctx.graph, operand, lo), hi), "clamp");
+    }
     MPSGraphTensor* result = [ctx.graph clampWithTensor:operand
                                          minValueTensor:minVal
                                          maxValueTensor:maxVal

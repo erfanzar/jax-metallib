@@ -118,14 +118,48 @@ enum class ShiftMode {
     kRightArithmetic,
 };
 
-static MPSGraphTensor* BuildShiftOverflowValue(MPSGraph* g, MPSGraphTensor* input, ShiftMode mode) {
+static bool IsUnsignedIntDtype(MPSDataType t) {
+    return t == MPSDataTypeUInt8 || t == MPSDataTypeUInt16 || t == MPSDataTypeUInt32 ||
+           t == MPSDataTypeUInt64;
+}
+
+static bool IsSignedIntDtype(MPSDataType t) {
+    return t == MPSDataTypeInt8 || t == MPSDataTypeInt16 || t == MPSDataTypeInt32 || t == MPSDataTypeInt64;
+}
+
+// ~0 in the given dtype (-1 signed, max unsigned), built without large
+// constant conversions.
+static MPSGraphTensor* AllOnes(MPSGraph* g, MPSDataType t) {
+    return [g bitwiseNOTWithTensor:[g constantWithScalar:0 dataType:t] name:nil];
+}
+
+// Bool tensor: the top (sign) bit of `input` is set. Works for either
+// signedness, unlike `input < 0`.
+static MPSGraphTensor* TopBitSet(MPSGraph* g, MPSGraphTensor* input, int bitWidth) {
+    MPSDataType t = input.dataType;
+    MPSGraphTensor* topBit = [g bitwiseLeftShiftWithPrimaryTensor:AllOnes(g, t)
+                                                  secondaryTensor:[g constantWithScalar:bitWidth - 1
+                                                                               dataType:t]
+                                                             name:nil];
+    MPSGraphTensor* bit = [g bitwiseANDWithPrimaryTensor:input secondaryTensor:topBit name:nil];
+    return [g notEqualWithPrimaryTensor:bit secondaryTensor:[g constantWithScalar:0 dataType:t] name:nil];
+}
+
+static MPSGraphTensor* BuildShiftOverflowValue(MPSGraph* g, MPSGraphTensor* input, ShiftMode mode,
+                                               int bitWidth) {
     MPSGraphTensor* zeroTensor = [g constantWithScalar:0 shape:@[@1] dataType:input.dataType];
     if (mode != ShiftMode::kRightArithmetic) {
         return zeroTensor;
     }
 
     MPSGraphTensor* minusOneTensor = [g constantWithScalar:-1 shape:@[@1] dataType:input.dataType];
-    MPSGraphTensor* isNegative = [g lessThanWithPrimaryTensor:input secondaryTensor:zeroTensor name:nil];
+    MPSGraphTensor* isNegative = IsUnsignedIntDtype(input.dataType) ? TopBitSet(g, input, bitWidth)
+                                                                    : [g lessThanWithPrimaryTensor:input
+                                                                                   secondaryTensor:zeroTensor
+                                                                                              name:nil];
+    if (IsUnsignedIntDtype(input.dataType)) {
+        minusOneTensor = AllOnes(g, input.dataType);
+    }
     return [g selectWithPredicateTensor:isNegative
                     truePredicateTensor:minusOneTensor
                    falsePredicateTensor:zeroTensor
@@ -142,13 +176,46 @@ static MPSGraphTensor* HandleShiftOp(HandlerContext& ctx, ShiftMode mode) {
     if (bitWidth == 0)
         return nullptr;
 
+    MPSGraph* g = ctx.graph;
     MPSGraphTensor* shiftedResult =
         mode == ShiftMode::kLeft
-            ? [ctx.graph bitwiseLeftShiftWithPrimaryTensor:input secondaryTensor:shiftAmount name:nil]
-            : [ctx.graph bitwiseRightShiftWithPrimaryTensor:input secondaryTensor:shiftAmount name:nil];
+            ? [g bitwiseLeftShiftWithPrimaryTensor:input secondaryTensor:shiftAmount name:nil]
+            : [g bitwiseRightShiftWithPrimaryTensor:input secondaryTensor:shiftAmount name:nil];
+
+    // MPSGraph right shift follows the dtype's signedness, not the op: signed
+    // ints always sign-extend and unsigned ints always zero-fill. Correct the
+    // mismatched combinations with masks (no reinterpret casts, which abort on
+    // rank-0 tensors). In-range amounts only; overflow is selected below.
+    const MPSDataType dtype = input.dataType;
+    if (mode == ShiftMode::kRightLogical && IsSignedIntDtype(dtype)) {
+        // keep = ~((INT_MIN >> s) << 1): clears the s sign-extended high bits.
+        MPSGraphTensor* one = [g constantWithScalar:1 dataType:dtype];
+        MPSGraphTensor* intMin = [g bitwiseLeftShiftWithPrimaryTensor:AllOnes(g, dtype)
+                                                      secondaryTensor:[g constantWithScalar:bitWidth - 1
+                                                                                   dataType:dtype]
+                                                                 name:nil];
+        MPSGraphTensor* high = [g bitwiseRightShiftWithPrimaryTensor:intMin
+                                                     secondaryTensor:shiftAmount
+                                                                name:nil];
+        high = [g bitwiseLeftShiftWithPrimaryTensor:high secondaryTensor:one name:nil];
+        MPSGraphTensor* keep = [g bitwiseNOTWithTensor:high name:nil];
+        shiftedResult = [g bitwiseANDWithPrimaryTensor:shiftedResult secondaryTensor:keep name:nil];
+    } else if (mode == ShiftMode::kRightArithmetic && IsUnsignedIntDtype(dtype)) {
+        // fill = ~(UMAX >> s): the s high bits, set only when the top bit is.
+        MPSGraphTensor* ones = AllOnes(g, dtype);
+        MPSGraphTensor* fill = [g bitwiseNOTWithTensor:[g bitwiseRightShiftWithPrimaryTensor:ones
+                                                                             secondaryTensor:shiftAmount
+                                                                                        name:nil]
+                                                  name:nil];
+        fill = [g selectWithPredicateTensor:TopBitSet(g, input, bitWidth)
+                        truePredicateTensor:fill
+                       falsePredicateTensor:[g constantWithScalar:0 dataType:dtype]
+                                       name:nil];
+        shiftedResult = [g bitwiseORWithPrimaryTensor:shiftedResult secondaryTensor:fill name:nil];
+    }
 
     MPSGraphTensor* overflowMask = BuildShiftOverflowMask(ctx.graph, shiftAmount, bitWidth);
-    MPSGraphTensor* overflowValue = BuildShiftOverflowValue(ctx.graph, input, mode);
+    MPSGraphTensor* overflowValue = BuildShiftOverflowValue(ctx.graph, input, mode, bitWidth);
 
     return [ctx.graph selectWithPredicateTensor:overflowMask
                             truePredicateTensor:overflowValue
