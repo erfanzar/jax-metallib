@@ -203,3 +203,13 @@ def initialize():
         )
     except Exception as e:
         raise SiliconPluginError(f"Failed to register MPS plugin: {e}") from e
+
+    # JAX has no eigh lowering rule for platform "mps" (only CPU/GPU/TPU), so
+    # jnp.linalg.eigh/eigvalsh failed at lowering time. Register pure-JAX
+    # lowerings now that "mps" is a known platform.
+    try:
+        from . import linalg_lowerings
+
+        linalg_lowerings.register()
+    except Exception as e:
+        warnings.warn(f"Failed to register MPS linalg lowerings: {e}", stacklevel=2)
