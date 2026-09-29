@@ -368,6 +368,68 @@ static int max_while_depth = [] {
     return env ? std::stoi(env) : 100;
 }();
 
+// MPSGraph whileWithInitialInputs segfaulted (first run, deterministic) when a
+// loop carry read by the predicate, and produced by a reduction in the body,
+// was not a compile target: e.g. a convergence loop testing max|a| whose jitted
+// function returned only `a` (reproduced in a standalone MPSGraph program;
+// making the carry a target operation or a control dependency did not help,
+// a data dependency did). Tie every output to one zero scalar that depends on
+// one element of each output. float(isNaN(e)) * 0 is exactly 0 even for
+// NaN/inf carries, and x - 0 keeps the sign of -0. Complex outputs are left
+// untied. JAX_METALLIB_DISABLE_WHILE_OUTPUT_TIE=1 disables this.
+static NSArray<MPSGraphTensor*>* TieWhileOutputs(MPSGraph* g, NSArray<MPSGraphTensor*>* outputs) {
+    if (outputs.count < 2 || EnvFlagEnabled("JAX_METALLIB_DISABLE_WHILE_OUTPUT_TIE")) {
+        return outputs;
+    }
+    auto isComplex = [](MPSDataType t) {
+        return t == MPSDataTypeComplexFloat32 || t == MPSDataTypeComplexFloat16;
+    };
+    MPSGraphTensor* zeroF = [g constantWithScalar:0.0 dataType:MPSDataTypeFloat32];
+    MPSGraphTensor* z = nil;
+    for (MPSGraphTensor* t in outputs) {
+        NSArray<NSNumber*>* shape = t.shape;
+        if (!shape) {
+            continue;
+        }
+        int64_t numel = 1;
+        for (NSNumber* d in shape) {
+            numel *= [d longLongValue];
+        }
+        if (numel <= 0) {
+            continue;
+        }
+        MPSGraphTensor* e = isComplex(t.dataType) ? [g realPartOfTensor:t name:nil] : t;
+        e = [g reshapeTensor:e withShape:@[@(numel)] name:nil];
+        e = [g sliceTensor:e dimension:0 start:0 length:1 name:nil];
+        if (e.dataType != MPSDataTypeFloat32) {
+            e = [g castTensor:e toType:MPSDataTypeFloat32 name:nil];
+        }
+        MPSGraphTensor* nanF = [g castTensor:[g isNaNWithTensor:e name:nil]
+                                      toType:MPSDataTypeFloat32
+                                        name:nil];
+        MPSGraphTensor* zj = [g multiplicationWithPrimaryTensor:nanF secondaryTensor:zeroF name:nil];
+        z = z ? [g additionWithPrimaryTensor:z secondaryTensor:zj name:nil] : zj;
+    }
+    if (!z) {
+        return outputs;
+    }
+    z = [g reshapeTensor:z withShape:@[] name:nil];
+    NSMutableArray<MPSGraphTensor*>* tied = [NSMutableArray arrayWithCapacity:outputs.count];
+    for (MPSGraphTensor* t in outputs) {
+        MPSDataType dt = t.dataType;
+        if (isComplex(dt)) {
+            [tied addObject:t];
+        } else if (dt == MPSDataTypeBool) {
+            MPSGraphTensor* zb = [g castTensor:z toType:MPSDataTypeBool name:nil];
+            [tied addObject:[g logicalORWithPrimaryTensor:t secondaryTensor:zb name:nil]];
+        } else {
+            MPSGraphTensor* zt = dt == MPSDataTypeFloat32 ? z : [g castTensor:z toType:dt name:nil];
+            [tied addObject:[g subtractionWithPrimaryTensor:t secondaryTensor:zt name:nil]];
+        }
+    }
+    return tied;
+}
+
 static ProcessResult HandleWhileOp(HandlerContext& ctx) {
     auto whileOp = mlir::dyn_cast<mlir::stablehlo::WhileOp>(ctx.op);
     if (!whileOp) {
@@ -402,7 +464,12 @@ static ProcessResult HandleWhileOp(HandlerContext& ctx) {
 
     CountedWhile counted;
     if (MatchCountedWhile(whileOp, condBlock, bodyBlock, &counted)) {
-        const bool enable_variable_carry = !EnvFlagEnabled("JAX_METALLIB_DISABLE_VARIABLE_CARRY");
+        // Promoting dynamic_update_slice carries to MPSGraph variables silently
+        // dropped every in-loop update: a scan over a >=64 KiB buffer returned
+        // its initial value (tests/test_scan_update.py). Root cause is not yet
+        // isolated, so keep it opt-in until the variable path is proven correct.
+        const bool enable_variable_carry = EnvFlagEnabled("JAX_METALLIB_ENABLE_VARIABLE_CARRY") &&
+                                           !EnvFlagEnabled("JAX_METALLIB_DISABLE_VARIABLE_CARRY");
 
         std::unordered_set<unsigned> promoted;
         CollectCarriedIndicesUpdatedByDynamicUpdateSlice(whileOp, bodyBlock, module, &promoted);
@@ -514,6 +581,7 @@ static ProcessResult HandleWhileOp(HandlerContext& ctx) {
     if ((NSUInteger)whileOp->getNumResults() != outputs.count) {
         return ProcessResult::Error("while output arity mismatch");
     }
+    outputs = TieWhileOutputs(graph, outputs);
 
     for (NSUInteger i = 0; i < outputs.count; ++i) {
         ctx.values[whileOp->getResult(i).getAsOpaquePointer()] = outputs[i];
@@ -679,8 +747,27 @@ static ProcessResult HandleCustomCall(HandlerContext& ctx) {
     return handler->graph_handler(ctx);
 }
 
+// stablehlo.optimization_barrier had no handler, so every jax.checkpoint
+// (remat) gradient under jit failed. It only constrains XLA's scheduling;
+// semantically it is the identity over its (variadic) operands.
+static ProcessResult HandleOptimizationBarrier(HandlerContext& ctx) {
+    const unsigned numOperands = ctx.op->getNumOperands();
+    if (numOperands != ctx.op->getNumResults()) {
+        return ProcessResult::Error("optimization_barrier: operand/result arity mismatch");
+    }
+    for (unsigned i = 0; i < numOperands; ++i) {
+        MPSGraphTensor* t = GetInputTensor(ctx, i);
+        if (!t) {
+            return ProcessResult::Error("optimization_barrier: missing operand tensor " + std::to_string(i));
+        }
+        SetOutputTensor(ctx.values, ctx.op, t, i);
+    }
+    return ProcessResult{};
+}
+
 REGISTER_MPS_OP("stablehlo.while", HandleWhileOp);
 REGISTER_MPS_OP("stablehlo.case", HandleCaseOp);
+REGISTER_MPS_OP("stablehlo.optimization_barrier", HandleOptimizationBarrier);
 
 REGISTER_MPS_OP("stablehlo.custom_call", HandleCustomCall);
 

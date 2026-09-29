@@ -36,10 +36,6 @@ from __future__ import annotations
 import jax.numpy as jnp
 import numpy as np
 
-# ──────────────────────────────────────────────────────────────────
-# MX Format Constants
-# ──────────────────────────────────────────────────────────────────
-
 _MX_MODES = {
     "mxfp4": {"bits": 4, "group_size": 32, "scale_type": "e8m0"},
     "mxfp8": {"bits": 8, "group_size": 32, "scale_type": "e8m0"},
@@ -50,28 +46,23 @@ _MX_MODES = {
 # Supported bit widths: 2, 4, 8. Group sizes: 32, 64, 128.
 _AFFINE_DEFAULTS = {"bits": 4, "group_size": 64}
 
-
-# ──────────────────────────────────────────────────────────────────
-# FP4 E2M1 NumPy reference (for CPU quantize/dequantize)
-# ──────────────────────────────────────────────────────────────────
-
 # E2M1 representable values (positive): 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
 _FP4_E2M1_TABLE = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
 
 
 def _fp4_e2m1_quantize(x: np.ndarray) -> np.ndarray:
     """Quantize float32 values to 4-bit E2M1 (returns uint8 with 4-bit values)."""
-    sign = (x < 0).astype(np.uint8) << 3
+    sign = np.signbit(x).astype(np.uint8) << 3
     a = np.abs(x)
     mag = np.zeros_like(a, dtype=np.uint8)
-    # Nearest-even rounding boundaries
-    mag = np.where(a >= 5.0, 7, mag)
-    mag = np.where((a >= 3.5) & (a < 5.0), 6, mag)
-    mag = np.where((a >= 2.5) & (a < 3.5), 5, mag)
-    mag = np.where((a >= 1.75) & (a < 2.5), 4, mag)
-    mag = np.where((a >= 1.25) & (a < 1.75), 3, mag)
-    mag = np.where((a >= 0.75) & (a < 1.25), 2, mag)
-    mag = np.where((a >= 0.25) & (a < 0.75), 1, mag)
+    # At exact midpoints, choose the value with an even magnitude code.
+    mag = np.where(a > 5.0, 7, mag)
+    mag = np.where((a >= 3.5) & (a <= 5.0), 6, mag)
+    mag = np.where((a > 2.5) & (a < 3.5), 5, mag)
+    mag = np.where((a >= 1.75) & (a <= 2.5), 4, mag)
+    mag = np.where((a > 1.25) & (a < 1.75), 3, mag)
+    mag = np.where((a >= 0.75) & (a <= 1.25), 2, mag)
+    mag = np.where((a > 0.25) & (a < 0.75), 1, mag)
     return sign | mag.astype(np.uint8)
 
 
@@ -82,42 +73,22 @@ def _fp4_e2m1_dequantize(bits: np.ndarray) -> np.ndarray:
     return sign * _FP4_E2M1_TABLE[mag_idx]
 
 
-# ──────────────────────────────────────────────────────────────────
-# FP8 E4M3 NumPy reference
-# ──────────────────────────────────────────────────────────────────
-
-
 def _fp8_e4m3_quantize(x: np.ndarray) -> np.ndarray:
-    """Quantize float32 → FP8 E4M3 (returns uint8)."""
-    # Simplified: clamp to ±448 and use nearest rounding
-    x = np.clip(x, -448.0, 448.0)
-    sign = (x < 0).astype(np.uint8)
-    a = np.abs(x)
+    """Quantize float32 → FP8 E4M3 using nearest-even rounding (returns uint8)."""
+    x = np.asarray(x, dtype=np.float32)
+    sign = np.signbit(x).astype(np.uint8)
+    a = np.abs(np.clip(x, -448.0, 448.0))
+    # Preserve the existing saturating-NaN behavior; do not encode the reserved NaN code.
+    a = np.where(np.isnan(a), 448.0, a)
 
-    # Use log-based quantization for E4M3
-    # E4M3: bias=7, max_exp=15, 3 mantissa bits
-    result = np.zeros_like(a, dtype=np.uint8)
-
-    for i in range(len(a.flat)):
-        v = float(a.flat[i])
-        if v == 0:
-            result.flat[i] = 0
-            continue
-        # Convert through float32 bit manipulation
-        fbits = np.float32(v).view(np.uint32)
-        # Shift exponent from float32 (bias 127) to E4M3 (bias 7)
-        exp = ((fbits >> 23) & 0xFF).astype(np.int32) - 127 + 7
-        mant = (fbits >> 20) & 0x7  # top 3 mantissa bits
-
-        if exp >= 15:
-            result.flat[i] = 0x7E  # saturate (126 = max positive)
-        elif exp <= 0:
-            result.flat[i] = 0  # flush to zero for subnormals (simplified)
-        else:
-            result.flat[i] = (exp.astype(np.uint8) << 3) | mant.astype(np.uint8)
-
-    result = result | (sign << 7)
-    return result
+    upper = np.searchsorted(_FP8_E4M3_POSITIVE_VALUES, a, side="left")
+    upper = np.minimum(upper, 0x7E)
+    lower = np.maximum(upper - 1, 0)
+    lower_distance = a - _FP8_E4M3_POSITIVE_VALUES[lower]
+    upper_distance = _FP8_E4M3_POSITIVE_VALUES[upper] - a
+    choose_upper = (upper_distance < lower_distance) | ((upper_distance == lower_distance) & (upper % 2 == 0))
+    mag = np.where(choose_upper, upper, lower).astype(np.uint8)
+    return mag | (sign << 7)
 
 
 def _fp8_e4m3_dequantize(bits: np.ndarray) -> np.ndarray:
@@ -128,32 +99,27 @@ def _fp8_e4m3_dequantize(bits: np.ndarray) -> np.ndarray:
     half_bits = (unsigned << 7).astype(np.uint16)
     # Interpret as float16 and convert
     result = half_bits.view(np.float16).astype(np.float32) * 256.0
-    return sign * result
+    return np.where(unsigned == 0x7F, np.nan, sign * result)
 
 
-# ──────────────────────────────────────────────────────────────────
-# FP8 E8M0 Scale NumPy reference
-# ──────────────────────────────────────────────────────────────────
+_FP8_E4M3_POSITIVE_VALUES = _fp8_e4m3_dequantize(np.arange(0x7F, dtype=np.uint8))
 
 
 def _fp8_e8m0_quantize(x: np.ndarray) -> np.ndarray:
     """Quantize positive float → E8M0 (pure power-of-2 scale)."""
-    x = np.maximum(x, np.finfo(np.float32).tiny)  # avoid log(0)
+    nonfinite = ~np.isfinite(x)
+    x = np.where(nonfinite, 1.0, np.maximum(x, np.finfo(np.float32).tiny))  # avoid log(0)
     log2_x = np.log2(x)
     n = np.round(log2_x).astype(np.int32)
     n = np.clip(n, -127, 127)
-    return (n + 127).astype(np.uint8)
+    return np.where(nonfinite, 0xFF, n + 127).astype(np.uint8)
 
 
 def _fp8_e8m0_dequantize(bits: np.ndarray) -> np.ndarray:
-    """Dequantize E8M0 → float32 (2^(bits - 127))."""
-    exp = bits.astype(np.int32) - 127
-    return np.ldexp(np.ones_like(exp, dtype=np.float32), exp)
-
-
-# ──────────────────────────────────────────────────────────────────
-# Public API: mx_quantize
-# ──────────────────────────────────────────────────────────────────
+    """Dequantize E8M0 → float32 (2^(bits - 127)); 0xFF is NaN."""
+    exp = np.minimum(bits.astype(np.int32) - 127, 127)
+    values = np.ldexp(np.ones_like(exp, dtype=np.float32), exp)
+    return np.where(bits == 0xFF, np.nan, values)
 
 
 def mx_quantize(w, *, mode: str = "mxfp4") -> tuple:
@@ -205,7 +171,7 @@ def mx_quantize(w, *, mode: str = "mxfp4") -> tuple:
             # Compute group scale
             group_max = np.max(np.abs(group))
             max_repr = 6.0 if bits == 4 else 448.0
-            raw_scale = group_max / max_repr if group_max > 0 else 0.0
+            raw_scale = group_max / max_repr if group_max != 0 else 0.0
 
             # Quantize scale
             if cfg["scale_type"] == "e8m0":
@@ -243,11 +209,6 @@ def mx_quantize(w, *, mode: str = "mxfp4") -> tuple:
     scales = scales.reshape(scales_shape)
 
     return jnp.array(packed), jnp.array(scales)
-
-
-# ──────────────────────────────────────────────────────────────────
-# Public API: mx_dequantize
-# ──────────────────────────────────────────────────────────────────
 
 
 def mx_dequantize(packed, scales, *, mode: str = "mxfp4", shape=None, dtype=jnp.float32):
@@ -312,11 +273,6 @@ def mx_dequantize(packed, scales, *, mode: str = "mxfp4", shape=None, dtype=jnp.
         result = result.reshape(shape)
 
     return jnp.array(result, dtype=dtype)
-
-
-# ──────────────────────────────────────────────────────────────────
-# Public API: affine_quantize / affine_dequantize
-# ──────────────────────────────────────────────────────────────────
 
 
 def affine_quantize(w, *, bits: int = 4, group_size: int = 64) -> tuple:
@@ -528,14 +484,6 @@ def affine_dequantize(packed, scales, biases, *, bits: int = 4, group_size: int 
     return jnp.array(result, dtype=dtype)
 
 
-# ──────────────────────────────────────────────────────────────────
-# Public API: quantized_matmul
-# ──────────────────────────────────────────────────────────────────
-
-# ──────────────────────────────────────────────────────────────────
-# Quantized GEMM Metal kernel source (embedded for metal.execute)
-# ──────────────────────────────────────────────────────────────────
-
 _QGEMM_KERNEL_SOURCE = r"""
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -553,6 +501,7 @@ inline float dequant_fp4(uint8_t nibble) {
 
 // ── FP8 E4M3 dequantize ──
 inline float dequant_fp8_e4m3(uint8_t bits) {
+    if ((bits & 127) == 127) return as_type<float>(0x7fc00000u);
     uint16_t v = (uint16_t)(bits & 127) << 7;
     half converted = as_type<half>(v);
     converted *= 256.0h;
@@ -561,6 +510,7 @@ inline float dequant_fp8_e4m3(uint8_t bits) {
 
 // ── FP8 E8M0 scale dequantize ──
 inline float dequant_scale_e8m0(uint8_t bits) {
+    if (bits == 0xFF) return as_type<float>(0x7fc00000u);
     uint32_t out = (bits == 0) ? 0x00400000u : ((uint32_t)bits << 23);
     return as_type<float>(out);
 }
@@ -1112,7 +1062,7 @@ def _quantized_matmul_gpu(x, w_packed, scales, *, mode: str, K: int, out_dtype):
         kernel_name,
         inputs=[x_2d, w_packed, scales],
         output_shapes=[(M, N)],
-        output_dtypes=[out_dtype],
+        output_dtypes=[x.dtype],
         constants={4: M, 5: N, 6: K},
         grid=grid,
         threadgroup=threadgroup,
@@ -1123,7 +1073,7 @@ def _quantized_matmul_gpu(x, w_packed, scales, *, mode: str, K: int, out_dtype):
         out_shape = [*list(x.shape[:-1]), N]
         result = result.reshape(out_shape)
 
-    return result
+    return result.astype(out_dtype)
 
 
 def affine_quantized_matmul(x, w_packed, scales, biases, *, bits: int = 4, group_size: int = 64, K: int, out_dtype=None):
@@ -1191,7 +1141,7 @@ def _affine_matmul_gpu(x, w_packed, scales, biases, *, bits: int, group_size: in
         kernel_name,
         inputs=[x_2d, w_packed, scales, biases],
         output_shapes=[(M, N)],
-        output_dtypes=[out_dtype],
+        output_dtypes=[x.dtype],
         constants={5: M, 6: N, 7: K, 8: group_size},
         grid=grid,
         threadgroup=threadgroup,
@@ -1201,4 +1151,4 @@ def _affine_matmul_gpu(x, w_packed, scales, biases, *, bits: int, group_size: in
         out_shape = [*list(x.shape[:-1]), N]
         result = result.reshape(out_shape)
 
-    return result
+    return result.astype(out_dtype)

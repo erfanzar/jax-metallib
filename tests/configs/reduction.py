@@ -13,25 +13,32 @@ def make_reduction_op_configs():
                     OperationTestConfig(
                         reduction,
                         lambda rng, is_complex=is_complex: complex_standard_normal(rng, (4, 5), is_complex),
+                        differentiable_argnums=(0,) if is_complex else None,
                     ),
                     # Explicit argument because capture doesn't work.
                     OperationTestConfig(
                         lambda x, reduction=reduction: reduction(x, axis=1),
                         lambda rng, is_complex=is_complex: complex_standard_normal(rng, (4, 5), is_complex),
+                        differentiable_argnums=(0,) if is_complex else None,
                     ),
                 ]
+
+        # The remaining cases have only real inputs; generating them for both
+        # is_complex values silently duplicates every value and gradient test.
+        if is_complex:
+            continue
 
         with OperationTestConfig.module_name("reduction-real"):
             yield from [
                 OperationTestConfig(
                     lambda x: jnp.max(x, axis=0),
                     lambda rng: rng.standard_normal((4, 5)),
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
                 OperationTestConfig(
                     lambda x: jnp.min(x, axis=-1),
                     lambda rng: rng.standard_normal((4, 5)),
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
             ]
 
@@ -41,19 +48,19 @@ def make_reduction_op_configs():
                     lambda x: jnp.cumsum(x, axis=0),
                     lambda rng: rng.standard_normal((8,)).astype("float32"),
                     name="cumsum_1d_axis0",
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
                 OperationTestConfig(
                     lambda x: jnp.cumsum(x, axis=0),
                     lambda rng: rng.standard_normal((3, 4)).astype("float32"),
                     name="cumsum_2d_axis0",
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
                 OperationTestConfig(
                     lambda x: jnp.cumsum(x, axis=1),
                     lambda rng: rng.standard_normal((3, 4)).astype("float32"),
                     name="cumsum_2d_axis1",
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
                 # Pooling-like reduce_window patterns (non-cumulative):
                 OperationTestConfig(
@@ -67,7 +74,7 @@ def make_reduction_op_configs():
                     ),
                     lambda rng: rng.standard_normal((1, 7, 8, 2)).astype(numpy.float32),
                     name="reduce_window_sum_pool_2d_stride2_padding",
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
                 # 1D pooling-like reduce_window on NWC.
                 OperationTestConfig(
@@ -81,7 +88,7 @@ def make_reduction_op_configs():
                     ),
                     lambda rng: rng.standard_normal((1, 9, 2)).astype(numpy.float32),
                     name="reduce_window_sum_pool_1d_stride2_padding",
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
                 OperationTestConfig(
                     lambda x: lax.reduce_window(
@@ -94,7 +101,7 @@ def make_reduction_op_configs():
                     ),
                     lambda rng: rng.standard_normal((1, 8, 8, 1)).astype(numpy.float32),
                     name="reduce_window_max_pool_2d_same",
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
                 OperationTestConfig(
                     lambda x: lax.reduce_window(
@@ -107,7 +114,7 @@ def make_reduction_op_configs():
                     ),
                     lambda rng: rng.standard_normal((1, 9, 1)).astype(numpy.float32),
                     name="reduce_window_max_pool_1d_same",
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
                 OperationTestConfig(
                     lambda x: lax.reduce_window(
@@ -120,7 +127,7 @@ def make_reduction_op_configs():
                     ),
                     lambda rng: rng.standard_normal((1, 8, 1)).astype(numpy.float32),
                     name="reduce_window_min_pool_1d_explicit",
-                    differentiable_argnums=(),
+                    differentiable_argnums=(0,),
                 ),
                 # Gradient of max pooling lowers to stablehlo.select_and_scatter.
                 OperationTestConfig(
@@ -161,6 +168,7 @@ def make_reduction_op_configs():
                     ),
                     lambda rng: rng.standard_normal((1, 8, 8, 1)).astype(numpy.float32),
                     name="reduce_window_max_pool_2d_same_window_dilation",
+                    # JAX does not implement a VJP for dilated max-pool windows.
                     differentiable_argnums=(),
                 ),
                 # Min-pool gradient (select_and_scatter LT/LE lowering).

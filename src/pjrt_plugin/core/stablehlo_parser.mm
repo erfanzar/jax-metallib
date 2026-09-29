@@ -15,6 +15,7 @@
 #include "pjrt_plugin/core/stablehlo_parser.h"
 
 #include "mlir/Bytecode/BytecodeReader.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -32,6 +33,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cstdlib>
 #include <unordered_set>
 
 namespace mps {
@@ -61,6 +63,14 @@ const std::unordered_set<std::string>& getSupportedOps() {
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::func::FuncDialect>();
+    // Without the func inliner extension, createInlinerPass() cannot inline
+    // func.call, so jitted functions kept top-level calls (e.g. @lu_solve) and
+    // native ops inside them (triangular_solve) reached the recursive graph
+    // builder and failed. JAX_METALLIB_DISABLE_FUNC_INLINER=1 restores that.
+    const char* noInline = std::getenv("JAX_METALLIB_DISABLE_FUNC_INLINER");
+    if (!(noInline && noInline[0] != '\0' && !(noInline[0] == '0' && noInline[1] == '\0'))) {
+        mlir::func::registerInlinerExtension(registry);
+    }
     registry.insert<mlir::stablehlo::StablehloDialect>();
     registry.insert<mlir::vhlo::VhloDialect>();
     registry.insert<mlir::chlo::ChloDialect>();

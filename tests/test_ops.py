@@ -141,11 +141,6 @@ def test_op_grad(op_config: OperationTestConfig, jit: bool) -> None:
     if not argnums:
         pytest.skip(f"No differentiable arguments for operation '{op_config.func}'.")
 
-    # Eager gradients in compare mode deadlock the Metal command queue after many
-    # prior dispatches in the same process. JIT gradients cover the same code paths.
-    if TEST_MODE == "compare" and not jit:
-        pytest.skip("Eager gradients deadlock Metal command queue in long compare-mode sessions")
-
     # Framework integration tests run on MPS only (same reasoning as test_op_value).
     if _is_framework_integration(op_config):
         device = jax.devices("mps")[0]
@@ -218,18 +213,34 @@ def test_unsupported_op_error_message(jit: bool) -> None:
     device = jax.devices("mps")[0]
     with jax.default_device(device):
         try:
-            # This is an obscure op. It's unlikely to be implemented, but this test may
-            # break if `clz` gets implemented.
-            func = jax.lax.clz
+            # A test-local primitive that lowers to stablehlo.replica_id, which has no
+            # MPS handler and is not emitted by JAX's public APIs on one device. If it
+            # gets implemented, switch to another unregistered op rather than skipping.
+            import functools
+
+            from jax._src import dispatch
+            from jax._src.core import ShapedArray
+            from jax._src.lib.mlir.dialects import hlo
+            from jax.extend import core as jex_core
+            from jax.interpreters import mlir
+
+            prim = jex_core.Primitive("jax_silicon_test_replica_id")
+            prim.def_impl(functools.partial(dispatch.apply_primitive, prim))
+            prim.def_abstract_eval(lambda: ShapedArray((), numpy.uint32))
+            mlir.register_lowering(prim, lambda ctx: [hlo.replica_id()])
+
+            def func(a):
+                return a + prim.bind().astype(a.dtype)
+
             if jit:
                 func = jax.jit(func)
-            func(numpy.int32(7))
+            numpy.asarray(func(numpy.asarray([1.0, 3.0], dtype=numpy.float32)))
         except Exception as exc:
             message = str(exc)
-            assert "issues/new?template=missing-op.yml" in message
-            assert "CONTRIBUTING.md" in message
+            assert "issues/new?template=missing-op.yml" in message, message
+            assert "CONTRIBUTING.md" in message, message
         else:
-            pytest.skip("clz is now supported; test needs a new unregistered op")
+            pytest.fail("replica_id is now supported; test needs a new unregistered op")
 
 
 def test_unknown_custom_call_error_message(jit: bool) -> None:

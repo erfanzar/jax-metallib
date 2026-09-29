@@ -229,6 +229,7 @@ set(MLIR_LIBS
     MLIRReconcileUnrealizedCasts
     MLIRPass
     MLIRTransforms
+    MLIRFuncInlinerExtension
     MLIRFuncDialect
     MLIRFuncTransforms
     MLIRArithDialect

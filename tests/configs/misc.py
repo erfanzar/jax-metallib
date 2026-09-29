@@ -7,7 +7,7 @@ from .util import OperationTestConfig
 
 def make_misc_op_configs():
     with OperationTestConfig.module_name("misc"):
-        yield from [
+        for config in [
             # This tests transfer of data with non-contiguous arrays.
             OperationTestConfig(
                 lambda x: x,
@@ -129,4 +129,11 @@ def make_misc_op_configs():
                 ),
                 name="irfft-c2r-2d-odd",
             ),
-        ]
+        ]:
+            # Complex FFT inputs are differentiable, but the default selector
+            # only includes float32 arrays. Keep real-input cases unchanged.
+            if config.name.startswith(
+                ("misc.fft-", "misc.fftn-", "misc.ifft-", "misc.ifftn-", "misc.irfft-", "misc.irfftn-")
+            ):
+                config.differentiable_argnums = (0,)
+            yield config

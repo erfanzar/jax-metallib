@@ -1230,6 +1230,19 @@ static id<MTLBuffer> NativeHandle_triangular_solve(id<MTLDevice> device, id<MTLC
         MPS_LOG_ERROR("triangular_solve: expected TriangularSolveOp\n");
         return nil;
     }
+    if (inputs.size() < 2 || !inputs[0] || !inputs[1]) {
+        MPS_LOG_ERROR("triangular_solve: missing input buffer\n");
+        return nil;
+    }
+
+    // Native-only plans may use command buffers with unretained references.
+    // Keep input buffers alive until the GPU finishes using the MPS solver.
+    CFTypeRef heldA = CFRetain((__bridge CFTypeRef)inputs[0]);
+    CFTypeRef heldB = CFRetain((__bridge CFTypeRef)inputs[1]);
+    [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer>) {
+      CFRelease(heldA);
+      CFRelease(heldB);
+    }];
 
     bool leftSide = triSolveOp.getLeftSide();
     bool lower = triSolveOp.getLower();
@@ -1569,5 +1582,231 @@ static id<MTLBuffer> NativeHandle_triangular_solve(id<MTLDevice> device, id<MTLC
 }
 
 REGISTER_NATIVE_MPS_OP("stablehlo.triangular_solve", NativeHandle_triangular_solve);
+
+// jnp.linalg.qr lowers to two custom calls that had no MPS handler:
+//   Qr: LAPACK geqrf -> (packed R + Householder tails, tau)
+//   ProductOfElementaryHouseholderReflectors: LAPACK orgqr -> Q
+// Both are lowered as unrolled Householder steps over masked full-length
+// column vectors (static slices only, no scatter), following slarfg's sign
+// conventions (beta = -sign(alpha) * ||[alpha, x]||, tau = (beta - alpha) /
+// beta, v = x / (alpha - beta), tau = 0 for a zero tail) so Q and R match
+// LAPACK directly. float32 only; the unroll is capped to keep graphs bounded.
+static constexpr int64_t kMaxHouseholderSteps = 128;
+
+static bool QrMatrixDims(NSArray<NSNumber*>* shape, int64_t* batch, int64_t* m, int64_t* n) {
+    if (!shape || shape.count < 2) {
+        return false;
+    }
+    int64_t b = 1;
+    for (NSUInteger i = 0; i + 2 < shape.count; ++i) {
+        b *= [shape[i] longLongValue];
+    }
+    *batch = b;
+    *m = [shape[shape.count - 2] longLongValue];
+    *n = [shape[shape.count - 1] longLongValue];
+    return b >= 0 && *m >= 0 && *n >= 0;
+}
+
+static ProcessResult HandleQrCustomCall(HandlerContext& ctx) {
+    MPSGraphTensor* input = GetInputTensor(ctx, 0);
+    if (!input || ctx.op->getNumResults() != 2) {
+        return ProcessResult::Error("Qr: expected one operand and two results");
+    }
+    if (input.dataType != MPSDataTypeFloat32) {
+        return ProcessResult::Error("Qr: only float32 is supported on MPS");
+    }
+    NSArray<NSNumber*>* shape = GetOutputShape(ctx.op, 0);
+    NSArray<NSNumber*>* tauShape = GetOutputShape(ctx.op, 1);
+    int64_t batch = 0, m = 0, n = 0;
+    if (!tauShape || !QrMatrixDims(shape, &batch, &m, &n)) {
+        return ProcessResult::Error("Qr: expected static rank >= 2 shapes");
+    }
+    const int64_t k = std::min(m, n);
+    if (k > kMaxHouseholderSteps) {
+        return ProcessResult::Error("Qr: min(m, n) > 128 is not supported on MPS");
+    }
+    MPSGraph* g = ctx.graph;
+    if (k == 0 || batch == 0) {
+        SetOutputTensor(ctx.values, ctx.op, input, 0);
+        SetOutputTensor(ctx.values, ctx.op,
+                        [g constantWithScalar:0.0 shape:tauShape dataType:MPSDataTypeFloat32], 1);
+        return ProcessResult{};
+    }
+
+    MPSGraphTensor* A = [g reshapeTensor:input withShape:@[@(batch), @(m), @(n)] name:nil];
+    MPSGraphTensor* rowIdx = [g coordinateAlongAxis:1 withShape:@[@1, @(m), @1] name:nil];
+    MPSGraphTensor* colIdx = [g coordinateAlongAxis:2 withShape:@[@1, @1, @(n)] name:nil];
+    MPSGraphTensor* zero = [g constantWithScalar:0.0 dataType:MPSDataTypeFloat32];
+    MPSGraphTensor* one = [g constantWithScalar:1.0 dataType:MPSDataTypeFloat32];
+    NSMutableArray<MPSGraphTensor*>* taus = [NSMutableArray arrayWithCapacity:(NSUInteger)k];
+
+    for (int64_t j = 0; j < k; ++j) {
+        MPSGraphTensor* jc = [g constantWithScalar:(double)j dataType:rowIdx.dataType];
+        MPSGraphTensor* isDiag = [g equalWithPrimaryTensor:rowIdx secondaryTensor:jc name:nil];
+        MPSGraphTensor* isBelow = [g greaterThanWithPrimaryTensor:rowIdx secondaryTensor:jc name:nil];
+        MPSGraphTensor* c = [g sliceTensor:A dimension:2 start:(NSInteger)j length:1 name:nil];
+        MPSGraphTensor* alpha = [g reductionSumWithTensor:[g selectWithPredicateTensor:isDiag
+                                                                   truePredicateTensor:c
+                                                                  falsePredicateTensor:zero
+                                                                                  name:nil]
+                                                     axis:1
+                                                     name:nil];
+        MPSGraphTensor* tail = [g selectWithPredicateTensor:isBelow
+                                        truePredicateTensor:c
+                                       falsePredicateTensor:zero
+                                                       name:nil];
+        MPSGraphTensor* xnorm2 = [g reductionSumWithTensor:[g multiplicationWithPrimaryTensor:tail
+                                                                              secondaryTensor:tail
+                                                                                         name:nil]
+                                                      axis:1
+                                                      name:nil];
+        MPSGraphTensor* norm =
+            [g squareRootWithTensor:[g additionWithPrimaryTensor:[g multiplicationWithPrimaryTensor:alpha
+                                                                                    secondaryTensor:alpha
+                                                                                               name:nil]
+                                                 secondaryTensor:xnorm2
+                                                            name:nil]
+                               name:nil];
+        MPSGraphTensor* beta = [g selectWithPredicateTensor:[g greaterThanOrEqualToWithPrimaryTensor:alpha
+                                                                                     secondaryTensor:zero
+                                                                                                name:nil]
+                                        truePredicateTensor:[g negativeWithTensor:norm name:nil]
+                                       falsePredicateTensor:norm
+                                                       name:nil];
+        MPSGraphTensor* zeroTail = [g equalWithPrimaryTensor:xnorm2 secondaryTensor:zero name:nil];
+        MPSGraphTensor* safeBeta = [g selectWithPredicateTensor:zeroTail
+                                            truePredicateTensor:one
+                                           falsePredicateTensor:beta
+                                                           name:nil];
+        MPSGraphTensor* tau = [g divisionWithPrimaryTensor:[g subtractionWithPrimaryTensor:beta
+                                                                           secondaryTensor:alpha
+                                                                                      name:nil]
+                                           secondaryTensor:safeBeta
+                                                      name:nil];
+        tau = [g selectWithPredicateTensor:zeroTail
+                       truePredicateTensor:zero
+                      falsePredicateTensor:tau
+                                      name:nil];
+        MPSGraphTensor* denom = [g selectWithPredicateTensor:zeroTail
+                                         truePredicateTensor:one
+                                        falsePredicateTensor:[g subtractionWithPrimaryTensor:alpha
+                                                                             secondaryTensor:beta
+                                                                                        name:nil]
+                                                        name:nil];
+        MPSGraphTensor* vTail = [g divisionWithPrimaryTensor:tail secondaryTensor:denom name:nil];
+        MPSGraphTensor* v = [g selectWithPredicateTensor:isDiag
+                                     truePredicateTensor:one
+                                    falsePredicateTensor:vTail
+                                                    name:nil];
+
+        // Apply H = I - tau v v^T to the trailing columns (> j).
+        MPSGraphTensor* w = [g reductionSumWithTensor:[g multiplicationWithPrimaryTensor:v
+                                                                         secondaryTensor:A
+                                                                                    name:nil]
+                                                 axis:1
+                                                 name:nil];
+        MPSGraphTensor* tv = [g multiplicationWithPrimaryTensor:tau secondaryTensor:v name:nil];
+        MPSGraphTensor* updated = [g subtractionWithPrimaryTensor:A
+                                                  secondaryTensor:[g multiplicationWithPrimaryTensor:tv
+                                                                                     secondaryTensor:w
+                                                                                                name:nil]
+                                                             name:nil];
+        MPSGraphTensor* colAfter = [g greaterThanWithPrimaryTensor:colIdx secondaryTensor:jc name:nil];
+        A = [g selectWithPredicateTensor:colAfter
+                     truePredicateTensor:updated
+                    falsePredicateTensor:A
+                                    name:nil];
+
+        // Column j: beta on the diagonal (alpha when tau = 0), v's tail below.
+        MPSGraphTensor* diagVal = [g selectWithPredicateTensor:zeroTail
+                                           truePredicateTensor:alpha
+                                          falsePredicateTensor:beta
+                                                          name:nil];
+        MPSGraphTensor* newCol = [g selectWithPredicateTensor:isBelow
+                                          truePredicateTensor:vTail
+                                         falsePredicateTensor:c
+                                                         name:nil];
+        newCol = [g selectWithPredicateTensor:isDiag
+                          truePredicateTensor:diagVal
+                         falsePredicateTensor:newCol
+                                         name:nil];
+        MPSGraphTensor* colIsJ = [g equalWithPrimaryTensor:colIdx secondaryTensor:jc name:nil];
+        A = [g selectWithPredicateTensor:colIsJ truePredicateTensor:newCol falsePredicateTensor:A name:nil];
+
+        [taus addObject:[g reshapeTensor:tau withShape:@[@(batch), @1] name:nil]];
+    }
+
+    MPSGraphTensor* tauAll = taus.count == 1 ? taus[0] : [g concatTensors:taus dimension:1 name:nil];
+    SetOutputTensor(ctx.values, ctx.op, [g reshapeTensor:A withShape:shape name:nil], 0);
+    SetOutputTensor(ctx.values, ctx.op, [g reshapeTensor:tauAll withShape:tauShape name:nil], 1);
+    return ProcessResult{};
+}
+
+static ProcessResult HandleHouseholderProduct(HandlerContext& ctx) {
+    MPSGraphTensor* input = GetInputTensor(ctx, 0);
+    MPSGraphTensor* tauIn = GetInputTensor(ctx, 1);
+    if (!input || !tauIn || ctx.op->getNumResults() != 1) {
+        return ProcessResult::Error("ProductOfElementaryHouseholderReflectors: expected (a, tau) -> q");
+    }
+    if (input.dataType != MPSDataTypeFloat32 || tauIn.dataType != MPSDataTypeFloat32) {
+        return ProcessResult::Error(
+            "ProductOfElementaryHouseholderReflectors: only float32 is supported on MPS");
+    }
+    NSArray<NSNumber*>* shape = GetOutputShape(ctx.op, 0);
+    int64_t batch = 0, m = 0, n = 0;
+    NSArray<NSNumber*>* tauShape = tauIn.shape;
+    if (!tauShape || tauShape.count == 0 || !QrMatrixDims(shape, &batch, &m, &n)) {
+        return ProcessResult::Error("ProductOfElementaryHouseholderReflectors: expected static shapes");
+    }
+    const int64_t k = [tauShape.lastObject longLongValue];
+    if (k > n || k > m || k > kMaxHouseholderSteps) {
+        return ProcessResult::Error("ProductOfElementaryHouseholderReflectors: unsupported reflector count");
+    }
+    MPSGraph* g = ctx.graph;
+    MPSGraphTensor* rowIdx = [g coordinateAlongAxis:1 withShape:@[@1, @(m), @1] name:nil];
+    MPSGraphTensor* colIdx = [g coordinateAlongAxis:2 withShape:@[@1, @1, @(n)] name:nil];
+    MPSGraphTensor* zero = [g constantWithScalar:0.0 dataType:MPSDataTypeFloat32];
+    MPSGraphTensor* one = [g constantWithScalar:1.0 dataType:MPSDataTypeFloat32];
+    MPSGraphTensor* Q = [g selectWithPredicateTensor:[g equalWithPrimaryTensor:rowIdx
+                                                               secondaryTensor:colIdx
+                                                                          name:nil]
+                                 truePredicateTensor:one
+                                falsePredicateTensor:zero
+                                                name:nil];
+    Q = [g broadcastTensor:Q toShape:@[@(batch), @(m), @(n)] name:nil];
+    if (k > 0 && batch > 0) {
+        MPSGraphTensor* A = [g reshapeTensor:input withShape:@[@(batch), @(m), @(n)] name:nil];
+        MPSGraphTensor* T = [g reshapeTensor:tauIn withShape:@[@(batch), @(k)] name:nil];
+        for (int64_t j = k - 1; j >= 0; --j) {
+            MPSGraphTensor* jc = [g constantWithScalar:(double)j dataType:rowIdx.dataType];
+            MPSGraphTensor* isDiag = [g equalWithPrimaryTensor:rowIdx secondaryTensor:jc name:nil];
+            MPSGraphTensor* isBelow = [g greaterThanWithPrimaryTensor:rowIdx secondaryTensor:jc name:nil];
+            MPSGraphTensor* c = [g sliceTensor:A dimension:2 start:(NSInteger)j length:1 name:nil];
+            MPSGraphTensor* v = [g selectWithPredicateTensor:isBelow
+                                         truePredicateTensor:c
+                                        falsePredicateTensor:zero
+                                                        name:nil];
+            v = [g selectWithPredicateTensor:isDiag truePredicateTensor:one falsePredicateTensor:v name:nil];
+            MPSGraphTensor* t = [g sliceTensor:T dimension:1 start:(NSInteger)j length:1 name:nil];
+            t = [g reshapeTensor:t withShape:@[@(batch), @1, @1] name:nil];
+            MPSGraphTensor* w = [g reductionSumWithTensor:[g multiplicationWithPrimaryTensor:v
+                                                                             secondaryTensor:Q
+                                                                                        name:nil]
+                                                     axis:1
+                                                     name:nil];
+            MPSGraphTensor* tv = [g multiplicationWithPrimaryTensor:t secondaryTensor:v name:nil];
+            Q = [g subtractionWithPrimaryTensor:Q
+                                secondaryTensor:[g multiplicationWithPrimaryTensor:tv
+                                                                   secondaryTensor:w
+                                                                              name:nil]
+                                           name:nil];
+        }
+    }
+    return Result(ctx, [g reshapeTensor:Q withShape:shape name:nil], "householder_product");
+}
+
+REGISTER_CUSTOM_CALL("Qr", HandleQrCustomCall, qr);
+REGISTER_CUSTOM_CALL("ProductOfElementaryHouseholderReflectors", HandleHouseholderProduct,
+                     householder_product);
 
 } // namespace jax_metallib

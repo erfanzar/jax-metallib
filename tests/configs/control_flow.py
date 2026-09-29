@@ -1,3 +1,4 @@
+import jax
 import numpy
 from jax import lax
 from jax import numpy as jnp
@@ -14,7 +15,7 @@ def make_control_flow_op_configs():
                 numpy.bool_(True),
                 numpy.float32(3.0),
                 numpy.float32(4.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(1, 2),
                 name="lax.cond.true",
             ),
             OperationTestConfig(
@@ -22,7 +23,7 @@ def make_control_flow_op_configs():
                 numpy.bool_(False),
                 numpy.float32(3.0),
                 numpy.float32(4.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(1, 2),
                 name="lax.cond.false",
             ),
             OperationTestConfig(
@@ -34,7 +35,7 @@ def make_control_flow_op_configs():
                 ),
                 numpy.bool_(True),
                 lambda rng: rng.standard_normal((5,)).astype(numpy.float32),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.cond.array",
             ),
             # ==================== lax.switch ====================
@@ -46,7 +47,7 @@ def make_control_flow_op_configs():
                 ),
                 numpy.int32(1),
                 lambda rng: rng.standard_normal((4,)).astype(numpy.float32),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.switch",
             ),
             OperationTestConfig(
@@ -61,7 +62,7 @@ def make_control_flow_op_configs():
                 ),
                 numpy.int32(2),
                 lambda rng: rng.standard_normal((4, 4)).astype(numpy.float32),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.switch.multiaxis",
             ),
             # Boundary selector: first branch (index 0)
@@ -73,7 +74,7 @@ def make_control_flow_op_configs():
                 ),
                 numpy.int32(0),
                 numpy.float32(5.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.switch.first_branch",
             ),
             # Boundary selector: last branch (index N-1)
@@ -85,7 +86,7 @@ def make_control_flow_op_configs():
                 ),
                 numpy.int32(2),
                 numpy.float32(5.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.switch.last_branch",
             ),
             # Out-of-bounds selector: negative (should clamp to first or last)
@@ -97,7 +98,7 @@ def make_control_flow_op_configs():
                 ),
                 numpy.int32(-1),
                 numpy.float32(5.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.switch.oob_negative",
             ),
             # Out-of-bounds selector: too large (should clamp to last)
@@ -109,7 +110,7 @@ def make_control_flow_op_configs():
                 ),
                 numpy.int32(100),
                 numpy.float32(5.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.switch.oob_large",
             ),
             # Many branches (5 branches)
@@ -127,7 +128,7 @@ def make_control_flow_op_configs():
                 ),
                 numpy.int32(3),
                 numpy.float32(4.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.switch.many_branches",
             ),
             # Multiple return values from branches
@@ -143,7 +144,7 @@ def make_control_flow_op_configs():
                 )[0],
                 numpy.int32(1),
                 numpy.float32(5.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.switch.multi_return.first",
             ),
             OperationTestConfig(
@@ -158,7 +159,7 @@ def make_control_flow_op_configs():
                 )[1],
                 numpy.int32(1),
                 numpy.float32(5.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(1,),
                 name="lax.switch.multi_return.second",
             ),
             # Nested switch inside branches
@@ -182,7 +183,7 @@ def make_control_flow_op_configs():
                 numpy.int32(0),
                 numpy.int32(1),
                 numpy.float32(5.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(2,),
                 name="lax.switch.nested",
             ),
             # ==================== lax.while_loop ====================
@@ -230,7 +231,8 @@ def make_control_flow_op_configs():
                     (numpy.int32(0), init),
                 )[1],
                 lambda rng: rng.standard_normal((3, 5)).astype(numpy.float32),
-                differentiable_argnums=(),
+                differentiable_argnums=(0,),
+                grad_transform=jax.jacfwd,
                 name="lax.while_loop.axis1",
             ),
             # Array operations along axis 0
@@ -244,7 +246,8 @@ def make_control_flow_op_configs():
                     (numpy.int32(0), init),
                 )[1],
                 lambda rng: rng.standard_normal((3, 5)).astype(numpy.float32),
-                differentiable_argnums=(),
+                differentiable_argnums=(0,),
+                grad_transform=jax.jacfwd,
                 name="lax.while_loop.axis0",
             ),
             # Mixed dtypes in state (int32 counter + float32 accumulator)
@@ -255,7 +258,8 @@ def make_control_flow_op_configs():
                     (numpy.int32(0), init_f),
                 )[1],
                 numpy.float32(1.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(0,),
+                grad_transform=jax.jacfwd,
                 name="lax.while_loop.mixed_dtype",
             ),
             # Three-element tuple state
@@ -269,6 +273,20 @@ def make_control_flow_op_configs():
                 numpy.float32(1.0),
                 differentiable_argnums=(),
                 name="lax.while_loop.triple_state",
+            ),
+            # A float-only projection of the tuple allows forward-mode coverage
+            # of both output leaves (the counter itself is not differentiable).
+            OperationTestConfig(
+                lambda x, y: lax.while_loop(
+                    lambda state: state[0] < 3,
+                    lambda state: (state[0] + 1, state[1] + 1.0, state[2] * 2.0),
+                    (numpy.int32(0), x, y),
+                )[1:],
+                numpy.float32(1.0),
+                numpy.float32(1.0),
+                differentiable_argnums=(0, 1),
+                grad_transform=jax.jacfwd,
+                name="lax.while_loop.triple_state_float_outputs",
             ),
             # Nested while loops with scalars
             OperationTestConfig(
@@ -308,10 +326,13 @@ def make_control_flow_op_configs():
                     (numpy.int32(0), init),
                 )[1],
                 lambda rng: rng.standard_normal((3, 5)).astype(numpy.float32),
-                differentiable_argnums=(),
+                differentiable_argnums=(0,),
+                grad_transform=jax.jacfwd,
                 name="lax.while_loop.nested_axis1",
             ),
             # ==================== lax.fori_loop ====================
+            # Static loop bounds permit reverse-mode gradients; dynamic while_loop
+            # bounds above do not support reverse-mode differentiation in JAX.
             OperationTestConfig(
                 lambda x: lax.fori_loop(
                     0,
@@ -320,7 +341,7 @@ def make_control_flow_op_configs():
                     x,
                 ),
                 numpy.float32(0.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(0,),
                 name="lax.fori_loop.scalar",
             ),
             OperationTestConfig(
@@ -331,7 +352,7 @@ def make_control_flow_op_configs():
                     x,
                 ),
                 lambda rng: rng.standard_normal((5,)).astype(numpy.float32),
-                differentiable_argnums=(),
+                differentiable_argnums=(0,),
                 name="lax.fori_loop.array",
             ),
             # fori_loop with zero iterations
@@ -343,7 +364,7 @@ def make_control_flow_op_configs():
                     x,
                 ),
                 numpy.float32(7.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(0,),
                 name="lax.fori_loop.zero_iter",
             ),
             # ==================== cond inside while ====================
@@ -362,7 +383,8 @@ def make_control_flow_op_configs():
                     (numpy.int32(0), x),
                 )[1],
                 numpy.float32(1.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(0,),
+                grad_transform=jax.jacfwd,
                 name="lax.while_loop.with_cond",
             ),
             # ==================== switch inside while ====================
@@ -384,7 +406,8 @@ def make_control_flow_op_configs():
                     (numpy.int32(0), x),
                 )[1],
                 numpy.float32(1.0),
-                differentiable_argnums=(),
+                differentiable_argnums=(0,),
+                grad_transform=jax.jacfwd,
                 name="lax.while_loop.with_switch",
             ),
         ]

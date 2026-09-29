@@ -205,4 +205,27 @@ static ProcessResult HandleCollectivePermute(HandlerContext& ctx) {
 }
 REGISTER_MPS_OP("stablehlo.collective_permute", HandleCollectivePermute);
 
+// lax.axis_index under shard_map and pmap lowers to stablehlo.partition_id,
+// which had no handler. With a single partition the id is always 0; modules
+// declaring more than one partition are rejected rather than silently given 0.
+static ProcessResult HandlePartitionId(HandlerContext& ctx) {
+    if (ctx.module) {
+        if (auto attr = ctx.module->getAttrOfType<mlir::IntegerAttr>("mhlo.num_partitions")) {
+            if (attr.getInt() != 1) {
+                return ProcessResult::Error("partition_id: multi-partition execution is not supported "
+                                            "(mhlo.num_partitions=" +
+                                            std::to_string(attr.getInt()) + ")");
+            }
+        }
+    }
+    MPSDataType dtype = GetResultMpsType(ctx.op);
+    NSArray<NSNumber*>* shape = GetOutputShape(ctx.op);
+    if (dtype == MPSDataTypeInvalid || !shape) {
+        return ProcessResult::Error("partition_id: could not determine result type");
+    }
+    MPSGraphTensor* zero = [ctx.graph constantWithScalar:0 shape:shape dataType:dtype];
+    return Result(ctx, zero, "partition_id");
+}
+REGISTER_MPS_OP("stablehlo.partition_id", HandlePartitionId);
+
 } // namespace jax_metallib

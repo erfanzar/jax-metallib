@@ -128,6 +128,7 @@ struct NativeStep {
         kTranspose2D,
         kCpuSort,
         kCpuCholesky,
+        kReduceSplit,
     };
 
     NativeOpHandler handler;
@@ -142,6 +143,15 @@ struct NativeStep {
     bool baked_use_vec4 = false;
     bool baked_use_stride = false;
     bool baked_reduce_threadgroup = false;
+
+    // Split reduce (two-stage single-row huge reduce): stage 1 reduces G
+    // column groups into G partials, stage 2 combines them into the scalar.
+    id<MTLComputePipelineState> baked_reduce_split_combine_pipeline = nil;
+    id<MTLBuffer> baked_reduce_split_partials = nil;
+    uint32_t baked_reduce_split_groups = 0;
+    MTLSize baked_reduce_split_combine_grid = MTLSizeMake(1, 1, 1);
+    MTLSize baked_reduce_split_combine_tg = MTLSizeMake(1, 1, 1);
+    bool baked_reduce_split_combine_tg_dispatch = false;
 
     uint32_t baked_n = 0;
     uint32_t baked_rows = 0;
@@ -274,6 +284,37 @@ static bool EnvFlagEnabled(const char* name) {
     return !(v[0] == '0' && v[1] == '\0');
 }
 
+// A nil compilation descriptor behaves like MPSGraphOptimizationLevel1, whose
+// placement pass can run float16 subgraphs on the Neural Engine. There f16
+// `nan != nan` was false, log(0) gave -45440, sqrt(-x) gave 0, exp(nan) gave inf
+// and f32->f16 casts turned NaN into inf and -0 into +0 (reproduced with a
+// standalone MPSGraph program). Level0 keeps core optimizations on the GPU and
+// matches XLA. JAX_METALLIB_MPSGRAPH_OPT_LEVEL1=1 restores the old default.
+static MPSGraphCompilationDescriptor* GraphCompilationDescriptor() {
+    static MPSGraphCompilationDescriptor* desc = []() -> MPSGraphCompilationDescriptor* {
+        if (EnvFlagEnabled("JAX_METALLIB_MPSGRAPH_OPT_LEVEL1")) {
+            return nil;
+        }
+        MPSGraphCompilationDescriptor* d = [MPSGraphCompilationDescriptor new];
+        d.optimizationLevel = MPSGraphOptimizationLevel0;
+        return d;
+    }();
+    return desc;
+}
+
+static MPSGraphExecutionDescriptor* GraphExecutionDescriptor() {
+    static MPSGraphExecutionDescriptor* desc = []() -> MPSGraphExecutionDescriptor* {
+        MPSGraphCompilationDescriptor* c = GraphCompilationDescriptor();
+        if (!c) {
+            return nil;
+        }
+        MPSGraphExecutionDescriptor* d = [MPSGraphExecutionDescriptor new];
+        d.compilationDescriptor = c;
+        return d;
+    }();
+    return desc;
+}
+
 // Intrinsic-native kernels are DISABLED by default. Under JAX 0.11's eager
 // dispatch, the fused-chain path still has a slot-aliasing defect (a graph-step
 // target sharing a slot with a fused-chain output) that yields wrong results
@@ -302,6 +343,7 @@ static int EnvIntValue(const char* name, int default_value) {
 }
 
 static id<MTLBuffer> AcquireReusableOutputBuffer(id<MTLDevice> device, size_t byte_size);
+static void RecycleReusableOutputBuffer(void* device_key, size_t byte_size, void* metal_buffer);
 static id<MTLBuffer> NativeIntrinsicReshapeAliasHandler(id<MTLDevice> device,
                                                         id<MTLCommandBuffer> commandBuffer,
                                                         mlir::Operation* op,
@@ -803,14 +845,40 @@ static std::string GetReduceBodyOpName(mlir::stablehlo::ReduceOp reduceOp) {
         return "";
     }
     mlir::Block& block = reduceOp.getBody().front();
+    if (block.getNumArguments() != 2) {
+        return "";
+    }
+    // Strict validation: the reducer must be exactly one binary compute op
+    // over the two block arguments whose result is returned directly. The
+    // previous "first non-return op name" heuristic could misroute a
+    // multi-op reducer (e.g. add-then-convert) as a plain sum/max/min.
+    mlir::Operation* compute = nullptr;
+    mlir::Operation* ret = nullptr;
     for (mlir::Operation& inner : block) {
         std::string opName = inner.getName().getStringRef().str();
         if (opName == "stablehlo.return") {
+            if (ret) {
+                return "";
+            }
+            ret = &inner;
             continue;
         }
-        return opName;
+        if (compute) {
+            return "";
+        }
+        compute = &inner;
     }
-    return "";
+    if (!compute || !ret || compute->getNumOperands() != 2 || compute->getNumResults() != 1 ||
+        ret->getNumOperands() != 1 || ret->getOperand(0) != compute->getResult(0)) {
+        return "";
+    }
+    auto arg0 = mlir::dyn_cast<mlir::BlockArgument>(compute->getOperand(0));
+    auto arg1 = mlir::dyn_cast<mlir::BlockArgument>(compute->getOperand(1));
+    if (!arg0 || !arg1 || arg0.getOwner() != &block || arg1.getOwner() != &block ||
+        arg0.getArgNumber() == arg1.getArgNumber()) {
+        return "";
+    }
+    return compute->getName().getStringRef().str();
 }
 
 static bool IsNeutralReduceInit(mlir::Value init, IntrinsicNativeKind kind) {
@@ -1909,6 +1977,23 @@ static IntrinsicNativeKind ClassifyElementwiseKind(mlir::Operation* op) {
     return IntrinsicNativeKind::kNone;
 }
 
+// True when the reduce dimensions are exactly the trailing axes {rank-k .. rank-1}.
+// A suffix reduce over contiguous row-major data is a per-row reduction with
+// cols = product(suffix dims), so the last-axis native kernels handle it
+// (a full reduce to a scalar is the special case rows == 1).
+static bool IsSuffixReduceDimensions(llvm::ArrayRef<int64_t> dims, int64_t rank) {
+    if (dims.empty() || rank <= 0 || static_cast<int64_t>(dims.size()) > rank) {
+        return false;
+    }
+    int64_t first = rank - static_cast<int64_t>(dims.size());
+    for (size_t i = 0; i < dims.size(); ++i) {
+        if (dims[i] != first + static_cast<int64_t>(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static IntrinsicNativeKind ClassifyReduceKind(mlir::Operation* op) {
     auto reduceOp = mlir::dyn_cast_or_null<mlir::stablehlo::ReduceOp>(op);
     if (!reduceOp) {
@@ -1936,9 +2021,22 @@ static IntrinsicNativeKind ClassifyReduceKind(mlir::Operation* op) {
     // axis/dtype/100K-element threshold. Max/min stay on MPSGraph (no headroom).
     if (auto inType2 = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType())) {
         auto dims2 = reduceOp.getDimensions();
-        if (dims2.size() == 1 && dims2[0] == inType2.getRank() - 1 &&
-            GetReduceBodyOpName(reduceOp) == "stablehlo.add") {
-            return IntrinsicNativeKind::kReduceSumLastAxis;
+        int64_t rank2 = static_cast<int64_t>(inType2.getRank());
+        if (IsSuffixReduceDimensions(dims2, rank2)) {
+            const std::string body2 = GetReduceBodyOpName(reduceOp);
+            if (body2 == "stablehlo.add") {
+                return IntrinsicNativeKind::kReduceSumLastAxis;
+            }
+            // Full reduce to a scalar: max/min also win big natively (the
+            // MPSGraph full-reduce path is effectively serial, ~45ns/elem).
+            if (static_cast<int64_t>(dims2.size()) == rank2) {
+                if (body2 == "stablehlo.maximum") {
+                    return IntrinsicNativeKind::kReduceMaxLastAxis;
+                }
+                if (body2 == "stablehlo.minimum") {
+                    return IntrinsicNativeKind::kReduceMinLastAxis;
+                }
+            }
         }
     }
     // Plain reduce ops route to MPSGraph: the graph path fuses the entire
@@ -2033,7 +2131,7 @@ static bool IsEligibleReduceNativeOp(mlir::Operation* op, IntrinsicNativeKind ki
         return false;
     }
     auto dims = reduceOp.getDimensions();
-    if (dims.size() != 1) {
+    if (dims.empty()) {
         return false;
     }
 
@@ -2058,21 +2156,33 @@ static bool IsEligibleReduceNativeOp(mlir::Operation* op, IntrinsicNativeKind ki
         return false;
     }
 
-    int64_t axis = dims[0];
     int64_t rank = static_cast<int64_t>(inShape.size());
     bool is_axis0_kind =
         (kind == IntrinsicNativeKind::kReduceSumAxis0 || kind == IntrinsicNativeKind::kReduceMaxAxis0 ||
          kind == IntrinsicNativeKind::kReduceMinAxis0 || kind == IntrinsicNativeKind::kReduceMeanAxis0);
+    int64_t reduce_dim_size = 0;
     if (is_axis0_kind) {
-        if (axis != 0 || rank != 2) {
+        if (dims.size() != 1 || dims[0] != 0 || rank != 2) {
             return false;
         }
+        reduce_dim_size = inShape[0];
     } else {
-        if (axis != rank - 1) {
+        // Trailing-suffix reduces (including full reduces to a scalar) are
+        // per-row reductions over contiguous memory with cols = product(suffix).
+        if (!IsSuffixReduceDimensions(dims, rank)) {
             return false;
+        }
+        if (dims.size() != 1 && kind != IntrinsicNativeKind::kReduceSumLastAxis &&
+            kind != IntrinsicNativeKind::kReduceMaxLastAxis &&
+            kind != IntrinsicNativeKind::kReduceMinLastAxis) {
+            // Fused softmax/layernorm/mean kernels are single-axis only.
+            return false;
+        }
+        reduce_dim_size = 1;
+        for (auto d : dims) {
+            reduce_dim_size *= inShape[d];
         }
     }
-    int64_t reduce_dim_size = inShape[axis];
     if (reduce_dim_size <= 0 || reduce_dim_size > std::numeric_limits<uint32_t>::max()) {
         return false;
     }
@@ -2090,8 +2200,14 @@ static bool IsEligibleReduceNativeOp(mlir::Operation* op, IntrinsicNativeKind ki
     // high dispatch overhead relative to compute, so stay on the graph path.
     if (kind == IntrinsicNativeKind::kReduceSumLastAxis || kind == IntrinsicNativeKind::kReduceMaxLastAxis ||
         kind == IntrinsicNativeKind::kReduceMinLastAxis) {
-        uint64_t minElems =
-            static_cast<uint64_t>(EnvIntValue("JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS", 32768));
+        // Single-row (full) reduces are effectively serial on the MPSGraph path
+        // (~45ns/elem), so the native TG kernel wins at much smaller sizes than
+        // the multi-row dispatch-overhead-bound case.
+        const bool single_row = (outNumel == 1);
+        uint64_t minElems = static_cast<uint64_t>(
+            EnvIntValue(single_row ? "JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS_SINGLE_ROW"
+                                   : "JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS",
+                        single_row ? 4096 : 32768));
         if (inNumel < minElems) {
             return false;
         }
@@ -4383,8 +4499,13 @@ static id<MTLBuffer> NativeIntrinsicReduceHandler(id<MTLDevice> device, id<MTLCo
         cols = static_cast<uint32_t>(inShape[1]);
         use_threadgroup = false;
     } else {
-        int64_t cols64 = inShape.back();
-        if (cols64 <= 0 || cols64 > std::numeric_limits<uint32_t>::max()) {
+        // cols = product of the reduced (trailing-suffix) dims; for a single
+        // last-axis reduce this is simply inShape.back().
+        uint64_t cols64 = 1;
+        for (auto d : reduceOp.getDimensions()) {
+            cols64 *= static_cast<uint64_t>(inShape[d]);
+        }
+        if (cols64 == 0 || cols64 > std::numeric_limits<uint32_t>::max()) {
             return nil;
         }
         cols = static_cast<uint32_t>(cols64);
@@ -4437,10 +4558,22 @@ static id<MTLBuffer> NativeIntrinsicReduceHandler(id<MTLDevice> device, id<MTLCo
             }
         }
         if (groups > 0) {
-            id<MTLBuffer> partials = AcquireReusableOutputBuffer(device, groups * sizeof(float));
+            const size_t partials_bytes = (size_t)groups * sizeof(float);
+            id<MTLBuffer> partials = AcquireReusableOutputBuffer(device, partials_bytes);
             if (!partials) {
+                CFRelease((__bridge CFTypeRef)out);
                 return nil;
             }
+            // Recycle the scratch partials only after the GPU work that
+            // produces/consumes them has completed (they are written by the
+            // first dispatch and read by the combine dispatch on this command
+            // buffer, which may use unretained references).
+            void* partials_dev_key = (__bridge void*)device;
+            id<MTLBuffer> captured_partials = partials;
+            [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+              RecycleReusableOutputBuffer(partials_dev_key, partials_bytes,
+                                          (__bridge void*)captured_partials);
+            }];
             uint32_t rows_g = groups;
             uint32_t cols_g = cols / groups;
             [encoder setComputePipelineState:pipeline];
@@ -4457,12 +4590,24 @@ static id<MTLBuffer> NativeIntrinsicReduceHandler(id<MTLDevice> device, id<MTLCo
             id<MTLComputePipelineState> combine_pipeline =
                 GetFastNativePipeline(device, ReduceKernelFunctionName(kind, dtype, combine_tg));
             if (!combine_pipeline) {
+                [enc2 endEncoding];
+                CFRelease((__bridge CFTypeRef)out);
                 return nil;
             }
+            // The kernels read rows/cols from buffer indices 2/3; they must be
+            // set on the combine encoder too (this was previously missing).
+            uint32_t rows_c = 1;
+            uint32_t cols_c = groups;
             [enc2 setComputePipelineState:combine_pipeline];
             [enc2 setBuffer:partials offset:0 atIndex:0];
             [enc2 setBuffer:out offset:0 atIndex:1];
-            EncodeRowReduceDispatch(enc2, combine_pipeline, 1, groups);
+            [enc2 setBytes:&rows_c length:sizeof(rows_c) atIndex:2];
+            [enc2 setBytes:&cols_c length:sizeof(cols_c) atIndex:3];
+            if (combine_tg) {
+                EncodeRowReduceDispatch(enc2, combine_pipeline, rows_c, cols_c);
+            } else {
+                EncodeLinearDispatch(enc2, combine_pipeline, rows_c, dtype);
+            }
             [enc2 endEncoding];
             return out;
         }
@@ -4878,10 +5023,23 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
             return false;
         }
 
-        uint32_t cols = static_cast<uint32_t>(inShape.back());
         uint64_t inNumel = 1;
         for (auto d : inShape)
             inNumel *= static_cast<uint64_t>(d);
+        // cols = product of the reduced dims (trailing suffix); equals
+        // inShape.back() for the single last-axis case.
+        uint64_t colsProd = 1;
+        if (auto reduceOp = mlir::dyn_cast_or_null<mlir::stablehlo::ReduceOp>(op)) {
+            for (auto d : reduceOp.getDimensions()) {
+                colsProd *= static_cast<uint64_t>(inShape[d]);
+            }
+        } else {
+            colsProd = static_cast<uint64_t>(inShape.back());
+        }
+        if (colsProd == 0 || colsProd > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        uint32_t cols = static_cast<uint32_t>(colsProd);
         uint32_t rows = static_cast<uint32_t>(inNumel / cols);
 
         if (reduceKind == IntrinsicNativeKind::kSoftmaxLastAxis) {
@@ -5027,6 +5185,69 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
         std::string kernelName = ReduceKernelFunctionName(reduceKind, dtype, use_threadgroup);
         if (kernelName.empty()) {
             return false;
+        }
+        // Single-row huge reduces use a two-stage group split (stage 1: G
+        // threadgroups reduce column groups into partials; stage 2: combine).
+        // Baked directly with a retained partials scratch buffer so hot loops
+        // avoid the per-execution handler path entirely.
+        if (rows == 1 && dtype == MPSDataTypeFloat32 && cols >= 4096 &&
+            (reduceKind == IntrinsicNativeKind::kReduceSumLastAxis ||
+             reduceKind == IntrinsicNativeKind::kReduceMaxLastAxis ||
+             reduceKind == IntrinsicNativeKind::kReduceMinLastAxis)) {
+            uint32_t groups = 0;
+            const uint32_t candidates[] = {1024u, 512u, 256u, 128u, 64u, 32u, 16u};
+            for (uint32_t g : candidates) {
+                if (cols % g == 0 && cols / g >= 512) {
+                    groups = g;
+                    break;
+                }
+            }
+            if (groups > 0) {
+                id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kernelName);
+                if (!pipeline) {
+                    return false;
+                }
+                const bool combine_tg = groups >= 512;
+                std::string combineName = ReduceKernelFunctionName(reduceKind, dtype, combine_tg);
+                if (combineName.empty()) {
+                    return false;
+                }
+                id<MTLComputePipelineState> combine = GetFastNativePipeline(device, combineName);
+                if (!combine) {
+                    return false;
+                }
+                id<MTLBuffer> partials =
+                    [device newBufferWithLength:(size_t)groups * sizeof(float)
+                                        options:ComputeBufferResourceOptions()];
+                if (!partials) {
+                    return false;
+                }
+                NSUInteger tg_split =
+                    MIN((NSUInteger)1024, (NSUInteger)pipeline.maxTotalThreadsPerThreadgroup);
+                if (tg_split == 0) {
+                    tg_split = 1;
+                }
+                ns->baked_kind = NativeStep::BakedKind::kReduceSplit;
+                ns->baked_pipeline = pipeline;
+                ns->baked_reduce_split_combine_pipeline = combine;
+                ns->baked_reduce_split_partials = partials;
+                ns->baked_reduce_split_groups = groups;
+                ns->baked_rows = groups;        // stage-1 rows
+                ns->baked_cols = cols / groups; // stage-1 cols
+                ns->baked_grid = MTLSizeMake((NSUInteger)groups, 1, 1);
+                ns->baked_tg = MTLSizeMake(tg_split, 1, 1);
+                ns->baked_reduce_split_combine_tg_dispatch = combine_tg;
+                if (combine_tg) {
+                    ComputeRowReduceDispatchConfig(combine, 1, groups,
+                                                   &ns->baked_reduce_split_combine_grid,
+                                                   &ns->baked_reduce_split_combine_tg);
+                } else {
+                    ComputeLinearDispatchConfig(combine, 1, &ns->baked_reduce_split_combine_grid,
+                                                &ns->baked_reduce_split_combine_tg, dtype);
+                }
+                return true;
+            }
+            // groups == 0: fall through to the regular single-dispatch bake.
         }
         id<MTLComputePipelineState> pipeline = GetFastNativePipeline(device, kernelName);
         if (!pipeline) {
@@ -5719,13 +5940,23 @@ static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
     // elimination machinery where the intrinsic-family defects live.
     if (!IntrinsicNativeKernelsEnabled()) {
         auto reduceOp = mlir::dyn_cast_or_null<mlir::stablehlo::ReduceOp>(op);
-        if (reduceOp && GetReduceBodyOpName(reduceOp) == "stablehlo.add" &&
-            reduceOp->getNumOperands() == 2 && reduceOp->getNumResults() == 1) {
+        if (reduceOp && reduceOp->getNumOperands() == 2 && reduceOp->getNumResults() == 1) {
+            const std::string bodyName = GetReduceBodyOpName(reduceOp);
             auto inType = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType());
             auto dims = reduceOp.getDimensions();
-            if (inType && inType.hasStaticShape() && dims.size() == 1 &&
-                dims[0] == static_cast<int64_t>(inType.getRank()) - 1) {
-                if (IsEligibleReduceNativeOp(op, IntrinsicNativeKind::kReduceSumLastAxis)) {
+            if (inType && inType.hasStaticShape() &&
+                IsSuffixReduceDimensions(dims, static_cast<int64_t>(inType.getRank()))) {
+                IntrinsicNativeKind bypassKind = IntrinsicNativeKind::kNone;
+                if (bodyName == "stablehlo.add") {
+                    bypassKind = IntrinsicNativeKind::kReduceSumLastAxis;
+                } else if (static_cast<int64_t>(dims.size()) == static_cast<int64_t>(inType.getRank()) &&
+                           bodyName == "stablehlo.maximum") {
+                    bypassKind = IntrinsicNativeKind::kReduceMaxLastAxis;
+                } else if (static_cast<int64_t>(dims.size()) == static_cast<int64_t>(inType.getRank()) &&
+                           bodyName == "stablehlo.minimum") {
+                    bypassKind = IntrinsicNativeKind::kReduceMinLastAxis;
+                }
+                if (bypassKind != IntrinsicNativeKind::kNone && IsEligibleReduceNativeOp(op, bypassKind)) {
                     return NativeIntrinsicReduceHandler;
                 }
             }
@@ -7044,7 +7275,7 @@ bool MpsExecutable::BuildExecutionPlan() {
                                                                           feeds:feedTypes
                                                                   targetTensors:targetTensors
                                                                targetOperations:nil
-                                                          compilationDescriptor:nil];
+                                                          compilationDescriptor:GraphCompilationDescriptor()];
                             if (exec) {
                                 exec.options = MPSGraphOptionsNone;
                                 gs.executable = (void*)CFBridgingRetain(exec);
@@ -7932,7 +8163,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                 fp_has_pipeline &&
                 (fp_kind == NativeStep::BakedKind::kElementwise ||
                  fp_kind == NativeStep::BakedKind::kFusedElementwise ||
-                 fp_kind == NativeStep::BakedKind::kReduce || fp_kind == NativeStep::BakedKind::kSoftmax ||
+                 fp_kind == NativeStep::BakedKind::kReduce ||
+                 fp_kind == NativeStep::BakedKind::kReduceSplit ||
+                 fp_kind == NativeStep::BakedKind::kSoftmax ||
                  fp_kind == NativeStep::BakedKind::kGatherRows || fp_kind == NativeStep::BakedKind::kGEMM ||
                  fp_kind == NativeStep::BakedKind::kSort);
             if (fp_eligible) {
@@ -7966,9 +8199,15 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             static const bool fp_async =
                                 !EnvFlagEnabled("JAX_METALLIB_DISABLE_ASYNC_COMPLETION");
                             // Reuse CompletionEvent from thread-local pool when possible.
+                            // TryReset only checks readiness; it does NOT prove
+                            // there are no remaining observers. Only reuse when
+                            // the TLS slot is the sole owner — otherwise prior
+                            // output buffers / PJRT events would flip back to
+                            // pending or observe a later execution's error.
                             thread_local CompletionEvent tl_fp_completion;
                             CompletionEvent fp_completion;
-                            if (tl_fp_completion && tl_fp_completion->TryReset()) {
+                            if (tl_fp_completion && tl_fp_completion.use_count() == 1 &&
+                                tl_fp_completion->TryReset()) {
                                 fp_completion = tl_fp_completion;
                             } else {
                                 fp_completion = MakePendingCompletionEvent();
@@ -8071,6 +8310,41 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                     } else {
                                         [fp_enc dispatchThreads:ns_fp.baked_grid
                                             threadsPerThreadgroup:ns_fp.baked_tg];
+                                    }
+                                    fp_encoded = true;
+                                    break;
+                                }
+                                case NativeStep::BakedKind::kReduceSplit: {
+                                    // Stage 1: G threadgroups reduce column groups into partials.
+                                    [fp_enc setBuffer:fp_slot[ns_fp.input_slots[0]] offset:0 atIndex:0];
+                                    [fp_enc setBuffer:ns_fp.baked_reduce_split_partials
+                                               offset:0
+                                              atIndex:1];
+                                    [fp_enc setBytes:&ns_fp.baked_rows
+                                              length:sizeof(ns_fp.baked_rows)
+                                             atIndex:2];
+                                    [fp_enc setBytes:&ns_fp.baked_cols
+                                              length:sizeof(ns_fp.baked_cols)
+                                             atIndex:3];
+                                    [fp_enc dispatchThreadgroups:ns_fp.baked_grid
+                                           threadsPerThreadgroup:ns_fp.baked_tg];
+                                    [fp_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                                    // Stage 2: combine the G partials into the scalar output.
+                                    [fp_enc setComputePipelineState:ns_fp.baked_reduce_split_combine_pipeline];
+                                    [fp_enc setBuffer:ns_fp.baked_reduce_split_partials
+                                               offset:0
+                                              atIndex:0];
+                                    [fp_enc setBuffer:out_buf offset:0 atIndex:1];
+                                    uint32_t rows_c = 1;
+                                    uint32_t cols_c = ns_fp.baked_reduce_split_groups;
+                                    [fp_enc setBytes:&rows_c length:sizeof(rows_c) atIndex:2];
+                                    [fp_enc setBytes:&cols_c length:sizeof(cols_c) atIndex:3];
+                                    if (ns_fp.baked_reduce_split_combine_tg_dispatch) {
+                                        [fp_enc dispatchThreadgroups:ns_fp.baked_reduce_split_combine_grid
+                                               threadsPerThreadgroup:ns_fp.baked_reduce_split_combine_tg];
+                                    } else {
+                                        [fp_enc dispatchThreads:ns_fp.baked_reduce_split_combine_grid
+                                            threadsPerThreadgroup:ns_fp.baked_reduce_split_combine_tg];
                                     }
                                     fp_encoded = true;
                                     break;
@@ -8603,6 +8877,25 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             return ExecutionResult::Error("Failed to flush before CPU sort");
                         }
                     }
+                    // The flush above only commits local work; in async mode the
+                    // GPU may still be running, and inputs produced by earlier
+                    // executions are not covered by it at all. Wait for the
+                    // producers of the actual input buffers before CPU reads.
+                    for (auto slot : ns.input_slots) {
+                        if (slot >= 0 && (size_t)slot < slot_producer_events.size()) {
+                            const CompletionEvent& prod = slot_producer_events[(size_t)slot];
+                            try {
+                                AwaitCompletionEvent(prod);
+                            } catch (const std::exception& e) {
+                                return ExecutionResult::Error(std::string("CPU sort: input wait failed: ") +
+                                                              e.what());
+                            }
+                            std::string prod_err = CompletionEventError(prod);
+                            if (!prod_err.empty()) {
+                                return ExecutionResult::Error("CPU sort: input producer failed: " + prod_err);
+                            }
+                        }
+                    }
                     if (!ensure_output_buffer(ns.output_slot)) {
                         return ExecutionResult::Error("Failed to allocate CPU sort output");
                     }
@@ -8636,6 +8929,22 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             return ExecutionResult::Error("Failed to flush before CPU Cholesky");
                         }
                     }
+                    // See CPU sort above: flush does not guarantee input readiness.
+                    for (auto slot : ns.input_slots) {
+                        if (slot >= 0 && (size_t)slot < slot_producer_events.size()) {
+                            const CompletionEvent& prod = slot_producer_events[(size_t)slot];
+                            try {
+                                AwaitCompletionEvent(prod);
+                            } catch (const std::exception& e) {
+                                return ExecutionResult::Error(std::string("CPU Cholesky: input wait failed: ") +
+                                                              e.what());
+                            }
+                            std::string prod_err = CompletionEventError(prod);
+                            if (!prod_err.empty()) {
+                                return ExecutionResult::Error("CPU Cholesky: input producer failed: " + prod_err);
+                            }
+                        }
+                    }
                     if (!ensure_output_buffer(ns.output_slot)) {
                         return ExecutionResult::Error("Failed to allocate CPU Cholesky output");
                     }
@@ -8656,6 +8965,22 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                     if (ops_in_cmd > 0) {
                         if (!flush_native_cmd()) {
                             return ExecutionResult::Error("Failed to flush before CPU BLAS");
+                        }
+                    }
+                    // See CPU sort above: flush does not guarantee input readiness.
+                    for (auto slot : ns.input_slots) {
+                        if (slot >= 0 && (size_t)slot < slot_producer_events.size()) {
+                            const CompletionEvent& prod = slot_producer_events[(size_t)slot];
+                            try {
+                                AwaitCompletionEvent(prod);
+                            } catch (const std::exception& e) {
+                                return ExecutionResult::Error(std::string("CPU BLAS: input wait failed: ") +
+                                                              e.what());
+                            }
+                            std::string prod_err = CompletionEventError(prod);
+                            if (!prod_err.empty()) {
+                                return ExecutionResult::Error("CPU BLAS: input producer failed: " + prod_err);
+                            }
                         }
                     }
                     if (!ensure_output_buffer(ns.output_slot)) {
@@ -8775,6 +9100,45 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         } else {
                             [nativeComputeEncoder dispatchThreads:ns.baked_grid
                                             threadsPerThreadgroup:ns.baked_tg];
+                        }
+                        encoded = true;
+                        break;
+                    }
+                    case NativeStep::BakedKind::kReduceSplit: {
+                        if (ns.input_slots.empty()) {
+                            return ExecutionResult::Error("Baked split reduce missing input slot");
+                        }
+                        // Stage 1: G threadgroups reduce column groups into partials.
+                        [nativeComputeEncoder setBuffer:slot_bufs[ns.input_slots[0]] offset:0 atIndex:0];
+                        [nativeComputeEncoder setBuffer:ns.baked_reduce_split_partials
+                                                 offset:0
+                                                atIndex:1];
+                        [nativeComputeEncoder setBytes:&ns.baked_rows
+                                                length:sizeof(ns.baked_rows)
+                                               atIndex:2];
+                        [nativeComputeEncoder setBytes:&ns.baked_cols
+                                                length:sizeof(ns.baked_cols)
+                                               atIndex:3];
+                        [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
+                                             threadsPerThreadgroup:ns.baked_tg];
+                        [nativeComputeEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        // Stage 2: combine the G partials into the scalar output.
+                        [nativeComputeEncoder
+                            setComputePipelineState:ns.baked_reduce_split_combine_pipeline];
+                        [nativeComputeEncoder setBuffer:ns.baked_reduce_split_partials
+                                                 offset:0
+                                                atIndex:0];
+                        [nativeComputeEncoder setBuffer:slot_bufs[ns.output_slot] offset:0 atIndex:1];
+                        uint32_t rows_c = 1;
+                        uint32_t cols_c = ns.baked_reduce_split_groups;
+                        [nativeComputeEncoder setBytes:&rows_c length:sizeof(rows_c) atIndex:2];
+                        [nativeComputeEncoder setBytes:&cols_c length:sizeof(cols_c) atIndex:3];
+                        if (ns.baked_reduce_split_combine_tg_dispatch) {
+                            [nativeComputeEncoder dispatchThreadgroups:ns.baked_reduce_split_combine_grid
+                                                 threadsPerThreadgroup:ns.baked_reduce_split_combine_tg];
+                        } else {
+                            [nativeComputeEncoder dispatchThreads:ns.baked_reduce_split_combine_grid
+                                            threadsPerThreadgroup:ns.baked_reduce_split_combine_tg];
                         }
                         encoded = true;
                         break;
@@ -9140,6 +9504,35 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         ops_in_cmd = 0;
                         bytes_in_cmd = 0;
                     }
+                    if (needs_cmd && !cmdBuf) {
+                        // The dependency wait above nils cmdBuf; handlers that
+                        // encode GPU work (e.g. NativeIntrinsicReduceHandler)
+                        // require a valid command buffer, so recreate it.
+                        if (!ensure_cmd_buf()) {
+                            return ExecutionResult::Error("Failed to recreate native command buffer");
+                        }
+                    }
+                    if (needs_cmd) {
+                        // Handlers may read input buffers on the CPU; the local
+                        // commit+wait above does not cover inputs produced by
+                        // earlier asynchronous work.
+                        for (auto slot : ns.input_slots) {
+                            if (slot >= 0 && (size_t)slot < slot_producer_events.size()) {
+                                const CompletionEvent& prod = slot_producer_events[(size_t)slot];
+                                try {
+                                    AwaitCompletionEvent(prod);
+                                } catch (const std::exception& e) {
+                                    return ExecutionResult::Error(
+                                        std::string("Native handler: input wait failed: ") + e.what());
+                                }
+                                std::string prod_err = CompletionEventError(prod);
+                                if (!prod_err.empty()) {
+                                    return ExecutionResult::Error("Native handler: input producer failed: " +
+                                                                  prod_err);
+                                }
+                            }
+                        }
+                    }
                     id<MTLBuffer> output =
                         ns.handler(mtl_device, needs_cmd ? cmdBuf : nil, ns.op, input_bufs);
                     if (!output) {
@@ -9375,7 +9768,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                                feeds:feeds
                                     targetOperations:nil
                                    resultsDictionary:results
-                                 executionDescriptor:nil];
+                                 executionDescriptor:GraphExecutionDescriptor()];
                         MPS_LOG_DEBUG("  encodeToCommandBuffer returned\n");
                     } @catch (NSException* exception) {
                         return ExecutionResult::Error("MPS graph execution failed: " +

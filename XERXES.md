@@ -179,11 +179,20 @@ OperationTestConfig(jnp.cos, lambda rng: complex_standard_normal(rng, (17,), is_
 | `JAX_PLATFORMS` | — | Set to `mps` to select Metal backend |
 | `JAX_METALLIB_LIBRARY_PATH` | auto | Override dylib search path |
 | `JAX_TEST_MODE` | `compare` | `compare` / `mps` / `cpu` |
-| `MPS_LOG_LEVEL` | `1` | `0`=error, `1`=warn, `2`=info, `3`=debug |
 | `JAX_METALLIB_GEMM_TRUE_F32` | `0` | `1` disables fp32→fp16 mixed-precision GEMM |
 | `JAX_METALLIB_TRACE_PLAN` | — | Trace execution plan to stderr |
 | `JAX_METALLIB_COMPLETION_TIMEOUT_MS` | `30000` | Async completion timeout |
 | `JAX_METALLIB_AUTOTUNE_CACHE_DIR` | `~/.cache/jax-metallib` | Autotune cache directory |
+| `JAX_METALLIB_MPSGRAPH_OPT_LEVEL1` | `0` | `1` restores the old nil compilation descriptor (Level1, ANE placement; breaks f16 NaN/-0/domain edges) |
+| `JAX_METALLIB_DISABLE_CAST_FOLD_BARRIER` | `0` | `1` lets MPSGraph fold f16/bf16 cast chains under jit (skips intermediate rounding) |
+| `JAX_METALLIB_DISABLE_FUNC_INLINER` | `0` | `1` skips func.call inlining (native ops inside callees then fail) |
+| `JAX_METALLIB_DISABLE_WHILE_OUTPUT_TIE` | `0` | `1` removes the while-output tie (re-exposes the MPSGraph reduced-carry segfault) |
+| `JAX_METALLIB_JACOBI_EARLY_EXIT` | `1` | `0` runs eigh/svd Jacobi for a fixed 12 sweeps instead of stopping at convergence |
+| `JAX_METALLIB_DISABLE_POOLING_NAN_PROPAGATION` | `0` | `1` skips the extra NaN pooling pass on max/min reduce_window (~0.39 ms faster on sliding_max, but NaN inside a window is dropped) |
+
+`MPS_LOG_LEVEL` is **not** an environment variable: it is a compile-time macro in
+`src/pjrt_plugin/core/logging.h` (default `1`; `0`=error, `1`=warn, `2`=info, `3`=debug).
+Debug logs need a rebuild with `-DMPS_LOG_LEVEL=3`.
 
 Full list: 40+ tuning flags in `src/pjrt_plugin/core/mps_executable.mm` and `README.md`.
 
