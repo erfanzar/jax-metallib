@@ -15,7 +15,9 @@
 #import "pjrt_plugin/ops/registry.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <sstream>
 
 namespace jax_metallib {
@@ -179,6 +181,14 @@ bool GetScalarConstantAttr(mlir::Value value, mlir::DenseElementsAttr& outDense)
         return false;
     }
     auto* defOp = value.getDefiningOp();
+    // JAX often wraps a scalar init in a rank-0 broadcast_in_dim.
+    if (auto broadcast = mlir::dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(defOp)) {
+        auto resultType = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+        if (!resultType || resultType.getRank() != 0) {
+            return false;
+        }
+        defOp = broadcast->getOperand(0).getDefiningOp();
+    }
     auto constOp = mlir::dyn_cast_or_null<mlir::stablehlo::ConstantOp>(defOp);
     if (!constOp) {
         return false;
@@ -225,6 +235,10 @@ int64_t GetTotalElements(NSArray<NSNumber*>* shape) {
     return total;
 }
 
+static bool IsFloatForNaN(MPSDataType t) {
+    return t == MPSDataTypeFloat32 || t == MPSDataTypeFloat16 || t == MPSDataTypeBFloat16;
+}
+
 MPSGraphTensor* CreateReduction(MPSGraph* graph, MPSGraphTensor* input, NSArray<NSNumber*>* axes,
                                 const std::string& reductionType) {
     if (reductionType == "stablehlo.add") {
@@ -232,8 +246,16 @@ MPSGraphTensor* CreateReduction(MPSGraph* graph, MPSGraphTensor* input, NSArray<
     } else if (reductionType == "stablehlo.multiply") {
         return [graph reductionProductWithTensor:input axes:axes name:nil];
     } else if (reductionType == "stablehlo.maximum") {
+        // StableHLO max/min reductions propagate NaN; the plain MPSGraph
+        // reductions returned the largest finite value instead.
+        if (IsFloatForNaN(input.dataType)) {
+            return [graph reductionMaximumPropagateNaNWithTensor:input axes:axes name:nil];
+        }
         return [graph reductionMaximumWithTensor:input axes:axes name:nil];
     } else if (reductionType == "stablehlo.minimum") {
+        if (IsFloatForNaN(input.dataType)) {
+            return [graph reductionMinimumPropagateNaNWithTensor:input axes:axes name:nil];
+        }
         return [graph reductionMinimumWithTensor:input axes:axes name:nil];
     } else if (reductionType == "stablehlo.and") {
         return [graph reductionAndWithTensor:input axes:axes name:nil];
@@ -380,10 +402,8 @@ static ProcessResult HandleSingleResultReduce(HandlerContext& ctx) {
             result = [ctx.graph reductionSumWithTensor:input axes:axes name:nil];
         } else if (reductionType == "stablehlo.multiply") {
             result = [ctx.graph reductionProductWithTensor:input axes:axes name:nil];
-        } else if (reductionType == "stablehlo.maximum") {
-            result = [ctx.graph reductionMaximumWithTensor:input axes:axes name:nil];
-        } else if (reductionType == "stablehlo.minimum") {
-            result = [ctx.graph reductionMinimumWithTensor:input axes:axes name:nil];
+        } else if (reductionType == "stablehlo.maximum" || reductionType == "stablehlo.minimum") {
+            result = CreateReduction(ctx.graph, input, axes, reductionType);
         } else if (reductionType == "stablehlo.and") {
             result = [ctx.graph reductionAndWithTensor:input axes:axes name:nil];
         } else if (reductionType == "stablehlo.or") {
@@ -426,6 +446,17 @@ static ProcessResult HandleMultiResultReduce(HandlerContext& ctx) {
         return ProcessResult::Error("reduce: unsupported multi-result reduce body");
     }
 
+    // MPSNDArrayReduction asserts (aborting the process) on uint32 arg-reductions.
+    // XOR with the sign bit maps uint32 order onto int32 order; reduce there and
+    // map the value back.
+    const bool uint32Input = valueInput.dataType == MPSDataTypeUInt32;
+    MPSGraphTensor* signBit = nil;
+    if (uint32Input) {
+        signBit = [ctx.graph constantWithScalar:-2147483648.0 dataType:MPSDataTypeInt32];
+        valueInput = [ctx.graph reinterpretCastTensor:valueInput toType:MPSDataTypeInt32 name:nil];
+        valueInput = [ctx.graph bitwiseXORWithPrimaryTensor:valueInput secondaryTensor:signBit name:nil];
+    }
+
     MPSGraphTensor* valueOut = nullptr;
     MPSGraphTensor* indexOut = nullptr;
     if (kind == ArgReduceKind::kMax) {
@@ -437,6 +468,38 @@ static ProcessResult HandleMultiResultReduce(HandlerContext& ctx) {
     }
     if (!valueOut || !indexOut) {
         return ProcessResult::Error("reduce: failed to lower multi-result reduce");
+    }
+    if (uint32Input) {
+        valueOut = [ctx.graph bitwiseXORWithPrimaryTensor:valueOut secondaryTensor:signBit name:nil];
+        valueOut = [ctx.graph reinterpretCastTensor:valueOut toType:MPSDataTypeUInt32 name:nil];
+    }
+    // MPSGraph arg-reductions returned -1 when every element of the slice equals
+    // the reduction sentinel (e.g. argmin over an all-INT32_MAX column). That only
+    // happens when all elements are equal, where the first index (0) is correct.
+    MPSGraphTensor* zeroIndex = [ctx.graph constantWithScalar:0 dataType:indexOut.dataType];
+    indexOut = [ctx.graph maximumWithPrimaryTensor:indexOut secondaryTensor:zeroIndex name:nil];
+
+    // JAX argmax/argmin return the first NaN's index and a NaN value when the
+    // slice contains NaN; MPSGraph arg-reductions ignored NaN entirely.
+    if (IsFloatForNaN(valueInput.dataType)) {
+        MPSGraphTensor* nanMask = [ctx.graph isNaNWithTensor:valueInput name:nil];
+        MPSGraphTensor* nanInt = [ctx.graph castTensor:nanMask toType:MPSDataTypeInt32 name:nil];
+        MPSGraphTensor* nanIndex = [ctx.graph reductionArgMaximumWithTensor:nanInt axis:axis name:nil];
+        MPSGraphTensor* anyNaN = [ctx.graph reductionMaximumWithTensor:nanInt axis:axis name:nil];
+        MPSGraphTensor* zeroI = [ctx.graph constantWithScalar:0 dataType:MPSDataTypeInt32];
+        anyNaN = [ctx.graph greaterThanWithPrimaryTensor:anyNaN secondaryTensor:zeroI name:nil];
+        if (nanIndex.dataType != indexOut.dataType) {
+            nanIndex = [ctx.graph castTensor:nanIndex toType:indexOut.dataType name:nil];
+        }
+        indexOut = [ctx.graph selectWithPredicateTensor:anyNaN
+                                    truePredicateTensor:nanIndex
+                                   falsePredicateTensor:indexOut
+                                                   name:nil];
+        MPSGraphTensor* nanValue = [ctx.graph constantWithScalar:NAN dataType:valueOut.dataType];
+        valueOut = [ctx.graph selectWithPredicateTensor:anyNaN
+                                    truePredicateTensor:nanValue
+                                   falsePredicateTensor:valueOut
+                                                   name:nil];
     }
 
     MPSDataType valueType = GetResultMpsType(ctx.op, 0);
@@ -469,6 +532,37 @@ static ProcessResult HandleReduce(HandlerContext& ctx) {
     return HandleSingleResultReduce(ctx);
 }
 REGISTER_MPS_OP("stablehlo.reduce", HandleReduce);
+
+// MPSGraph max pooling returns the largest non-NaN value, so a NaN inside a
+// window was dropped where XLA propagates it. Max-pool a NaN indicator with the
+// same descriptor and put NaN back wherever any window element was NaN.
+// isNaN(-x) == isNaN(x), so this also works on the negated min-pooling source.
+static MPSGraphTensor* PropagatePoolingNaN(MPSGraph* g, MPSGraphTensor* pooledSource,
+                                           MPSGraphPooling2DOpDescriptor* desc, MPSGraphTensor* pooled) {
+    static const bool disabled = []() {
+        const char* v = std::getenv("JAX_METALLIB_DISABLE_POOLING_NAN_PROPAGATION");
+        return v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+    }();
+    MPSDataType st = pooledSource.dataType;
+    if (disabled || !pooled ||
+        (st != MPSDataTypeFloat32 && st != MPSDataTypeFloat16 && st != MPSDataTypeBFloat16)) {
+        return pooled;
+    }
+    // Costs one extra pooling pass (~0.39 ms on the sliding_max benches). Gating
+    // it behind an MPSGraph `if` on any(isNaN) was measured at ~3.7 ms per call,
+    // far worse, so the pass is unconditional.
+    // JAX_METALLIB_DISABLE_POOLING_NAN_PROPAGATION=1 opts out.
+    MPSGraphTensor* flag = [g castTensor:[g isNaNWithTensor:pooledSource name:nil]
+                                  toType:MPSDataTypeFloat32
+                                    name:nil];
+    MPSGraphTensor* any = [g maxPooling2DWithSourceTensor:flag descriptor:desc name:nil];
+    MPSGraphTensor* hasNaN = [g greaterThanWithPrimaryTensor:any
+                                             secondaryTensor:[g constantWithScalar:0.0
+                                                                          dataType:MPSDataTypeFloat32]
+                                                        name:nil];
+    MPSGraphTensor* nanT = [g constantWithScalar:NAN dataType:pooled.dataType];
+    return [g selectWithPredicateTensor:hasNaN truePredicateTensor:nanT falsePredicateTensor:pooled name:nil];
+}
 
 static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
     auto reduceWindowOp = mlir::dyn_cast<mlir::stablehlo::ReduceWindowOp>(ctx.op);
@@ -508,23 +602,262 @@ static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
         return ProcessResult::Error("reduce_window: invalid padding shape");
     }
 
+    std::string reducerType = GetReductionOpType(reduceWindowOp.getBody());
+
+    // base_dilation > 1 was rejected before any lowering ran. Materialise the
+    // dilated operand instead (per axis: reshape to [n,1], concat k-1 filler
+    // slots, reshape to n*k, trim to (n-1)*k+1) and continue with dilation 1.
+    // Holes hold the reducer identity for add/multiply and init for max/min,
+    // matching XLA:CPU (holes do not contribute; init is folded once).
+    bool hasBaseDilation = false;
     for (int64_t d : baseDilations) {
-        if (d != 1) {
+        hasBaseDilation = hasBaseDilation || d != 1;
+    }
+    if (hasBaseDilation) {
+        const bool isAdd = reducerType == "stablehlo.add";
+        const bool isMul = reducerType == "stablehlo.multiply";
+        const bool isExtrema = reducerType == "stablehlo.maximum" || reducerType == "stablehlo.minimum";
+        MPSGraphTensor* init = GetInputTensor(ctx, 1);
+        bool supported = (isAdd || isMul || isExtrema) && input.shape && input.shape.count == rank &&
+                         input.dataType != MPSDataTypeBool && (!isExtrema || init);
+        for (size_t d = 0; supported && d < rank; ++d) {
+            supported = baseDilations[d] >= 1 && input.shape[d].longLongValue >= 1;
+        }
+        if (!supported) {
 #if MPS_LOG_LEVEL >= 3
-            return ProcessResult::Error(
-                "reduce_window: base_dilations != 1 is unsupported (" +
-                DescribeReduceWindowPattern(reduceWindowOp, windowDimensions, windowStrides, baseDilations,
-                                            windowDilations, padding,
-                                            GetReductionOpType(reduceWindowOp.getBody())) +
-                ")");
+            return ProcessResult::Error("reduce_window: base_dilations != 1 is unsupported (" +
+                                        DescribeReduceWindowPattern(reduceWindowOp, windowDimensions,
+                                                                    windowStrides, baseDilations,
+                                                                    windowDilations, padding, reducerType) +
+                                        ")");
 #else
             return ProcessResult::Error("reduce_window: base_dilations != 1 is unsupported");
 #endif
         }
+        MPSGraphTensor* fill = nil;
+        if (isExtrema) {
+            fill = init.dataType == input.dataType
+                       ? init
+                       : [ctx.graph castTensor:init toType:input.dataType name:nil];
+        } else {
+            fill = [ctx.graph constantWithScalar:(isMul ? 1.0 : 0.0) dataType:input.dataType];
+        }
+        for (size_t d = 0; d < rank; ++d) {
+            const int64_t k = baseDilations[d];
+            if (k == 1) {
+                continue;
+            }
+            NSArray<NSNumber*>* shape = input.shape;
+            const int64_t n = shape[d].longLongValue;
+            NSMutableArray<NSNumber*>* column = [shape mutableCopy];
+            [column insertObject:@1 atIndex:d + 1];
+            NSMutableArray<NSNumber*>* holes = [shape mutableCopy];
+            [holes insertObject:@(k - 1) atIndex:d + 1];
+            NSMutableArray<NSNumber*>* spread = [shape mutableCopy];
+            spread[d] = @(n * k);
+            MPSGraphTensor* col = [ctx.graph reshapeTensor:input withShape:column name:nil];
+            MPSGraphTensor* gap = [ctx.graph broadcastTensor:fill toShape:holes name:nil];
+            MPSGraphTensor* joined = [ctx.graph concatTensors:@[col, gap]
+                                                    dimension:static_cast<NSInteger>(d + 1)
+                                                         name:nil];
+            MPSGraphTensor* flat = [ctx.graph reshapeTensor:joined withShape:spread name:nil];
+            input = [ctx.graph sliceTensor:flat
+                                 dimension:static_cast<NSUInteger>(d)
+                                     start:0
+                                    length:(n - 1) * k + 1
+                                      name:nil];
+        }
+        std::fill(baseDilations.begin(), baseDilations.end(), 1);
     }
 
-    std::string reducerType = GetReductionOpType(reduceWindowOp.getBody());
+    // Integer max/min windows: the pooling and sliding paths below are float-only
+    // (they pad with +/-inf), so integer extrema raised "unsupported pattern".
+    // Lower exactly instead: pad with the init value (StableHLO pads with init),
+    // take one strided/dilated slice per window position, and fold with max/min.
+    auto integerExtremaWindow = [&]() -> MPSGraphTensor* {
+        MPSDataType dt = input.dataType;
+        const bool isInt = dt == MPSDataTypeInt8 || dt == MPSDataTypeUInt8 || dt == MPSDataTypeInt16 ||
+                           dt == MPSDataTypeUInt16 || dt == MPSDataTypeInt32 || dt == MPSDataTypeUInt32;
+        const bool isMax = reducerType == "stablehlo.maximum";
+        if (!isInt || (!isMax && reducerType != "stablehlo.minimum") || !input.shape ||
+            input.shape.count != rank) {
+            return nil;
+        }
+        MPSGraphTensor* init = GetInputTensor(ctx, 1);
+        if (!init) {
+            return nil;
+        }
+        if (init.dataType != dt) {
+            init = [ctx.graph castTensor:init toType:dt name:nil];
+        }
+        int64_t positions = 1;
+        std::vector<int64_t> outDims(rank, 0);
+        MPSGraphTensor* padded = input;
+        for (size_t d = 0; d < rank; ++d) {
+            if (windowDimensions[d] < 1 || windowStrides[d] < 1 || windowDilations[d] < 1 ||
+                padding[d].first < 0 || padding[d].second < 0) {
+                return nil;
+            }
+            positions *= windowDimensions[d];
+            if (positions > 256) {
+                return nil;
+            }
+            int64_t size = [input.shape[d] longLongValue] + padding[d].first + padding[d].second;
+            int64_t effective = (windowDimensions[d] - 1) * windowDilations[d] + 1;
+            if (size < effective) {
+                return nil;
+            }
+            outDims[d] = (size - effective) / windowStrides[d] + 1;
+            NSMutableArray<MPSGraphTensor*>* parts = [NSMutableArray arrayWithCapacity:3];
+            auto fill = [&](int64_t count) {
+                NSMutableArray<NSNumber*>* shape = [NSMutableArray arrayWithArray:padded.shape];
+                shape[d] = @(count);
+                return [ctx.graph broadcastTensor:init toShape:shape name:nil];
+            };
+            if (padding[d].first > 0) {
+                [parts addObject:fill(padding[d].first)];
+            }
+            [parts addObject:padded];
+            if (padding[d].second > 0) {
+                [parts addObject:fill(padding[d].second)];
+            }
+            if (parts.count > 1) {
+                padded = [ctx.graph concatTensors:parts dimension:(NSInteger)d name:nil];
+            }
+        }
+        NSArray<NSNumber*>* expectedShape = GetOutputShape(ctx.op);
+        if (expectedShape) {
+            if (expectedShape.count != rank) {
+                return nil;
+            }
+            for (size_t d = 0; d < rank; ++d) {
+                if ([expectedShape[d] longLongValue] != outDims[d]) {
+                    return nil;
+                }
+            }
+        }
+        MPSGraphTensor* result = nil;
+        for (int64_t p = 0; p < positions; ++p) {
+            NSMutableArray<NSNumber*>* starts = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* ends = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* strides = [NSMutableArray arrayWithCapacity:rank];
+            std::vector<int64_t> offset(rank, 0);
+            int64_t rem = p;
+            for (size_t d = rank; d-- > 0;) {
+                offset[d] = rem % windowDimensions[d];
+                rem /= windowDimensions[d];
+            }
+            for (size_t d = 0; d < rank; ++d) {
+                int64_t start = offset[d] * windowDilations[d];
+                [starts addObject:@(start)];
+                [ends addObject:@(start + (outDims[d] - 1) * windowStrides[d] + 1)];
+                [strides addObject:@(windowStrides[d])];
+            }
+            MPSGraphTensor* slice = [ctx.graph sliceTensor:padded
+                                                    starts:starts
+                                                      ends:ends
+                                                   strides:strides
+                                                      name:nil];
+            if (!result) {
+                result = slice;
+            } else if (isMax) {
+                result = [ctx.graph maximumWithPrimaryTensor:result secondaryTensor:slice name:nil];
+            } else {
+                result = [ctx.graph minimumWithPrimaryTensor:result secondaryTensor:slice name:nil];
+            }
+        }
+        if (!result) {
+            return nil;
+        }
+        return isMax ? [ctx.graph maximumWithPrimaryTensor:result secondaryTensor:init name:nil]
+                     : [ctx.graph minimumWithPrimaryTensor:result secondaryTensor:init name:nil];
+    };
+    if (MPSGraphTensor* extrema = integerExtremaWindow()) {
+        return Result(ctx, extrema, "reduce_window");
+    }
+
+    // Pooling accumulates each window independently, avoiding float32 prefix
+    // cancellation for sums and unbounded cumulative max/min for extrema.
+    auto poolSmallRankWindow = [&](NSInteger axis, int64_t window, int64_t padLow,
+                                   int64_t padHigh) -> MPSGraphTensor* {
+        if (rank > 2 || !input.shape || input.shape.count != rank ||
+            (input.dataType != MPSDataTypeFloat16 && input.dataType != MPSDataTypeFloat32)) {
+            return nil;
+        }
+        NSArray<NSNumber*>* shape =
+            rank == 1 ? @[@1, @1, input.shape[0], @1] : @[@1, input.shape[0], input.shape[1], @1];
+        MPSGraphTensor* source = [ctx.graph reshapeTensor:input withShape:shape name:nil];
+        bool height = rank == 2 && axis == 0;
+        NSUInteger kWidth = (NSUInteger)(height ? 1 : window);
+        NSUInteger kHeight = (NSUInteger)(height ? window : 1);
+        NSUInteger left = (NSUInteger)(height ? 0 : padLow);
+        NSUInteger right = (NSUInteger)(height ? 0 : padHigh);
+        NSUInteger top = (NSUInteger)(height ? padLow : 0);
+        NSUInteger bottom = (NSUInteger)(height ? padHigh : 0);
+        if (input.dataType == MPSDataTypeFloat16 &&
+            (reducerType == "stablehlo.maximum" || reducerType == "stablehlo.minimum")) {
+            // Half-precision max pooling with right padding can shift windows
+            // to the left on MPSGraph. Extrema are exact after widening.
+            source = [ctx.graph castTensor:source toType:MPSDataTypeFloat32 name:nil];
+        }
+        MPSGraphPooling2DOpDescriptor* desc =
+            [MPSGraphPooling2DOpDescriptor descriptorWithKernelWidth:kWidth
+                                                        kernelHeight:kHeight
+                                                           strideInX:1
+                                                           strideInY:1
+                                                     dilationRateInX:1
+                                                     dilationRateInY:1
+                                                         paddingLeft:left
+                                                        paddingRight:right
+                                                          paddingTop:top
+                                                       paddingBottom:bottom
+                                                        paddingStyle:MPSGraphPaddingStyleExplicit
+                                                          dataLayout:MPSGraphTensorNamedDataLayoutNHWC];
+        if (reducerType == "stablehlo.maximum" || reducerType == "stablehlo.minimum") {
+            if (reducerType == "stablehlo.minimum") {
+                source = [ctx.graph negativeWithTensor:source name:nil];
+            }
+            MPSGraphTensor* pooled = [ctx.graph maxPooling2DWithSourceTensor:source descriptor:desc name:nil];
+            pooled = PropagatePoolingNaN(ctx.graph, source, desc, pooled);
+            if (reducerType == "stablehlo.minimum") {
+                pooled = [ctx.graph negativeWithTensor:pooled name:nil];
+            }
+            if (input.dataType == MPSDataTypeFloat16) {
+                pooled = [ctx.graph castTensor:pooled toType:input.dataType name:nil];
+            }
+            MPSGraphTensor* result = [ctx.graph reshapeTensor:pooled
+                                                    withShape:GetOutputShape(ctx.op)
+                                                         name:nil];
+            MPSGraphTensor* init = GetInputTensor(ctx, 1);
+            if (!init) {
+                return nil;
+            }
+            return reducerType == "stablehlo.maximum"
+                       ? [ctx.graph maximumWithNaNPropagationWithPrimaryTensor:result
+                                                               secondaryTensor:init
+                                                                          name:nil]
+                       : [ctx.graph minimumWithNaNPropagationWithPrimaryTensor:result
+                                                               secondaryTensor:init
+                                                                          name:nil];
+        }
+        desc.includeZeroPadToAverage = YES;
+        MPSGraphTensor* avg = [ctx.graph avgPooling2DWithSourceTensor:source descriptor:desc name:nil];
+        MPSGraphTensor* scale = [ctx.graph constantWithScalar:(double)window dataType:input.dataType];
+        MPSGraphTensor* result = [ctx.graph multiplicationWithPrimaryTensor:avg
+                                                            secondaryTensor:scale
+                                                                       name:nil];
+        result = [ctx.graph reshapeTensor:result withShape:GetOutputShape(ctx.op) name:nil];
+        if (!IsScalarZero(ctx.op->getOperand(1))) {
+            MPSGraphTensor* init = GetInputTensor(ctx, 1);
+            if (!init) {
+                return nil;
+            }
+            result = [ctx.graph additionWithPrimaryTensor:result secondaryTensor:init name:nil];
+        }
+        return result;
+    };
     NSInteger cumulativeAxis = -1;
+    bool reverseCumulative = false;
     bool patternMatches = true;
     for (size_t dim = 0; dim < rank; ++dim) {
         if (windowStrides[dim] != 1 || baseDilations[dim] != 1 || windowDilations[dim] != 1) {
@@ -536,11 +869,14 @@ static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
         int64_t padLow = padding[dim].first;
         int64_t padHigh = padding[dim].second;
         if (window > 1) {
-            if (cumulativeAxis != -1 || padLow != window - 1 || padHigh != 0) {
+            bool forward = padLow == window - 1 && padHigh == 0;
+            bool reverse = padLow == 0 && padHigh == window - 1;
+            if (cumulativeAxis != -1 || (!forward && !reverse)) {
                 patternMatches = false;
                 break;
             }
             cumulativeAxis = (NSInteger)dim;
+            reverseCumulative = reverse;
         } else if (window == 1) {
             if (padLow != 0 || padHigh != 0) {
                 patternMatches = false;
@@ -552,9 +888,94 @@ static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
         }
     }
 
+    // Sliding sums and extrema are not full-prefix reductions. Reuse the
+    // NHWC/NWC pooling route for supported high-rank spatial axes.
+    if (patternMatches && cumulativeAxis >= 0 &&
+        (reducerType == "stablehlo.add" || reducerType == "stablehlo.maximum" ||
+         reducerType == "stablehlo.minimum") &&
+        rank >= 3 && input.shape && input.shape.count == rank &&
+        ((rank == 3 && cumulativeAxis == 1) || (rank == 4 && (cumulativeAxis == 1 || cumulativeAxis == 2))) &&
+        windowDimensions[(size_t)cumulativeAxis] < [input.shape[(NSUInteger)cumulativeAxis] longLongValue]) {
+        patternMatches = false;
+    }
+
     if (cumulativeAxis < 0 || !patternMatches) {
+        // The transpose of a partial-window sum uses an unpadded VALID
+        // reduce_window. Pool single-axis rank-1/2 sums directly; other
+        // pool patterns are handled below.
+        NSInteger validSumAxis = -1;
+        bool validSum = rank <= 2 && reducerType == "stablehlo.add" && input.shape.count == rank &&
+                        IsScalarZero(ctx.op->getOperand(1));
+        for (size_t dim = 0; validSum && dim < rank; ++dim) {
+            int64_t window = windowDimensions[dim];
+            int64_t axisSize = [input.shape[dim] longLongValue];
+            if (window < 1 || window > axisSize || windowStrides[dim] != 1 || baseDilations[dim] != 1 ||
+                windowDilations[dim] != 1 || padding[dim].first != 0 || padding[dim].second != 0) {
+                validSum = false;
+            } else if (window > 1) {
+                if (validSumAxis >= 0) {
+                    validSum = false;
+                } else {
+                    validSumAxis = (NSInteger)dim;
+                }
+            }
+        }
+        if (validSum && validSumAxis >= 0) {
+            int64_t window = windowDimensions[(size_t)validSumAxis];
+            if (MPSGraphTensor* pooled = poolSmallRankWindow(validSumAxis, window, 0, 0)) {
+                return Result(ctx, pooled, "reduce_window");
+            }
+            int64_t axisSize = [input.shape[(NSUInteger)validSumAxis] longLongValue];
+            MPSGraphTensor* prefix = [ctx.graph cumulativeSumWithTensor:input axis:validSumAxis name:nil];
+            NSMutableArray<NSNumber*>* starts = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* ends = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* headEnds = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* strides = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* left = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* right = [NSMutableArray arrayWithCapacity:rank];
+            for (size_t dim = 0; dim < rank; ++dim) {
+                bool axis = dim == (size_t)validSumAxis;
+                [starts addObject:axis ? @(window - 1) : @0];
+                [ends addObject:input.shape[dim]];
+                [headEnds addObject:axis ? @(axisSize - window) : input.shape[dim]];
+                [strides addObject:@1];
+                [left addObject:axis ? @1 : @0];
+                [right addObject:@0];
+            }
+            MPSGraphTensor* result = [ctx.graph sliceTensor:prefix
+                                                     starts:starts
+                                                       ends:ends
+                                                    strides:strides
+                                                       name:nil];
+            if (axisSize > window) {
+                for (size_t dim = 0; dim < rank; ++dim) {
+                    starts[dim] = @0;
+                }
+                MPSGraphTensor* head = [ctx.graph sliceTensor:prefix
+                                                       starts:starts
+                                                         ends:headEnds
+                                                      strides:strides
+                                                         name:nil];
+                MPSGraphTensor* shifted = [ctx.graph padTensor:head
+                                               withPaddingMode:MPSGraphPaddingModeConstant
+                                                   leftPadding:left
+                                                  rightPadding:right
+                                                 constantValue:0.0
+                                                          name:nil];
+                result = [ctx.graph subtractionWithPrimaryTensor:result secondaryTensor:shifted name:nil];
+            }
+            return Result(ctx, result, "reduce_window");
+        }
 
         auto inputType = mlir::dyn_cast<mlir::RankedTensorType>(ctx.op->getOperand(0).getType());
+        bool isSpatial2DPooling =
+            (rank == 2 && inputType && inputType.getRank() == 2 && input.shape && input.shape.count == 2 &&
+             (input.dataType == MPSDataTypeFloat16 || input.dataType == MPSDataTypeFloat32) &&
+             (reducerType == "stablehlo.maximum" || reducerType == "stablehlo.minimum") &&
+             windowDimensions[0] >= 1 && windowDimensions[1] >= 1 && windowStrides[0] >= 1 &&
+             windowStrides[1] >= 1 && baseDilations[0] == 1 && baseDilations[1] == 1 &&
+             windowDilations[0] == 1 && windowDilations[1] == 1 && padding[0].first >= 0 &&
+             padding[0].second >= 0 && padding[1].first >= 0 && padding[1].second >= 0);
         bool is2DPooling =
             (rank == 4 && inputType && inputType.getRank() == 4 && windowDimensions.size() == 4 &&
              windowStrides.size() == 4 && baseDilations.size() == 4 && windowDilations.size() == 4 &&
@@ -577,18 +998,27 @@ static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
              padding[2].first == 0 && padding[2].second == 0 && padding[1].first >= 0 &&
              padding[1].second >= 0 && windowDimensions[1] >= 1 && windowStrides[1] >= 1);
 
-        if (is2DPooling || is1DPooling) {
-            int64_t kH = is2DPooling ? windowDimensions[1] : 1;
+        if (is2DPooling || is1DPooling || isSpatial2DPooling) {
+            MPSGraphTensor* init = GetInputTensor(ctx, 1);
+            if (!init) {
+                return ProcessResult::Error("reduce_window: missing pooling init tensor");
+            }
+            int64_t kH = is2DPooling ? windowDimensions[1] : isSpatial2DPooling ? windowDimensions[0] : 1;
             int64_t kW = is2DPooling ? windowDimensions[2] : windowDimensions[1];
-            int64_t sH = is2DPooling ? windowStrides[1] : 1;
+            int64_t sH = is2DPooling ? windowStrides[1] : isSpatial2DPooling ? windowStrides[0] : 1;
             int64_t sW = is2DPooling ? windowStrides[2] : windowStrides[1];
             int64_t dH = is2DPooling ? windowDilations[1] : 1;
             int64_t dW = is2DPooling ? windowDilations[2] : windowDilations[1];
-            int64_t padTop = is2DPooling ? padding[1].first : 0;
-            int64_t padBottom = is2DPooling ? padding[1].second : 0;
+            int64_t padTop = is2DPooling ? padding[1].first : isSpatial2DPooling ? padding[0].first : 0;
+            int64_t padBottom = is2DPooling ? padding[1].second : isSpatial2DPooling ? padding[0].second : 0;
             int64_t padLeft = is2DPooling ? padding[2].first : padding[1].first;
             int64_t padRight = is2DPooling ? padding[2].second : padding[1].second;
 
+            if (isSpatial2DPooling) {
+                input = [ctx.graph reshapeTensor:input
+                                       withShape:@[@1, input.shape[0], input.shape[1], @1]
+                                            name:nil];
+            }
             if (is1DPooling) {
                 if (!input.shape || input.shape.count != 3) {
                     return ProcessResult::Error("reduce_window: expected rank-3 NWC tensor for 1D pooling");
@@ -628,6 +1058,9 @@ static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
                 MPSGraphTensor* result = [ctx.graph multiplicationWithPrimaryTensor:avg
                                                                     secondaryTensor:scale
                                                                                name:nil];
+                if (!IsScalarZero(ctx.op->getOperand(1))) {
+                    result = [ctx.graph additionWithPrimaryTensor:result secondaryTensor:init name:nil];
+                }
                 NSArray<NSNumber*>* outputShape = GetOutputShape(ctx.op);
                 if (result && outputShape && ![outputShape isEqualToArray:result.shape]) {
                     result = [ctx.graph reshapeTensor:result withShape:outputShape name:nil];
@@ -635,10 +1068,21 @@ static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
                 return Result(ctx, result, "reduce_window");
             }
 
+            if (isSpatial2DPooling && input.dataType == MPSDataTypeFloat16) {
+                // Right-padded float16 max pooling can select shifted windows.
+                input = [ctx.graph castTensor:input toType:MPSDataTypeFloat32 name:nil];
+            }
             if (reducerType == "stablehlo.maximum") {
                 MPSGraphTensor* result = [ctx.graph maxPooling2DWithSourceTensor:input
                                                                       descriptor:desc
                                                                             name:nil];
+                result = PropagatePoolingNaN(ctx.graph, input, desc, result);
+                if (isSpatial2DPooling && result.dataType != init.dataType) {
+                    result = [ctx.graph castTensor:result toType:init.dataType name:nil];
+                }
+                result = [ctx.graph maximumWithNaNPropagationWithPrimaryTensor:result
+                                                               secondaryTensor:init
+                                                                          name:nil];
                 NSArray<NSNumber*>* outputShape = GetOutputShape(ctx.op);
                 if (result && outputShape && ![outputShape isEqualToArray:result.shape]) {
                     result = [ctx.graph reshapeTensor:result withShape:outputShape name:nil];
@@ -659,13 +1103,166 @@ static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
                 MPSGraphTensor* pooled = [ctx.graph maxPooling2DWithSourceTensor:neg
                                                                       descriptor:desc
                                                                             name:nil];
+                pooled = PropagatePoolingNaN(ctx.graph, neg, desc, pooled);
                 MPSGraphTensor* result = [ctx.graph negativeWithTensor:pooled name:nil];
+                if (isSpatial2DPooling && result.dataType != init.dataType) {
+                    result = [ctx.graph castTensor:result toType:init.dataType name:nil];
+                }
+                result = [ctx.graph minimumWithNaNPropagationWithPrimaryTensor:result
+                                                               secondaryTensor:init
+                                                                          name:nil];
                 NSArray<NSNumber*>* outputShape = GetOutputShape(ctx.op);
                 if (result && outputShape && ![outputShape isEqualToArray:result.shape]) {
                     result = [ctx.graph reshapeTensor:result withShape:outputShape name:nil];
                 }
                 return Result(ctx, result, "reduce_window");
             }
+        }
+
+        // General fallback for strided / dilated / multi-axis windows that no
+        // path above handles (strided moving sums and products at any rank,
+        // rank-1 strided max/min were rejected as "unsupported pattern").
+        // StableHLO semantics exactly: pad with the init value, take one
+        // strided/dilated slice per window position, fold with the reducer,
+        // then fold in init once. 8-bit add/multiply widen to int32 (MPSGraph
+        // saturates 8-bit arithmetic); f16/bf16 add/multiply accumulate in
+        // f32; float max/min propagate NaN. Bounded to 256 window positions.
+        auto generalWindowFold = [&]() -> MPSGraphTensor* {
+            const bool isAdd = reducerType == "stablehlo.add";
+            const bool isMul = reducerType == "stablehlo.multiply";
+            const bool isMax = reducerType == "stablehlo.maximum";
+            const bool isMin = reducerType == "stablehlo.minimum";
+            if (!(isAdd || isMul || isMax || isMin) || !input.shape || input.shape.count != rank) {
+                return nil;
+            }
+            const MPSDataType dt = input.dataType;
+            const bool isHalf = dt == MPSDataTypeFloat16 || dt == MPSDataTypeBFloat16;
+            const bool isFloat = dt == MPSDataTypeFloat32 || isHalf;
+            const bool isNarrowInt = dt == MPSDataTypeInt8 || dt == MPSDataTypeUInt8;
+            const bool isInt = isNarrowInt || dt == MPSDataTypeInt16 || dt == MPSDataTypeUInt16 ||
+                               dt == MPSDataTypeInt32 || dt == MPSDataTypeUInt32;
+            if (!isFloat && !isInt) {
+                return nil;
+            }
+            MPSGraphTensor* init = GetInputTensor(ctx, 1);
+            if (!init) {
+                return nil;
+            }
+            if (init.dataType != dt) {
+                init = [ctx.graph castTensor:init toType:dt name:nil];
+            }
+            MPSDataType work = dt;
+            if ((isAdd || isMul) && isHalf) {
+                work = MPSDataTypeFloat32;
+            } else if ((isAdd || isMul) && isNarrowInt) {
+                work = MPSDataTypeInt32;
+            }
+            MPSGraphTensor* src = work == dt ? input : [ctx.graph castTensor:input toType:work name:nil];
+            MPSGraphTensor* initW = work == dt ? init : [ctx.graph castTensor:init toType:work name:nil];
+
+            // XLA:CPU skips padded positions (identity), then folds init once;
+            // for max/min padding with init is equivalent after that fold.
+            MPSGraphTensor* padValue =
+                (isAdd || isMul) ? [ctx.graph constantWithScalar:(isAdd ? 0.0 : 1.0) dataType:work] : initW;
+            int64_t positions = 1;
+            std::vector<int64_t> outDims(rank, 0);
+            MPSGraphTensor* padded = src;
+            for (size_t d = 0; d < rank; ++d) {
+                if (windowDimensions[d] < 1 || windowStrides[d] < 1 || windowDilations[d] < 1 ||
+                    padding[d].first < 0 || padding[d].second < 0) {
+                    return nil;
+                }
+                positions *= windowDimensions[d];
+                if (positions > 256) {
+                    return nil;
+                }
+                int64_t size = [src.shape[d] longLongValue] + padding[d].first + padding[d].second;
+                int64_t effective = (windowDimensions[d] - 1) * windowDilations[d] + 1;
+                if (size < effective) {
+                    return nil;
+                }
+                outDims[d] = (size - effective) / windowStrides[d] + 1;
+                NSMutableArray<MPSGraphTensor*>* parts = [NSMutableArray arrayWithCapacity:3];
+                auto fill = [&](int64_t count) {
+                    NSMutableArray<NSNumber*>* shape = [NSMutableArray arrayWithArray:padded.shape];
+                    shape[d] = @(count);
+                    return [ctx.graph broadcastTensor:padValue toShape:shape name:nil];
+                };
+                if (padding[d].first > 0) {
+                    [parts addObject:fill(padding[d].first)];
+                }
+                [parts addObject:padded];
+                if (padding[d].second > 0) {
+                    [parts addObject:fill(padding[d].second)];
+                }
+                if (parts.count > 1) {
+                    padded = [ctx.graph concatTensors:parts dimension:(NSInteger)d name:nil];
+                }
+            }
+            NSArray<NSNumber*>* expectedShape = GetOutputShape(ctx.op);
+            if (expectedShape) {
+                if (expectedShape.count != rank) {
+                    return nil;
+                }
+                for (size_t d = 0; d < rank; ++d) {
+                    if ([expectedShape[d] longLongValue] != outDims[d]) {
+                        return nil;
+                    }
+                }
+            }
+            auto combine = [&](MPSGraphTensor* a, MPSGraphTensor* b) -> MPSGraphTensor* {
+                if (isAdd) {
+                    return [ctx.graph additionWithPrimaryTensor:a secondaryTensor:b name:nil];
+                }
+                if (isMul) {
+                    return [ctx.graph multiplicationWithPrimaryTensor:a secondaryTensor:b name:nil];
+                }
+                if (isMax) {
+                    return isFloat ? [ctx.graph maximumWithNaNPropagationWithPrimaryTensor:a
+                                                                           secondaryTensor:b
+                                                                                      name:nil]
+                                   : [ctx.graph maximumWithPrimaryTensor:a secondaryTensor:b name:nil];
+                }
+                return isFloat ? [ctx.graph minimumWithNaNPropagationWithPrimaryTensor:a
+                                                                       secondaryTensor:b
+                                                                                  name:nil]
+                               : [ctx.graph minimumWithPrimaryTensor:a secondaryTensor:b name:nil];
+            };
+            MPSGraphTensor* result = nil;
+            for (int64_t p = 0; p < positions; ++p) {
+                NSMutableArray<NSNumber*>* starts = [NSMutableArray arrayWithCapacity:rank];
+                NSMutableArray<NSNumber*>* ends = [NSMutableArray arrayWithCapacity:rank];
+                NSMutableArray<NSNumber*>* strides = [NSMutableArray arrayWithCapacity:rank];
+                std::vector<int64_t> offset(rank, 0);
+                int64_t rem = p;
+                for (size_t d = rank; d-- > 0;) {
+                    offset[d] = rem % windowDimensions[d];
+                    rem /= windowDimensions[d];
+                }
+                for (size_t d = 0; d < rank; ++d) {
+                    int64_t start = offset[d] * windowDilations[d];
+                    [starts addObject:@(start)];
+                    [ends addObject:@(start + (outDims[d] - 1) * windowStrides[d] + 1)];
+                    [strides addObject:@(windowStrides[d])];
+                }
+                MPSGraphTensor* slice = [ctx.graph sliceTensor:padded
+                                                        starts:starts
+                                                          ends:ends
+                                                       strides:strides
+                                                          name:nil];
+                result = result ? combine(result, slice) : slice;
+            }
+            if (!result) {
+                return nil;
+            }
+            result = combine(result, initW);
+            if (work != dt) {
+                result = [ctx.graph castTensor:result toType:dt name:nil];
+            }
+            return result;
+        };
+        if (MPSGraphTensor* folded = generalWindowFold()) {
+            return Result(ctx, folded, "reduce_window");
         }
 
         return ProcessResult::Error("reduce_window: unsupported pattern (" +
@@ -675,6 +1272,91 @@ static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
                                     ")");
     }
 
+    int64_t window = windowDimensions[(size_t)cumulativeAxis];
+    int64_t axisSize = [input.shape[(NSUInteger)cumulativeAxis] longLongValue];
+    if (window < axisSize && (reducerType == "stablehlo.maximum" || reducerType == "stablehlo.minimum")) {
+        if (MPSGraphTensor* pooled =
+                poolSmallRankWindow(cumulativeAxis, window, padding[(size_t)cumulativeAxis].first,
+                                    padding[(size_t)cumulativeAxis].second)) {
+            return Result(ctx, pooled, "reduce_window");
+        }
+    }
+    if (window < axisSize && (reducerType == "stablehlo.multiply" || reducerType == "stablehlo.maximum" ||
+                              reducerType == "stablehlo.minimum")) {
+        // A bounded window is not a cumulative reduction. Materialize the small
+        // windows directly; max/min cannot be undone from a cumulative prefix,
+        // and dividing cumulative products is incorrect when an input is zero.
+        if (window > 32 || (input.dataType != MPSDataTypeFloat16 && input.dataType != MPSDataTypeFloat32)) {
+            return ProcessResult::Error(
+                "reduce_window: sliding multiply/max/min requires a float window <= 32");
+        }
+        double padValue = reducerType == "stablehlo.multiply"  ? 1.0
+                          : reducerType == "stablehlo.maximum" ? -INFINITY
+                                                               : INFINITY;
+        NSMutableArray<NSNumber*>* left = [NSMutableArray arrayWithCapacity:rank];
+        NSMutableArray<NSNumber*>* right = [NSMutableArray arrayWithCapacity:rank];
+        for (size_t dim = 0; dim < rank; ++dim) {
+            [left addObject:dim == (size_t)cumulativeAxis ? @(padding[dim].first) : @0];
+            [right addObject:dim == (size_t)cumulativeAxis ? @(padding[dim].second) : @0];
+        }
+        MPSGraphTensor* padded = [ctx.graph padTensor:input
+                                      withPaddingMode:MPSGraphPaddingModeConstant
+                                          leftPadding:left
+                                         rightPadding:right
+                                        constantValue:padValue
+                                                 name:nil];
+        MPSGraphTensor* result = nil;
+        for (int64_t offset = 0; offset < window; ++offset) {
+            NSMutableArray<NSNumber*>* starts = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* ends = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* strides = [NSMutableArray arrayWithCapacity:rank];
+            for (size_t dim = 0; dim < rank; ++dim) {
+                [starts addObject:dim == (size_t)cumulativeAxis ? @(offset) : @0];
+                [ends addObject:dim == (size_t)cumulativeAxis ? @(offset + axisSize) : input.shape[dim]];
+                [strides addObject:@1];
+            }
+            MPSGraphTensor* next = [ctx.graph sliceTensor:padded
+                                                   starts:starts
+                                                     ends:ends
+                                                  strides:strides
+                                                     name:nil];
+            if (!result) {
+                result = next;
+            } else if (reducerType == "stablehlo.multiply") {
+                result = [ctx.graph multiplicationWithPrimaryTensor:result secondaryTensor:next name:nil];
+            } else if (reducerType == "stablehlo.maximum") {
+                result = [ctx.graph maximumWithPrimaryTensor:result secondaryTensor:next name:nil];
+            } else {
+                result = [ctx.graph minimumWithPrimaryTensor:result secondaryTensor:next name:nil];
+            }
+        }
+        MPSGraphTensor* init = GetInputTensor(ctx, 1);
+        if (!init) {
+            return ProcessResult::Error("reduce_window: missing sliding init tensor");
+        }
+        if (reducerType == "stablehlo.multiply") {
+            result = [ctx.graph multiplicationWithPrimaryTensor:result secondaryTensor:init name:nil];
+        } else if (reducerType == "stablehlo.maximum") {
+            result = [ctx.graph maximumWithPrimaryTensor:result secondaryTensor:init name:nil];
+        } else {
+            result = [ctx.graph minimumWithPrimaryTensor:result secondaryTensor:init name:nil];
+        }
+        return Result(ctx, result, "reduce_window");
+    }
+    if (reducerType == "stablehlo.add") {
+        int64_t axisSize = [input.shape[(NSUInteger)cumulativeAxis] longLongValue];
+        if (window < axisSize) {
+            if (MPSGraphTensor* pooled =
+                    poolSmallRankWindow(cumulativeAxis, window, padding[(size_t)cumulativeAxis].first,
+                                     padding[(size_t)cumulativeAxis].second)) {
+                return Result(ctx, pooled, "reduce_window");
+            }
+        }
+    }
+    NSArray<NSNumber*>* axes = @[@(cumulativeAxis)];
+    if (reverseCumulative) {
+        input = [ctx.graph reverseTensor:input axes:axes name:nil];
+    }
     MPSGraphTensor* result = nullptr;
     if (reducerType == "stablehlo.add") {
         result = [ctx.graph cumulativeSumWithTensor:input axis:cumulativeAxis name:nil];
@@ -692,6 +1374,56 @@ static ProcessResult HandleReduceWindow(HandlerContext& ctx) {
                                     ")");
     }
 
+    if (result && reducerType == "stablehlo.add") {
+        // A window smaller than the axis is a sliding sum, not a full
+        // cumulative sum: subtract the prefix that has left the window.
+        int64_t window = windowDimensions[static_cast<size_t>(cumulativeAxis)];
+        int64_t axisSize = [input.shape[(NSUInteger)cumulativeAxis] longLongValue];
+        if (window < axisSize) {
+            NSMutableArray<NSNumber*>* starts = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* ends = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* strides = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* left = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* right = [NSMutableArray arrayWithCapacity:rank];
+            for (size_t dim = 0; dim < rank; ++dim) {
+                [starts addObject:@0];
+                [ends addObject:dim == (size_t)cumulativeAxis ? @(axisSize - window) : input.shape[dim]];
+                [strides addObject:@1];
+                [left addObject:dim == (size_t)cumulativeAxis ? @(window) : @0];
+                [right addObject:@0];
+            }
+            MPSGraphTensor* prefix = [ctx.graph sliceTensor:result
+                                                     starts:starts
+                                                       ends:ends
+                                                    strides:strides
+                                                       name:nil];
+            MPSGraphTensor* shifted = [ctx.graph padTensor:prefix
+                                           withPaddingMode:MPSGraphPaddingModeConstant
+                                               leftPadding:left
+                                              rightPadding:right
+                                             constantValue:0.0
+                                                      name:nil];
+            result = [ctx.graph subtractionWithPrimaryTensor:result secondaryTensor:shifted name:nil];
+        }
+    }
+    if (result && reverseCumulative) {
+        result = [ctx.graph reverseTensor:result axes:axes name:nil];
+    }
+    if (result && (reducerType != "stablehlo.add" || !IsScalarZero(ctx.op->getOperand(1)))) {
+        MPSGraphTensor* init = GetInputTensor(ctx, 1);
+        if (!init) {
+            return ProcessResult::Error("reduce_window: missing init tensor");
+        }
+        if (reducerType == "stablehlo.add") {
+            result = [ctx.graph additionWithPrimaryTensor:result secondaryTensor:init name:nil];
+        } else if (reducerType == "stablehlo.multiply") {
+            result = [ctx.graph multiplicationWithPrimaryTensor:result secondaryTensor:init name:nil];
+        } else if (reducerType == "stablehlo.maximum") {
+            result = [ctx.graph maximumWithPrimaryTensor:result secondaryTensor:init name:nil];
+        } else if (reducerType == "stablehlo.minimum") {
+            result = [ctx.graph minimumWithPrimaryTensor:result secondaryTensor:init name:nil];
+        }
+    }
     NSArray<NSNumber*>* outputShape = GetOutputShape(ctx.op);
     if (result && outputShape && ![outputShape isEqualToArray:result.shape]) {
         result = [ctx.graph reshapeTensor:result withShape:outputShape name:nil];
@@ -778,8 +1510,10 @@ static ProcessResult HandleSelectAndScatter(HandlerContext& ctx) {
     size_t rank = windowDimensions.size();
     bool isNHWC = (rank == 4 && windowStrides.size() == 4);
     bool isNWC = (rank == 3 && windowStrides.size() == 3);
-    if (!isNHWC && !isNWC) {
-        return ProcessResult::Error("select_and_scatter: only rank-4 NHWC or rank-3 NWC is supported");
+    bool isSpatialOnly = (rank == 1 || rank == 2) && windowStrides.size() == rank;
+    if (!isNHWC && !isNWC && !isSpatialOnly) {
+        return ProcessResult::Error(
+            "select_and_scatter: expected rank-1/2 spatial, rank-3 NWC, or rank-4 NHWC");
     }
 
     std::vector<std::pair<int64_t, int64_t>> padding;
@@ -819,7 +1553,7 @@ static ProcessResult HandleSelectAndScatter(HandlerContext& ctx) {
         padBottom = padding[1].second;
         padLeft = padding[2].first;
         padRight = padding[2].second;
-    } else {
+    } else if (isNWC) {
 
         if (windowDimensions[0] != 1 || windowDimensions[2] != 1 || windowStrides[0] != 1 ||
             windowStrides[2] != 1 || padding[0].first != 0 || padding[0].second != 0 ||
@@ -850,6 +1584,33 @@ static ProcessResult HandleSelectAndScatter(HandlerContext& ctx) {
         padBottom = 0;
         padLeft = padding[1].first;
         padRight = padding[1].second;
+    } else {
+        if (!operand.shape || operand.shape.count != rank || !source.shape || source.shape.count != rank) {
+            return ProcessResult::Error("select_and_scatter: rank-1/2 tensor shapes unavailable");
+        }
+        for (size_t dim = 0; dim < rank; ++dim) {
+            if (windowDimensions[dim] <= 0 || windowStrides[dim] <= 0 || padding[dim].first < 0 ||
+                padding[dim].second < 0) {
+                return ProcessResult::Error("select_and_scatter: unsupported rank-1/2 pooling parameters");
+            }
+        }
+        NSArray<NSNumber*>* operandShape =
+            rank == 1 ? @[@1, @1, operand.shape[0], @1] : @[@1, operand.shape[0], operand.shape[1], @1];
+        NSArray<NSNumber*>* sourceShape =
+            rank == 1 ? @[@1, @1, source.shape[0], @1] : @[@1, source.shape[0], source.shape[1], @1];
+        operand = [ctx.graph reshapeTensor:operand withShape:operandShape name:nil];
+        source = [ctx.graph reshapeTensor:source withShape:sourceShape name:nil];
+        size_t widthDim = rank - 1;
+        kW = windowDimensions[widthDim];
+        sW = windowStrides[widthDim];
+        padLeft = padding[widthDim].first;
+        padRight = padding[widthDim].second;
+        if (rank == 2) {
+            kH = windowDimensions[0];
+            sH = windowStrides[0];
+            padTop = padding[0].first;
+            padBottom = padding[0].second;
+        }
     }
 
     MPSGraphPooling2DOpDescriptor* desc =
