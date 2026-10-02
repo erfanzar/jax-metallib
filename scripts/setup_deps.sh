@@ -18,6 +18,11 @@ set -e
 PREFIX="${PREFIX:-$HOME/.local/jax-metallib-deps}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 BUILD_DIR="${BUILD_DIR:-/tmp/jax-metallib-deps-build}"
+# CMake reads this as the default CMAKE_OSX_DEPLOYMENT_TARGET for every dep build
+# below. Without it the static deps target the host OS (ld warned "built for newer
+# macOS version (26.0) than being linked (15.0)" when linking the 15.0 plugin).
+# Keep in sync with CMAKE_OSX_DEPLOYMENT_TARGET in CMakeLists.txt.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
 # Pin to versions matching jaxlib 0.11.1 for bytecode compatibility
 # These are extracted from:

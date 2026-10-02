@@ -48,7 +48,7 @@ wheel.install-dir = "jax_plugins/silicon"
 
 [tool.cibuildwheel]
 build = ["cp312-macosx_arm64", "cp313-macosx_arm64"]
-environment = { CMAKE_PREFIX_PATH = "$HOME/.local/jax-metallib-deps" }
+environment = { CMAKE_PREFIX_PATH = "$HOME/.local/jax-metallib-deps", MACOSX_DEPLOYMENT_TARGET = "15.0" }
 before-all = "./scripts/setup_deps.sh"
 
 [tool.uv.sources]
