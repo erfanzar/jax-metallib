@@ -1,0 +1,107 @@
+# Hosted CI. GitHub-hosted macOS runners expose no Metal device, so the
+# CPU-vs-MPS test suite cannot run here; it stays a local gate (see
+# CONTRIBUTING.md). This workflow checks what a runner can check:
+#   lint  - ruff / clang-format on the lines a change touches
+#           (scripts/ci_lint_changed.sh explains why not whole-repo);
+#   wheel - builds the deps (cached) and the wheel, then checks the wheel's
+#           tag, dylib minos, exports, linkage and a clean-venv import
+#           (scripts/ci_check_wheel.sh).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install pinned linters
+        run: python -m pip install ruff==0.14.13 clang-format==21.1.8
+      - name: Lint changed files
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          base="${PR_BASE:-$PUSH_BEFORE}"
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base=$(git rev-parse HEAD~1)
+          fi
+          scripts/ci_lint_changed.sh "$base"
+
+  wheel:
+    # Xcode 26+ is required: mps_executable.mm uses MTLLanguageVersion4_0
+    # behind @available(macOS 26.0, *), which older SDKs do not declare.
+    runs-on: macos-26
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    env:
+      DEPS_PREFIX: ${{ github.workspace }}/../jax-metallib-deps
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check SDK
+        id: sdk
+        run: |
+          v=$(xcrun --show-sdk-version)
+          echo "macOS SDK $v"
+          if [ "${v%%.*}" -lt 26 ]; then
+            echo "::error::macOS SDK $v < 26; the plugin needs Xcode 26+ (MTLLanguageVersion4_0)"
+            exit 1
+          fi
+          echo "major=${v%%.*}" >> "$GITHUB_OUTPUT"
+      - name: Install build tools
+        run: brew install cmake ninja
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+      # The whole prefix is cached (~2.5 GB): the plugin build runs protoc and
+      # the MLIR CMake config references tools under bin/, so lib/ and include/
+      # alone are not enough.
+      - name: Restore dependency cache
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPS_PREFIX }}
+          key: deps-macos-arm64-sdk${{ steps.sdk.outputs.major }}-dt15.0-${{ hashFiles('scripts/setup_deps.sh') }}
+      - name: Build LLVM/MLIR, StableHLO, Abseil, Protobuf
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: PREFIX="$DEPS_PREFIX" JOBS=$(sysctl -n hw.ncpu) ./scripts/setup_deps.sh
+      - name: Build wheel
+        env:
+          CMAKE_PREFIX_PATH: ${{ env.DEPS_PREFIX }}
+          SKBUILD_CMAKE_DEFINE: JAX_METALLIB_DEPS_PREFIX=${{ env.DEPS_PREFIX }}
+        run: uv build --wheel --python "${{ matrix.python }}" --out-dir dist
+      - name: Check wheel
+        run: PYTHON="$(which python)" scripts/ci_check_wheel.sh dist/*.whl 15.0
+      - name: Probe for a Metal device (informational)
+        continue-on-error: true
+        run: |
+          python -m pip install --quiet dist/*.whl
+          cd "$RUNNER_TEMP"
+          JAX_PLATFORMS=mps python -c 'import jax; print(jax.devices("mps"))'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
