@@ -198,10 +198,20 @@ std::unique_ptr<MpsBuffer> MpsClient::BufferFromHostBuffer(const void* data, int
     id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)metal_device_;
     id<MTLBuffer> buffer = nil;
 
-    // Zero-element tensors (e.g. shape [0] or [5,0,3]) are valid in JAX/XLA.
-    // Metal doesn't allow zero-length buffers, so allocate a 4-byte placeholder.
+    // Zero-element tensors (e.g. shape [0] or [5,0,3]) are valid in JAX/XLA. Metal rejects
+    // zero-length buffers and MPSNDArray binds them as if each zero dim were 1, so allocate a
+    // zeroed placeholder of that size. The host array is empty: copy nothing from `data`.
     if (byte_size == 0) {
-        byte_size = 4;
+        buffer = [mtl_device newBufferWithLength:ZeroElementPlaceholderBytes(dtype, dims)
+                                         options:MTLResourceStorageModeShared];
+        if (!buffer) {
+            NSLog(@"Failed to create zero-element Metal placeholder buffer");
+            return nullptr;
+        }
+        auto empty = std::make_unique<MpsBuffer>(device ? device : devices_[0].get(), (__bridge void*)buffer,
+                                                 dtype, dims);
+        CFRelease((__bridge CFTypeRef)buffer);
+        return empty;
     }
 
     const bool contiguous = IsContiguous(dims, byte_strides, element_size);
@@ -295,7 +305,7 @@ std::unique_ptr<MpsBuffer> MpsClient::CreateUninitializedBuffer(int dtype, const
     size_t byte_size = element_count * element_size;
 
     if (byte_size == 0) {
-        byte_size = 1;
+        byte_size = ZeroElementPlaceholderBytes(dtype, dims);
     }
 
     id<MTLDevice> mtl_device = (__bridge id<MTLDevice>)metal_device_;

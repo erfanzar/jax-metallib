@@ -329,6 +329,20 @@ static bool IntrinsicNativeKernelsEnabled() {
     return EnvFlagEnabled("JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS");
 }
 
+// Full last-axis softmax (reduce_max -> sub -> exp -> reduce_sum -> div) is
+// fused and routed to the standalone softmax kernel even when the intrinsic
+// family is off: it does not use the fused elementwise-chain machinery where
+// the known defects live, and MPSGraph softmax was ~3.7x slower at
+// [4096,4096]. Fusion and routing must stay enabled together: a fused
+// reduce_max reaching MPSGraph has the wrong shape.
+// JAX_METALLIB_DISABLE_STANDALONE_SOFTMAX=1 restores the graph path.
+static bool StandaloneSoftmaxEnabled() {
+    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_SOFTMAX_FUSION")) {
+        return false;
+    }
+    return IntrinsicNativeKernelsEnabled() || !EnvFlagEnabled("JAX_METALLIB_DISABLE_STANDALONE_SOFTMAX");
+}
+
 static int EnvIntValue(const char* name, int default_value) {
     const char* v = std::getenv(name);
     if (!v || v[0] == '\0') {
@@ -425,7 +439,14 @@ static MTLResourceOptions ComputeBufferResourceOptions() {
                                      ? MTLResourceStorageModePrivate
                                      : MTLResourceStorageModeShared;
 
-        if (!EnvFlagEnabled("JAX_METALLIB_ENABLE_HAZARD_TRACKING")) {
+        // Untracked buffers let a native kernel read a slot while an MPSGraph
+        // step on the same command buffer was still writing it: a >=4-op graph
+        // chain feeding the native last-axis reduce returned zero rows at
+        // ~16M elements (f16 softmax [4096,4096] gave NaN). Tracking measured
+        // no cost (9 workloads within noise), so it is the default now;
+        // JAX_METALLIB_DISABLE_HAZARD_TRACKING=1 restores untracked buffers.
+        if (EnvFlagEnabled("JAX_METALLIB_DISABLE_HAZARD_TRACKING") &&
+            !EnvFlagEnabled("JAX_METALLIB_ENABLE_HAZARD_TRACKING")) {
             opt |= MTLResourceHazardTrackingModeUntracked;
         }
         return opt;
@@ -1129,6 +1150,25 @@ static void FuseReduceMeanPatterns(mlir::Block& block) {
     }
 }
 
+// JAX's f16 softmax widens exp to f32 for the row sum and narrows the sum
+// back to f16 before the divide. It is fused into softmax_full_f16_xla_tg,
+// which reproduces XLA:CPU's rounding points bit for bit (MPSGraph's fused
+// sub->exp skipped the f16 rounding of x - max: up to 9 ulp off).
+// JAX_METALLIB_DISABLE_F16_WIDENED_SOFTMAX_FUSION=1 keeps the graph path.
+static bool F16WidenedSoftmaxFusionEnabled() {
+    static const bool enabled = !EnvFlagEnabled("JAX_METALLIB_DISABLE_F16_WIDENED_SOFTMAX_FUSION");
+    return enabled;
+}
+
+static bool IsZeroFloatSplat(mlir::Value v) {
+    auto c = v.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!c) {
+        return false;
+    }
+    auto attr = mlir::dyn_cast<mlir::DenseFPElementsAttr>(c.getValue());
+    return attr && attr.isSplat() && attr.getSplatValue<llvm::APFloat>().isZero();
+}
+
 static mlir::Value TraceBroadcastChain(mlir::Value start, llvm::SmallVectorImpl<mlir::Operation*>& absorbed) {
     mlir::Value cur = start;
     for (int step = 0; step < 8; ++step) {
@@ -1547,9 +1587,116 @@ static void FuseLayerNormPatterns(mlir::Block& block) {
     }
 }
 
+// The softmax matchers follow a last-axis reduce_max / reduce_sum result through
+// broadcast_in_dim / reshape / broadcast (and elementwise max / convert) back to
+// the input shape. The native kernel reduces and rebroadcasts along the last
+// axis, so the chain must put every leading input axis back where it came from.
+// Without this check x - max(x, axis=1)[None, :] on a square input was fused as
+// a row softmax (relative error ~6e2 vs CPU at n=1024). Axes of extent 1 are
+// not tracked: where they land cannot change any value.
+static bool BroadcastChainRestoresLeadingAxes(mlir::Value reduced, mlir::Value end) {
+    auto redType = mlir::dyn_cast<mlir::RankedTensorType>(reduced.getType());
+    auto endType = mlir::dyn_cast<mlir::RankedTensorType>(end.getType());
+    if (!redType || !endType || !redType.hasStaticShape() || !endType.hasStaticShape() ||
+        endType.getRank() != redType.getRank() + 1) {
+        return false;
+    }
+    // pos[k]: current axis of reduced axis k, or -1 when it has extent 1.
+    llvm::SmallVector<int64_t, 8> pos;
+    for (int64_t k = 0; k < redType.getRank(); ++k) {
+        pos.push_back(redType.getDimSize(k) == 1 ? -1 : k);
+    }
+    mlir::Value cur = reduced;
+    for (int step = 0; step < 32 && cur != end; ++step) {
+        if (!cur.hasOneUse()) {
+            return false;
+        }
+        mlir::Operation* user = *cur.getUsers().begin();
+        auto inT = mlir::dyn_cast<mlir::RankedTensorType>(cur.getType());
+        auto outT = mlir::dyn_cast<mlir::RankedTensorType>(user->getResult(0).getType());
+        if (!inT || !outT || !inT.hasStaticShape() || !outT.hasStaticShape()) {
+            return false;
+        }
+        if (auto bc = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(user)) {
+            auto dims = bc.getBroadcastDimensions();
+            for (int64_t& p : pos) {
+                if (p < 0) {
+                    continue;
+                }
+                if (p >= static_cast<int64_t>(dims.size())) {
+                    return false;
+                }
+                p = dims[p];
+            }
+        } else if (mlir::isa<mlir::stablehlo::BroadcastOp>(user)) {
+            const int64_t added = outT.getRank() - inT.getRank();
+            if (added < 0) {
+                return false;
+            }
+            for (int64_t& p : pos) {
+                if (p >= 0) {
+                    p += added;
+                }
+            }
+        } else if (mlir::isa<mlir::stablehlo::ReshapeOp>(user)) {
+            // Only reshapes that add or drop size-1 axes (non-1 extents keep their order).
+            llvm::SmallVector<int64_t, 8> inAxes;
+            llvm::SmallVector<int64_t, 8> outAxes;
+            for (int64_t a = 0; a < inT.getRank(); ++a) {
+                if (inT.getDimSize(a) != 1) {
+                    inAxes.push_back(a);
+                }
+            }
+            for (int64_t a = 0; a < outT.getRank(); ++a) {
+                if (outT.getDimSize(a) != 1) {
+                    outAxes.push_back(a);
+                }
+            }
+            if (inAxes.size() != outAxes.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < inAxes.size(); ++i) {
+                if (inT.getDimSize(inAxes[i]) != outT.getDimSize(outAxes[i])) {
+                    return false;
+                }
+            }
+            for (int64_t& p : pos) {
+                if (p < 0) {
+                    continue;
+                }
+                auto it = llvm::find(inAxes, p);
+                if (it == inAxes.end()) {
+                    return false;
+                }
+                p = outAxes[static_cast<size_t>(it - inAxes.begin())];
+            }
+        } else if (mlir::isa<mlir::stablehlo::MaxOp, mlir::stablehlo::ConvertOp>(user)) {
+            if (inT.getShape() != outT.getShape()) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        cur = user->getResult(0);
+    }
+    if (cur != end) {
+        return false;
+    }
+    for (int64_t k = 0; k < static_cast<int64_t>(pos.size()); ++k) {
+        if (pos[k] >= 0 && pos[k] != k) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool IsSoftmaxPattern(mlir::Operation* reduceMaxOp,
                              llvm::SmallVectorImpl<mlir::Operation*>& absorbed_ops,
-                             mlir::Value& softmax_input, mlir::Value& final_result) {
+                             mlir::Value& softmax_input, mlir::Value& final_result,
+                             bool* widenedF16Out = nullptr) {
+    if (widenedF16Out) {
+        *widenedF16Out = false;
+    }
     auto reduce = mlir::dyn_cast_or_null<mlir::stablehlo::ReduceOp>(reduceMaxOp);
     if (!reduce)
         return false;
@@ -1575,6 +1722,9 @@ static bool IsSoftmaxPattern(mlir::Operation* reduceMaxOp,
     llvm::SmallVector<mlir::Operation*, 8> broadcastOps;
     mlir::Value broadcastedMax = TraceBroadcastChain(reduceResult, broadcastOps);
     if (!broadcastedMax.hasOneUse()) {
+        return false;
+    }
+    if (!BroadcastChainRestoresLeadingAxes(reduceResult, broadcastedMax)) {
         return false;
     }
 
@@ -1607,11 +1757,30 @@ static bool IsSoftmaxPattern(mlir::Operation* reduceMaxOp,
 
     mlir::stablehlo::ReduceOp reduceSumOp = nullptr;
     mlir::stablehlo::DivOp divOp = nullptr;
+    mlir::stablehlo::ConvertOp widenOp = nullptr;
     for (auto* user : expResult.getUsers()) {
         if (auto rs = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(user)) {
             reduceSumOp = rs;
         } else if (auto dv = mlir::dyn_cast<mlir::stablehlo::DivOp>(user)) {
             divOp = dv;
+        } else if (auto cv = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(user)) {
+            widenOp = cv;
+        }
+    }
+    // f16: exp -> convert f32 (single use) -> reduce_sum(add, zero init).
+    // Rows over 8192 would need the two-pass kernel, which cannot round the
+    // sum like XLA, so they stay on the graph path.
+    bool widened = false;
+    if (!reduceSumOp && widenOp && divOp && F16WidenedSoftmaxFusionEnabled() &&
+        inType.getElementType().isF16() && inType.getShape().back() <= 8192) {
+        auto wOut = mlir::dyn_cast<mlir::RankedTensorType>(widenOp->getResult(0).getType());
+        if (wOut && wOut.getElementType().isF32() && widenOp->getResult(0).hasOneUse()) {
+            reduceSumOp =
+                mlir::dyn_cast<mlir::stablehlo::ReduceOp>(*widenOp->getResult(0).getUsers().begin());
+            widened = static_cast<bool>(reduceSumOp);
+        }
+        if (widened && (reduceSumOp->getNumOperands() < 2 || !IsZeroFloatSplat(reduceSumOp->getOperand(1)))) {
+            return false;
         }
     }
     if (!reduceSumOp || !divOp)
@@ -1631,6 +1800,25 @@ static bool IsSoftmaxPattern(mlir::Operation* reduceMaxOp,
     mlir::Value broadcastedSum = TraceBroadcastChain(sumResult, sumBroadcastOps);
     if (!broadcastedSum.hasOneUse())
         return false;
+    if (widened) {
+        auto narrow = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(*broadcastedSum.getUsers().begin());
+        if (!narrow) {
+            return false;
+        }
+        auto nOut = mlir::dyn_cast<mlir::RankedTensorType>(narrow->getResult(0).getType());
+        if (!nOut || !nOut.getElementType().isF16()) {
+            return false;
+        }
+        sumBroadcastOps.push_back(narrow.getOperation());
+        broadcastedSum = TraceBroadcastChain(narrow->getResult(0), sumBroadcastOps);
+        if (!broadcastedSum.hasOneUse()) {
+            return false;
+        }
+    }
+
+    if (!BroadcastChainRestoresLeadingAxes(sumResult, broadcastedSum)) {
+        return false;
+    }
 
     mlir::Operation* divUser = *broadcastedSum.getUsers().begin();
     if (divUser != divOp.getOperation()) {
@@ -1645,6 +1833,9 @@ static bool IsSoftmaxPattern(mlir::Operation* reduceMaxOp,
         absorbed_ops.push_back(op);
     absorbed_ops.push_back(subOp);
     absorbed_ops.push_back(expOp);
+    if (widened) {
+        absorbed_ops.push_back(widenOp.getOperation());
+    }
     absorbed_ops.push_back(reduceSumOp.getOperation());
     for (auto* op : sumBroadcastOps)
         absorbed_ops.push_back(op);
@@ -1662,6 +1853,9 @@ static bool IsSoftmaxPattern(mlir::Operation* reduceMaxOp,
     }
 
     final_result = divOp.getResult();
+    if (widenedF16Out) {
+        *widenedF16Out = widened;
+    }
     return true;
 }
 
@@ -1670,8 +1864,7 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
     // 2-D inputs (e.g. softmax(4096x64) aborts in mps.reshape verification),
     // so this pass must follow the intrinsic-kernel gate. Do not revert to
     // checking the raw DISABLE flag.
-    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_SOFTMAX_FUSION") ||
-        !IntrinsicNativeKernelsEnabled()) {
+    if (!StandaloneSoftmaxEnabled()) {
         return;
     }
 
@@ -1680,6 +1873,7 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
         llvm::SmallVector<mlir::Operation*, 16> absorbed_ops;
         mlir::Value softmax_input;
         mlir::Value final_result;
+        bool widened_f16 = false;
     };
     llvm::SmallVector<Candidate, 4> candidates;
 
@@ -1693,7 +1887,7 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
 
         Candidate c;
         c.reduceMaxOp = reduceOp;
-        if (!IsSoftmaxPattern(&operation, c.absorbed_ops, c.softmax_input, c.final_result)) {
+        if (!IsSoftmaxPattern(&operation, c.absorbed_ops, c.softmax_input, c.final_result, &c.widened_f16)) {
             continue;
         }
         if (!IsEligibleReduceNativeOp(&operation, IntrinsicNativeKind::kReduceMaxLastAxis)) {
@@ -1704,12 +1898,30 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
             inputNumel < (uint64_t)EnvIntValue("JAX_METALLIB_SOFTMAX_FUSION_MIN_ELEMENTS", 1024)) {
             continue;
         }
+        // Multi-row f32 softmax with short rows stays in MPSGraph: the native
+        // kernel split the plan into graph/native/graph segments, and between
+        // matmuls (attention) the switch cost more than the kernel saved
+        // ([2,8,128,32] attention 0.27 ms fused vs 0.22 ms graph; standalone
+        // rows < 1024 are within ~0.02 ms either way, rows >= 1024 are 2x+
+        // faster native). f16 keeps the native XLA-rounding kernel.
+        // JAX_METALLIB_SOFTMAX_NATIVE_MIN_COLS=1 restores the old routing.
+        if (!IntrinsicNativeKernelsEnabled() && !c.widened_f16) {
+            auto inT = mlir::dyn_cast<mlir::RankedTensorType>(c.softmax_input.getType());
+            if (inT && inT.hasStaticShape() && inT.getRank() >= 1 && inT.getElementType().isF32()) {
+                const int64_t cols = inT.getDimSize(inT.getRank() - 1);
+                const int64_t minCols = EnvIntValue("JAX_METALLIB_SOFTMAX_NATIVE_MIN_COLS", 1024);
+                if (cols > 0 && static_cast<int64_t>(inputNumel) / cols > 1 && cols < minCols) {
+                    continue;
+                }
+            }
+        }
         candidates.push_back(std::move(c));
     }
 
     // --- Softmax numerator pattern: reduce_max → broadcast → sub → exp (final output) ---
     // This matches exp(x - max(x, axis=-1, keepdims=True)) where exp is the return value.
-    if (candidates.empty()) {
+    // The numerator kernel has no standalone route, so it stays with the family.
+    if (candidates.empty() && IntrinsicNativeKernelsEnabled()) {
         struct NumCandidate {
             mlir::stablehlo::ReduceOp reduceMaxOp;
             llvm::SmallVector<mlir::Operation*, 8> absorbed_ops;
@@ -1760,6 +1972,8 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
             // Identify the softmax input: lhs of subtract
             mlir::Value softmax_input = subOp.getLhs();
             if (subOp.getRhs() != broadcastedMax)
+                continue;
+            if (!BroadcastChainRestoresLeadingAxes(reduceResult, broadcastedMax))
                 continue;
 
             mlir::Value subResult = subOp.getResult();
@@ -1902,6 +2116,9 @@ static void FuseSoftmaxPatterns(mlir::Block& block) {
 
         mlir::OpBuilder builder(c.reduceMaxOp);
         c.reduceMaxOp->setAttr("__softmax_fused", builder.getUnitAttr());
+        if (c.widened_f16) {
+            c.reduceMaxOp->setAttr("__softmax_f16_xla", builder.getUnitAttr());
+        }
 
         llvm::SmallPtrSet<mlir::Operation*, 16> eraseSet;
         for (auto* op : c.absorbed_ops)
@@ -4752,7 +4969,30 @@ static bool WriteScalarConstantData(mlir::stablehlo::ConstantOp constOp, MPSData
 }
 
 // Forward declarations for sort constants (used in BakeNativeStep, defined with IsEligibleSortNativeOp)
-static constexpr uint32_t kMaxNativeSortElements = 8192;
+// The stable keyed bitonic kernels keep a uint key and a ushort index per
+// padded element (6 bytes), so rows are capped at 4096 (24 KiB); longer
+// rows use the MPSGraph argsort + gather path.
+static constexpr uint32_t kMaxNativeSortElements = 4096;
+static NSUInteger SortThreadgroupBytes(uint32_t padded_n) {
+    NSUInteger bytes = (NSUInteger)padded_n * (sizeof(uint32_t) + sizeof(uint16_t));
+    return (bytes + 15) & ~(NSUInteger)15;
+}
+// Threads per row for the bitonic row sort. A fixed 32 (one simdgroup) left
+// the GPU idle when there were few rows: 8x4096 took 0.53 ms at 32 threads vs
+// 0.24 ms at 256. The best size measured gives each thread ~8 compare-swaps
+// per stage, i.e. padded_n / 16, clamped to [32, 256] (4096x256 stays at 32,
+// 4096x1024 -> 64, 8x4096 -> 256). JAX_METALLIB_SORT_TG_CAP=N forces a fixed
+// cap of N (32 restores the old behaviour); 0 (default) is automatic.
+static NSUInteger SortThreadgroupSize(uint32_t padded_n, id<MTLComputePipelineState> pipeline) {
+    static const int64_t fixed = EnvIntValue("JAX_METALLIB_SORT_TG_CAP", 0);
+    NSUInteger tg = fixed > 0 ? (NSUInteger)std::min<int64_t>(fixed, 1024)
+                              : std::max<NSUInteger>(32, std::min<NSUInteger>(256, padded_n / 16));
+    tg = std::min(tg, (NSUInteger)(padded_n / 2));
+    if (pipeline) {
+        tg = std::min(tg, (NSUInteger)pipeline.maxTotalThreadsPerThreadgroup);
+    }
+    return std::max<NSUInteger>(tg, 1);
+}
 
 static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
     if (!device || !ns || !ns->op) {
@@ -5046,7 +5286,9 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
             const bool f16 = (dtype == MPSDataTypeFloat16);
             // Use single-pass full softmax when cols fit in threadgroup memory
             if (cols <= 8192) {
-                std::string fullKernelName = f16 ? "softmax_full_f16_tg" : "softmax_full_f32_tg";
+                std::string fullKernelName = op->hasAttr("__softmax_f16_xla") ? "softmax_full_f16_xla_tg"
+                                             : f16                            ? "softmax_full_f16_tg"
+                                                                              : "softmax_full_f32_tg";
                 id<MTLComputePipelineState> pFull = GetFastNativePipeline(device, fullKernelName);
                 if (pFull) {
                     ns->baked_kind = NativeStep::BakedKind::kSoftmax;
@@ -5058,6 +5300,10 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
                     ComputeRowReduceDispatchConfig(pFull, rows, cols, &ns->baked_grid, &ns->baked_tg);
                     return true;
                 }
+            }
+            // The XLA-rounding f16 form is only fused for cols <= 8192.
+            if (op->hasAttr("__softmax_f16_xla")) {
+                return false;
             }
             // Fallback: 2-pass softmax for large cols (>8K)
             std::string pass1Name = f16 ? "softmax_pass1_f16_tg" : "softmax_pass1_f32_tg";
@@ -5419,10 +5665,8 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
         if (!pipeline) {
             return false;
         }
-        // Use 32 threads per TG (= 1 simdgroup on Apple GPUs). Threads in a
-        // simdgroup execute in lockstep, making threadgroup_barrier essentially free.
-        // Combined with bitwise-optimized inner loop, this gives best perf for small rows.
-        NSUInteger tg_size = std::min((NSUInteger)32, std::min((NSUInteger)(padded_n / 2), (NSUInteger)1024));
+        // Threads per row: see SortThreadgroupSize.
+        NSUInteger tg_size = SortThreadgroupSize(padded_n, pipeline);
         if (tg_size == 0)
             tg_size = 1;
 
@@ -5823,7 +6067,11 @@ static bool IsEligibleSortNativeOp(mlir::Operation* op) {
     if (descending) {
         return false;
     }
-    // Size threshold: small sorts are faster through MPSGraph.
+    // Small sorts used to stay on MPSGraph, but the exact graph path is argsort
+    // + gather: [4096,16] 4.95 ms vs 0.22 ms native, [1024,64] 1.64 vs 0.35,
+    // 1-D 4096 0.29 vs 0.24. Every eligible sort now runs natively;
+    // JAX_METALLIB_SORT_NATIVE_MIN_ELEMS=100000 restores the old size gate
+    // (EnvIntValue ignores values <= 0).
     uint64_t totalElems = 1;
     for (int64_t d : inShape) {
         totalElems *= static_cast<uint64_t>(d);
@@ -5831,7 +6079,8 @@ static bool IsEligibleSortNativeOp(mlir::Operation* op) {
     uint64_t cols =
         (inShape.size() == 2) ? static_cast<uint64_t>(inShape[1]) : static_cast<uint64_t>(inShape[0]);
     uint64_t rows = (inShape.size() == 2) ? static_cast<uint64_t>(inShape[0]) : 1;
-    if (totalElems < 100000 && !(rows > 1 && cols > 256)) {
+    static const int64_t minElems = EnvIntValue("JAX_METALLIB_SORT_NATIVE_MIN_ELEMS", 1);
+    if (static_cast<int64_t>(totalElems) < minElems && !(rows > 1 && cols > 256)) {
         return false;
     }
     return true;
@@ -5908,8 +6157,8 @@ static id<MTLBuffer> NativeIntrinsicSortHandler(id<MTLDevice> device, id<MTLComm
     if (!out) {
         return nil;
     }
-    NSUInteger tg_mem = (NSUInteger)padded_n * sizeof(float);
-    NSUInteger tg_size = std::min((NSUInteger)32, std::min((NSUInteger)(padded_n / 2), (NSUInteger)1024));
+    NSUInteger tg_mem = SortThreadgroupBytes(padded_n);
+    NSUInteger tg_size = SortThreadgroupSize(padded_n, pipeline);
     if (tg_size == 0)
         tg_size = 1;
 
@@ -5956,10 +6205,39 @@ static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
                            bodyName == "stablehlo.minimum") {
                     bypassKind = IntrinsicNativeKind::kReduceMinLastAxis;
                 }
+                // Multi-row reduces with short rows (LayerNorm, in-layer softmax
+                // sums) stay in MPSGraph: routing them natively split the plan into
+                // graph/native/graph segments, and that switch cost dominated
+                // (LayerNorm [16,256,512] 1.19 ms native vs 0.35 ms in graph).
+                // Rows >= 1024 measured equal or faster natively; single-row
+                // (full) reduces are unaffected.
+                // JAX_METALLIB_REDUCE_BYPASS_MIN_ROW=0 restores the old routing.
+                if (bypassKind != IntrinsicNativeKind::kNone) {
+                    int64_t rowLen = 1;
+                    for (auto d : dims) {
+                        rowLen *= inType.getDimSize(d);
+                    }
+                    const int64_t numel = inType.getNumElements();
+                    const bool multiRow = rowLen > 0 && numel / rowLen > 1;
+                    const int64_t minRow = EnvIntValue("JAX_METALLIB_REDUCE_BYPASS_MIN_ROW", 1024);
+                    if (multiRow && rowLen < minRow) {
+                        bypassKind = IntrinsicNativeKind::kNone;
+                    }
+                }
                 if (bypassKind != IntrinsicNativeKind::kNone && IsEligibleReduceNativeOp(op, bypassKind)) {
                     return NativeIntrinsicReduceHandler;
                 }
             }
+        }
+        // The f32 bitonic row sort is likewise a standalone kernel outside the
+        // fused-chain machinery; MPSGraph sort was ~17x slower at [4096,256]
+        // (7.7 ms vs 0.46 ms). The kernel uses XLA's NaN-last total order.
+        if (IsEligibleSortNativeOp(op)) {
+            return NativeIntrinsicSortHandler;
+        }
+        if (op->hasAttr("__softmax_fused") &&
+            IsEligibleReduceNativeOp(op, IntrinsicNativeKind::kSoftmaxLastAxis)) {
+            return NativeIntrinsicReduceHandler;
         }
         return nullptr;
     }
@@ -6309,6 +6587,34 @@ static CompletionEvent CompletionEventForCommandBuffer(id<MTLCommandBuffer> cmd_
       MarkCompletionFromCommandBuffer(captured, completed);
     }];
     return completion;
+}
+
+// Mixed graph+native execution encodes MPSGraph work into an MPSCommandBuffer,
+// which MPSGraph may commit-and-continue for large graphs. A completed handler
+// added when the buffer was created then belongs to the first underlying Metal
+// command buffer and fired before later native steps ran (a 4096x4095 graph
+// chain feeding the native last-axis reduce returned zero rows). The handler
+// is attached right before the final commit instead.
+// JAX_METALLIB_DISABLE_DEFERRED_COMPLETION=1 restores the old behaviour.
+static bool DeferMixedCompletion() {
+    static const bool defer = !EnvFlagEnabled("JAX_METALLIB_DISABLE_DEFERRED_COMPLETION");
+    return defer;
+}
+
+static CompletionEvent MixedCompletionEvent(id<MTLCommandBuffer> cmd_buf, bool async_completion) {
+    return DeferMixedCompletion() ? MakePendingCompletionEvent()
+                                  : CompletionEventForCommandBuffer(cmd_buf, async_completion);
+}
+
+static void AttachDeferredCompletion(id<MTLCommandBuffer> cmd_buf, const CompletionEvent& completion,
+                                     bool async_completion) {
+    if (!DeferMixedCompletion() || !async_completion || !cmd_buf || !completion) {
+        return;
+    }
+    CompletionEvent captured = completion;
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+      MarkCompletionFromCommandBuffer(captured, completed);
+    }];
 }
 
 static MPSGraphTensorData* GetTensorDataForSlot(IntermediateCacheSet* cache, SlotId slot,
@@ -6689,16 +6995,22 @@ static ProcessResult processOperations(HandlerContext& ctx, mlir::Block& block) 
                                         OpRegistry::ListRegistered());
         }
 
+        auto graphFn = handler->graph_handler;
         if (handler->is_native()) {
-            return ProcessResult::Error("Native op '" + op_name +
-                                        "' encountered during graph building - "
-                                        "this should have been handled by segmented execution");
+            // A native-only op inside a graph region (a case/while body) cannot
+            // run its native kernel; use the op's graph fallback when it has one.
+            if (!handler->graph_fallback) {
+                return ProcessResult::Error("Native op '" + op_name +
+                                            "' encountered during graph building - "
+                                            "this should have been handled by segmented execution");
+            }
+            graphFn = handler->graph_fallback;
         }
 
         HandlerContext opCtx(ctx.graph, op, ctx.values, ctx.module, ctx.depth, processOperationsAdapter);
         opCtx.variables = ctx.variables;
         opCtx.in_control_flow = ctx.in_control_flow;
-        ProcessResult opResult = handler->graph_handler(opCtx);
+        ProcessResult opResult = graphFn(opCtx);
         if (!opResult.ok())
             return opResult;
     }
@@ -8463,8 +8775,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                                       length:sizeof(ns_fp.baked_sort_n)
                                                      atIndex:4];
                                         }
-                                        NSUInteger tg_mem =
-                                            (NSUInteger)ns_fp.baked_sort_padded_n * sizeof(float);
+                                        NSUInteger tg_mem = SortThreadgroupBytes(ns_fp.baked_sort_padded_n);
                                         [fp_enc setThreadgroupMemoryLength:tg_mem atIndex:0];
                                         [fp_enc dispatchThreadgroups:ns_fp.baked_grid
                                                threadsPerThreadgroup:ns_fp.baked_tg];
@@ -8728,10 +9039,17 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
 
         if (!executed_direct_run && plan_->graph_steps.empty()) {
 
-            // Unretained command buffers avoid Metal's internal reference counting overhead.
-            // Safe for native-only JIT plans where buffer lifetimes are managed by the execution plan.
-            // Disable with JAX_METALLIB_DISABLE_NATIVE_UNRETAINED_CMDBUF if GPU faults occur.
+            // Retained command buffers by default. The plan manages its own slot
+            // buffers, but not caller-owned inputs: with unretained references an
+            // input released before the GPU finished gave intermittent
+            // "Invalid Resource" (native row sort under the intrinsic family:
+            // 11/480 failed cases unretained vs 0/480 retained), and retaining
+            // measured no cost (sort [4096,256] ~0.49 ms, row sum [4096,4096]
+            // ~0.75 ms, 64x64 sum ~0.16 ms either way).
+            // JAX_METALLIB_ENABLE_NATIVE_UNRETAINED_CMDBUF=1 restores unretained
+            // buffers; JAX_METALLIB_DISABLE_NATIVE_UNRETAINED_CMDBUF=1 still wins.
             static const bool use_unretained_default =
+                EnvFlagEnabled("JAX_METALLIB_ENABLE_NATIVE_UNRETAINED_CMDBUF") &&
                 !EnvFlagEnabled("JAX_METALLIB_DISABLE_NATIVE_UNRETAINED_CMDBUF");
             const bool use_unretained = use_unretained_default && !plan_->needs_retained_cmd_bufs;
             static const int max_ops_per_cmd = EnvIntValue("JAX_METALLIB_MAX_OPS_PER_CMDBUF", 256);
@@ -9468,7 +9786,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                                     length:sizeof(ns.baked_sort_n)
                                                    atIndex:4];
                         }
-                        NSUInteger tg_mem = (NSUInteger)ns.baked_sort_padded_n * sizeof(float);
+                        NSUInteger tg_mem = SortThreadgroupBytes(ns.baked_sort_padded_n);
                         [nativeComputeEncoder setThreadgroupMemoryLength:tg_mem atIndex:0];
                         [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
                                              threadsPerThreadgroup:ns.baked_tg];
@@ -9583,7 +9901,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
             if (!cmdBuf) {
                 return ExecutionResult::Error("Failed to create command buffer");
             }
-            CompletionEvent cmd_completion = CompletionEventForCommandBuffer(cmdBuf, async_completion);
+            CompletionEvent cmd_completion = MixedCompletionEvent(cmdBuf, async_completion);
 
             MPS_LOG_DEBUG("Executing %zu steps\n", plan_->steps.size());
             std::vector<id<MTLBuffer>> mixed_input_bufs;
@@ -9817,12 +10135,15 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         endMixedNativeEncoder();
                         [cmdBuf commit];
                         [cmdBuf waitUntilCompleted];
+                        if (DeferMixedCompletion()) {
+                            MarkCompletionFromCommandBuffer(cmd_completion, cmdBuf);
+                        }
                         // Create a new command buffer for subsequent steps
                         cmdBuf = [MPSCommandBuffer commandBufferFromCommandQueue:commandQueue];
                         if (!cmdBuf) {
                             return ExecutionResult::Error("Failed to recreate cmdBuf after CPU sort");
                         }
-                        cmd_completion = CompletionEventForCommandBuffer(cmdBuf, async_completion);
+                        cmd_completion = MixedCompletionEvent(cmdBuf, async_completion);
                         if (ns.output_slot >= 0 && (size_t)ns.output_slot < slot_bufs.size() &&
                             !slot_bufs[ns.output_slot]) {
                             size_t out_bytes = plan_->slots[ns.output_slot].byte_size;
@@ -9859,12 +10180,15 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         endMixedNativeEncoder();
                         [cmdBuf commit];
                         [cmdBuf waitUntilCompleted];
+                        if (DeferMixedCompletion()) {
+                            MarkCompletionFromCommandBuffer(cmd_completion, cmdBuf);
+                        }
                         // Create a new command buffer for subsequent steps
                         cmdBuf = [MPSCommandBuffer commandBufferFromCommandQueue:commandQueue];
                         if (!cmdBuf) {
                             return ExecutionResult::Error("Failed to recreate cmdBuf after CPU Cholesky");
                         }
-                        cmd_completion = CompletionEventForCommandBuffer(cmdBuf, async_completion);
+                        cmd_completion = MixedCompletionEvent(cmdBuf, async_completion);
                         if (ns.output_slot >= 0 && (size_t)ns.output_slot < slot_bufs.size() &&
                             !slot_bufs[ns.output_slot]) {
                             size_t out_bytes = plan_->slots[ns.output_slot].byte_size;
@@ -9891,12 +10215,15 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         endMixedNativeEncoder();
                         [cmdBuf commit];
                         [cmdBuf waitUntilCompleted];
+                        if (DeferMixedCompletion()) {
+                            MarkCompletionFromCommandBuffer(cmd_completion, cmdBuf);
+                        }
                         // Create a new command buffer for subsequent steps
                         cmdBuf = [MPSCommandBuffer commandBufferFromCommandQueue:commandQueue];
                         if (!cmdBuf) {
                             return ExecutionResult::Error("Failed to recreate cmdBuf after CPU BLAS");
                         }
-                        cmd_completion = CompletionEventForCommandBuffer(cmdBuf, async_completion);
+                        cmd_completion = MixedCompletionEvent(cmdBuf, async_completion);
                         if (ns.output_slot >= 0 && (size_t)ns.output_slot < slot_bufs.size() &&
                             !slot_bufs[ns.output_slot]) {
                             size_t out_bytes = plan_->slots[ns.output_slot].byte_size;
@@ -10179,7 +10506,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             if (ns.baked_sort_num_rows > 1) {
                                 [sortEnc setBytes:&ns.baked_sort_n length:sizeof(ns.baked_sort_n) atIndex:4];
                             }
-                            NSUInteger tg_mem = (NSUInteger)ns.baked_sort_padded_n * sizeof(float);
+                            NSUInteger tg_mem = SortThreadgroupBytes(ns.baked_sort_padded_n);
                             [sortEnc setThreadgroupMemoryLength:tg_mem atIndex:0];
                             [sortEnc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
                             break;
@@ -10225,7 +10552,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         if (!cmdBuf) {
                             return ExecutionResult::Error("Failed to recreate cmdBuf after CPU handler sync");
                         }
-                        cmd_completion = CompletionEventForCommandBuffer(cmdBuf, async_completion);
+                        cmd_completion = MixedCompletionEvent(cmdBuf, async_completion);
                     }
 
                     mixed_input_bufs.clear();
@@ -10254,6 +10581,7 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
             }
 
             endMixedNativeEncoder();
+            AttachDeferredCompletion(cmdBuf, cmd_completion, async_completion);
             [cmdBuf commit];
             if (!async_completion) {
                 [cmdBuf waitUntilCompleted];

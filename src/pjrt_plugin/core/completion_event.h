@@ -42,55 +42,44 @@ public:
         return error_;
     }
 
+    // Waits until the event is ready, however long the GPU work takes. Every wait
+    // that guards freeing or reusing a buffer must use this: giving up early would
+    // release memory the GPU is still writing. It cannot hang on a stuck GPU,
+    // because Metal's command-buffer watchdog completes such a buffer with an
+    // error, which fires the completion handler.
     void Await() const {
         AwaitWithHint(0);
     }
 
     void AwaitWithHint(uint32_t expected_us) const {
-        // Fast path: already complete.
-        if (ready_.load(std::memory_order_acquire)) {
+        if (SpinUntilReady(expected_us)) {
             return;
         }
-        // Phase 1: short spin (5K iterations ~10us on ARM).
-        // Catches very fast GPU completions without any condvar overhead.
-        for (int i = 0; i < 5000; ++i) {
-            if (ready_.load(std::memory_order_acquire)) {
-                return;
-            }
-            SpinPause();
-        }
-        // Phase 2: medium spin (up to JAX_METALLIB_SPIN_ITERATIONS, default 50K).
-        // Skip if the hint suggests GPU work is expected to take longer than ~200us.
-        if (expected_us <= 200) {
-            int max_spin = GetMaxSpinIterations();
-            for (int i = 5000; i < max_spin; ++i) {
-                if (ready_.load(std::memory_order_acquire)) {
-                    return;
-                }
-                SpinPause();
-            }
-        }
-        // Phase 3: condvar wait with timeout.
-        const auto timeout_ms = []() -> int {
-            const char* env = std::getenv("JAX_METALLIB_COMPLETION_TIMEOUT_MS");
-            if (env) {
-                try {
-                    int val = std::stoi(env);
-                    return val > 0 ? val : 30000;
-                } catch (...) {
-                    return 30000;
-                }
-            }
-            return 30000;
-        }();
-
         std::unique_lock lock(mu_);
-        bool ready = cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                                  [&] { return ready_.load(std::memory_order_relaxed); });
-        if (!ready) {
-            throw std::runtime_error("CompletionEvent::Await() timed out after " +
-                                     std::to_string(timeout_ms) + "ms");
+        cv_.wait(lock, [&] { return ready_.load(std::memory_order_relaxed); });
+    }
+
+    // Caller-facing wait bounded by JAX_METALLIB_COMPLETION_TIMEOUT_MS (default
+    // 30000, read per wait). Never throws: on timeout it returns false and
+    // describes the timeout in *error. The event stays pending and the GPU work
+    // keeps running, so release waits still wait for it. (Await used to throw
+    // std::runtime_error, which reached std::terminate on the detached
+    // cache-release thread and across the PJRT C boundary.)
+    bool AwaitWithTimeout(std::string* error = nullptr) const {
+        if (SpinUntilReady(0)) {
+            return true;
         }
+        const int timeout_ms = CompletionTimeoutMs();
+        std::unique_lock lock(mu_);
+        if (cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                         [&] { return ready_.load(std::memory_order_relaxed); })) {
+            return true;
+        }
+        if (error) {
+            *error = "CompletionEvent::Await() timed out after " + std::to_string(timeout_ms) +
+                     "ms (raise JAX_METALLIB_COMPLETION_TIMEOUT_MS for longer GPU programs)";
+        }
+        return false;
     }
 
     void MarkReady() {
@@ -137,6 +126,45 @@ public:
     }
 
 private:
+    // Spins briefly so fast GPU completions skip the condvar; true once ready.
+    bool SpinUntilReady(uint32_t expected_us) const {
+        if (ready_.load(std::memory_order_acquire)) {
+            return true;
+        }
+        // Phase 1: short spin (5K iterations ~10us on ARM).
+        for (int i = 0; i < 5000; ++i) {
+            if (ready_.load(std::memory_order_acquire)) {
+                return true;
+            }
+            SpinPause();
+        }
+        // Phase 2: medium spin (up to JAX_METALLIB_SPIN_ITERATIONS, default 50K).
+        // Skip if the hint suggests GPU work is expected to take longer than ~200us.
+        if (expected_us <= 200) {
+            int max_spin = GetMaxSpinIterations();
+            for (int i = 5000; i < max_spin; ++i) {
+                if (ready_.load(std::memory_order_acquire)) {
+                    return true;
+                }
+                SpinPause();
+            }
+        }
+        return ready_.load(std::memory_order_acquire);
+    }
+
+    static int CompletionTimeoutMs() {
+        const char* env = std::getenv("JAX_METALLIB_COMPLETION_TIMEOUT_MS");
+        if (env) {
+            try {
+                int val = std::stoi(env);
+                return val > 0 ? val : 30000;
+            } catch (...) {
+                return 30000;
+            }
+        }
+        return 30000;
+    }
+
     void SpinPause() const {
 #if defined(__aarch64__) || defined(__arm64__)
         __asm__ volatile("yield");
@@ -208,6 +236,11 @@ inline void AwaitCompletionEvent(const CompletionEvent& event) {
     if (event) {
         event->Await();
     }
+}
+
+// Caller-facing bounded wait; see CompletionEventState::AwaitWithTimeout.
+inline bool AwaitCompletionEventWithTimeout(const CompletionEvent& event, std::string* error) {
+    return !event || event->AwaitWithTimeout(error);
 }
 
 inline std::string CompletionEventError(const CompletionEvent& event) {
