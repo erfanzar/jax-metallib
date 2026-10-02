@@ -213,3 +213,21 @@ def initialize():
         linalg_lowerings.register()
     except Exception as e:
         warnings.warn(f"Failed to register MPS linalg lowerings: {e}", stacklevel=2)
+
+    # Only last-axis sorts reach the native bitonic kernel; move other sort
+    # dimensions to the end at lowering time.
+    try:
+        from . import sort_lowerings
+
+        sort_lowerings.register()
+    except Exception as e:
+        warnings.warn(f"Failed to register MPS sort lowering: {e}", stacklevel=2)
+
+    # The native rng_bit_generator ignores its state and aborts on uint8/uint16;
+    # expand ThreeFry/Philox in uint32 ops (bitwise equal to XLA:CPU) instead.
+    try:
+        from . import random_lowerings
+
+        random_lowerings.register()
+    except Exception as e:
+        warnings.warn(f"Failed to register MPS rng_bit_generator lowering: {e}", stacklevel=2)
