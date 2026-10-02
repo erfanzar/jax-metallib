@@ -67,13 +67,13 @@ grads = f(x)
 
 | Requirement | Version                                |
 | ----------- | -------------------------------------- |
-| macOS       | 13.0+ (Ventura) or 15+ (recommended)   |
+| macOS       | 15.0+ (Sequoia)                        |
 | Hardware    | Apple Silicon (M1 / M2 / M3 / M4 / M5) |
 | Python      | 3.12 or 3.13                           |
 | JAX         | 0.11.x                                 |
 | jaxlib      | 0.11.x                                 |
 
-> **Note:** macOS 15+ is recommended for the best compatibility. Some MPSGraph APIs used on macOS 13–14 have been deprecated and replaced with modern equivalents on macOS 15+.
+> **Note:** The plugin is built with a macOS 15.0 deployment target. It calls MPSGraph and Accelerate APIs introduced in macOS 13.1–15.0 (for example `reinterpretCastTensor`, bfloat16, the FFT and complex-part ops, and `sliceUpdateDataTensor`) without runtime fallbacks, so it does not support macOS 13 or 14.
 
 ## Build from Source
 
@@ -230,7 +230,7 @@ The plugin implements three execution models that are interleaved within a singl
 | `JAX_TEST_MODE` | `compare` | Test mode: `compare` (CPU vs MPS), `mps`, or `cpu` |
 | `JAX_METALLIB_GEMM_TRUE_F32` | `0` | Set to `1` to disable mixed-precision fp32→fp16 GEMM and force true fp32 (precision-critical workloads) |
 | `JAX_METALLIB_CHOLESKY_LAPACK_MAX_N` | `256` | Maximum total elements (`n × batchCount`) for CPU LAPACK Cholesky fallback. Set to `0` to disable |
-| `JAX_METALLIB_COMPLETION_TIMEOUT_MS` | `30000` | Timeout for completion events in milliseconds |
+| `JAX_METALLIB_COMPLETION_TIMEOUT_MS` | `30000` | Timeout in milliseconds for waiting on GPU results (host copies, `block_until_ready`). On timeout JAX raises an error and the process keeps running; raise it for GPU programs that legitimately run longer |
 
 > **Precision note:** The mixed-precision fp32 GEMM path (enabled by default) casts inputs to `float16` when both have ≥ 1,000,000 elements. This yields near-2× speedup on large matmuls with a small precision loss. Set `JAX_METALLIB_GEMM_TRUE_F32=1` for exact fp32.
 
@@ -370,8 +370,8 @@ The benchmark suite includes per-op micro-benchmarks, representative anchor work
 
 ## macOS Version Compatibility
 
-- **macOS 13+ (Ventura):** Base support. All core ops work.
-- **macOS 15+ (Sequoia):** Recommended. The plugin uses modern MPSGraph APIs (`randomTensorWithShape:descriptor:seed:`, `sliceTensor:starts:ends:strides:`, `concatTensors:dimension:`) that are only available on macOS 15+. On older systems, deprecated API paths may still function but are not actively tested.
+- **macOS 15+ (Sequoia):** Required. The dylib declares a minimum of macOS 15.0. A build targeting 13.0 produced 272 unguarded uses of newer APIs: `reinterpretCastTensor` (13.2), `cblas_sgemm`/`spotrf_` (13.3), bfloat16, FFT and complex real/imaginary parts (14.0), and `sliceUpdateDataTensor`/`reciprocalSquareRootWithTensor` (15.0). On macOS 13 or 14 those would fail at runtime with unrecognized selectors.
+- **macOS 13–14:** Not supported.
 
 ## Known Limitations
 
