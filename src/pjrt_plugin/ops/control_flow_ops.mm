@@ -19,8 +19,10 @@
 
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <vector>
 
 namespace jax_metallib {
 
@@ -134,7 +136,9 @@ MPSGraphTensor* EvaluateWhileCond(MPSGraph* graph, mlir::Block& condBlock, const
 NSArray<MPSGraphTensor*>* EvaluateLoopBody(MPSGraph* graph, mlir::Block& bodyBlock, const ValueMap& values,
                                            NSArray<MPSGraphTensor*>* bodyArgs, mlir::ModuleOp module,
                                            int depth, bool markWhileContext, std::string* blockError,
-                                           BlockProcessor processBlock, ValueMap* variables) {
+                                           BlockProcessor processBlock, ValueMap* variables,
+                                           const std::vector<mlir::Value>* captureValues = nullptr,
+                                           std::vector<MPSGraphTensor*>* captured = nullptr) {
     ValueMap bodyValues = values;
     BindBlockArguments(bodyBlock, bodyArgs, bodyValues, variables);
 
@@ -163,6 +167,16 @@ NSArray<MPSGraphTensor*>* EvaluateLoopBody(MPSGraph* graph, mlir::Block& bodyBlo
             return bodyArgs;
         }
         [out addObject:tensor];
+    }
+    if (captureValues && captured) {
+        for (mlir::Value v : *captureValues) {
+            MPSGraphTensor* tensor = GetTensor(bodyValues, v);
+            if (!tensor) {
+                *blockError = "while body capture tensor not found";
+                return bodyArgs;
+            }
+            captured->push_back(tensor);
+        }
     }
     return out;
 }
@@ -430,6 +444,346 @@ static NSArray<MPSGraphTensor*>* TieWhileOutputs(MPSGraph* g, NSArray<MPSGraphTe
     return tied;
 }
 
+// Each MPSGraph for-loop iteration costs ~5.4 us regardless of body size
+// (1024-step empty scan: 5.8 ms; unrolled by 8: 1.4 ms). For counted loops
+// whose trip count is a compile-time constant, evaluate the body `unroll`
+// times per MPSGraph iteration. Only small bodies without nested control flow
+// or in-loop buffer writes are unrolled, to bound graph size and compile time.
+// JAX_METALLIB_LOOP_UNROLL=<k> sets the maximum factor (default 8; 1 disables).
+static int MaxLoopUnroll() {
+    static const int value = [] {
+        const char* v = std::getenv("JAX_METALLIB_LOOP_UNROLL");
+        if (!v || v[0] == '\0') {
+            return 8;
+        }
+        long k = std::strtol(v, nullptr, 10);
+        return static_cast<int>(std::max(1L, std::min(k, 32L)));
+    }();
+    return value;
+}
+
+static int ChooseLoopUnroll(mlir::stablehlo::WhileOp whileOp, mlir::Block& bodyBlock,
+                            const CountedWhile& counted,
+                            const std::unordered_set<mlir::Operation*>* allowedWrites = nullptr) {
+    const int maxUnroll = MaxLoopUnroll();
+    if (maxUnroll <= 1 || !counted.upper_bound_is_const || counted.step <= 0) {
+        return 1;
+    }
+    int64_t lower = 0;
+    if (!ReadConstantIntScalar(whileOp->getOperand(counted.counter_index), &lower)) {
+        return 1;
+    }
+    const int64_t span = counted.upper_bound_const - lower;
+    if (span <= 0) {
+        return 1;
+    }
+    const int64_t trips = (span + counted.step - 1) / counted.step;
+    // In-loop buffer writes (dynamic_update_slice, scatter, and scan output
+    // stacking, which lowers to dynamic_update_slice) are full-buffer
+    // mask/select updates on MPS; chaining several per iteration measured
+    // slower (1024-row write loop: 12.9 ms -> 27.3 ms at unroll 8), so such
+    // bodies are never unrolled. func.call is skipped since it may hide them.
+    size_t numOps = 0;
+    for (mlir::Operation& op : bodyBlock) {
+        if (allowedWrites && allowedWrites->count(&op)) {
+            ++numOps;
+            continue;
+        }
+        if (mlir::isa<mlir::stablehlo::WhileOp, mlir::stablehlo::CaseOp, mlir::stablehlo::IfOp,
+                      mlir::stablehlo::DynamicUpdateSliceOp, mlir::stablehlo::ScatterOp, mlir::func::CallOp>(
+                op)) {
+            return 1;
+        }
+        ++numOps;
+    }
+    if (numOps > 64) {
+        return 1;
+    }
+    for (int k = maxUnroll; k >= 2; --k) {
+        if (trips % k == 0 && trips >= 2 * static_cast<int64_t>(k)) {
+            return k;
+        }
+    }
+    return 1;
+}
+
+// Scan output stacking lowers to one dynamic_update_slice of a full row per
+// step into a carried buffer, and each such write is a full-buffer
+// mask/select on MPS (256-step tanh RNN: 6.3 ms with stacked outputs vs
+// 2.9 ms carry-only). Plain unrolling chained U full-buffer writes and was
+// slower, so instead: when a buffer carry feeds only its write and the write
+// result is only returned, evaluate the body U times against the unchanged
+// buffer, collect the U rows and start indices, and apply them in one pass
+// (later sub-iterations win on duplicate rows; starts clamp like XLA).
+// JAX_METALLIB_DISABLE_BATCHED_LOOP_WRITES=1 keeps the per-step writes.
+struct BatchedLoopWrite {
+    unsigned carry_index = 0;
+    mlir::Value update;
+    mlir::Value start;
+    int64_t rows = 0;
+    // Axis the one-slice writes run along (0 for scan stacking; 1 for a
+    // [1, T, H, D] KV-cache fill). Every other dim of the update spans the
+    // buffer, so its start clamps to 0 and is ignored.
+    int64_t axis = 0;
+};
+
+static bool CollectBatchableLoopWrites(mlir::Block& bodyBlock, const CountedWhile& counted,
+                                       std::vector<BatchedLoopWrite>* out,
+                                       std::unordered_set<mlir::Operation*>* ops) {
+    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_BATCHED_LOOP_WRITES")) {
+        return false;
+    }
+    mlir::Operation* term = bodyBlock.getTerminator();
+    if (!term) {
+        return false;
+    }
+    for (mlir::Operation& op : bodyBlock) {
+        auto dus = mlir::dyn_cast<mlir::stablehlo::DynamicUpdateSliceOp>(&op);
+        if (!dus) {
+            continue;
+        }
+        auto ba = mlir::dyn_cast<mlir::BlockArgument>(dus->getOperand(0));
+        if (!ba || ba.getOwner() != &bodyBlock || !ba.hasOneUse()) {
+            return false;
+        }
+        const unsigned k = ba.getArgNumber();
+        if (k == counted.counter_index) {
+            return false;
+        }
+        mlir::Value res = dus->getResult(0);
+        if (!res.hasOneUse()) {
+            return false;
+        }
+        mlir::OpOperand& use = *res.use_begin();
+        if (use.getOwner() != term || use.getOperandNumber() != k) {
+            return false;
+        }
+        auto bufT = mlir::dyn_cast<mlir::RankedTensorType>(dus->getOperand(0).getType());
+        auto updT = mlir::dyn_cast<mlir::RankedTensorType>(dus->getOperand(1).getType());
+        if (!bufT || !updT || !bufT.hasStaticShape() || !updT.hasStaticShape() || bufT.getRank() < 1 ||
+            updT.getRank() != bufT.getRank() || !bufT.getElementType().isF32() ||
+            updT.getElementType() != bufT.getElementType()) {
+            return false;
+        }
+        int64_t axis = -1;
+        for (int64_t d = 0; d < bufT.getRank(); ++d) {
+            if (updT.getDimSize(d) == bufT.getDimSize(d)) {
+                continue;
+            }
+            if (axis >= 0 || updT.getDimSize(d) != 1) {
+                return false;
+            }
+            axis = d;
+        }
+        if (axis < 0 || bufT.getDimSize(axis) > (1 << 20)) {
+            return false;
+        }
+        if (dus->getNumOperands() != 2 + static_cast<unsigned>(bufT.getRank())) {
+            return false;
+        }
+        BatchedLoopWrite w;
+        w.carry_index = k;
+        w.update = dus->getOperand(1);
+        w.start = dus->getOperand(2 + static_cast<unsigned>(axis));
+        w.rows = bufT.getDimSize(axis);
+        w.axis = axis;
+        out->push_back(w);
+        ops->insert(&op);
+    }
+    return !out->empty();
+}
+
+// Writes rows[u] (size 1 along axis) at clamped start starts[u] into buffer,
+// in order, as one gather + select along axis: each slice takes the last
+// sub-iteration that targets it, or keeps its value.
+static MPSGraphTensor* ApplyBatchedRowWrites(MPSGraph* g, MPSGraphTensor* buffer,
+                                             NSArray<MPSGraphTensor*>* rows, NSArray<MPSGraphTensor*>* starts,
+                                             int64_t numRows, int64_t axis) {
+    const NSUInteger U = rows.count;
+    MPSGraphTensor* rowsCat = [g concatTensors:rows dimension:(NSInteger)axis name:nil];
+    NSMutableArray<MPSGraphTensor*>* idx = [NSMutableArray arrayWithCapacity:U];
+    for (MPSGraphTensor* s in starts) {
+        MPSGraphTensor* t =
+            s.dataType == MPSDataTypeInt32 ? s : [g castTensor:s toType:MPSDataTypeInt32 name:nil];
+        [idx addObject:[g reshapeTensor:t withShape:@[@1, @1] name:nil]];
+    }
+    MPSGraphTensor* zero = [g constantWithScalar:0 dataType:MPSDataTypeInt32];
+    MPSGraphTensor* one = [g constantWithScalar:1 dataType:MPSDataTypeInt32];
+    MPSGraphTensor* last = [g constantWithScalar:(double)(numRows - 1) dataType:MPSDataTypeInt32];
+    MPSGraphTensor* idxRow = [g concatTensors:idx dimension:1 name:nil];
+    idxRow = [g maximumWithPrimaryTensor:idxRow secondaryTensor:zero name:nil];
+    idxRow = [g minimumWithPrimaryTensor:idxRow secondaryTensor:last name:nil];
+
+    std::vector<int32_t> iota(static_cast<size_t>(numRows));
+    for (int64_t r = 0; r < numRows; ++r) {
+        iota[static_cast<size_t>(r)] = static_cast<int32_t>(r);
+    }
+    std::vector<int32_t> order(U);
+    for (NSUInteger u = 0; u < U; ++u) {
+        order[u] = static_cast<int32_t>(u + 1);
+    }
+    MPSGraphTensor* iotaT = [g constantWithData:[NSData dataWithBytes:iota.data() length:iota.size() * 4]
+                                          shape:@[@(numRows), @1]
+                                       dataType:MPSDataTypeInt32];
+    MPSGraphTensor* orderT = [g constantWithData:[NSData dataWithBytes:order.data() length:order.size() * 4]
+                                           shape:@[@1, @(U)]
+                                        dataType:MPSDataTypeInt32];
+    MPSGraphTensor* eq = [g equalWithPrimaryTensor:iotaT secondaryTensor:idxRow name:nil];
+    MPSGraphTensor* who = [g selectWithPredicateTensor:eq
+                                   truePredicateTensor:orderT
+                                  falsePredicateTensor:zero
+                                                  name:nil];
+    who = [g reductionMaximumWithTensor:who axis:1 name:nil];
+    who = [g reshapeTensor:who withShape:@[@(numRows)] name:nil];
+    MPSGraphTensor* hit = [g greaterThanWithPrimaryTensor:who secondaryTensor:zero name:nil];
+    MPSGraphTensor* sel = [g subtractionWithPrimaryTensor:who secondaryTensor:one name:nil];
+    sel = [g maximumWithPrimaryTensor:sel secondaryTensor:zero name:nil];
+    MPSGraphTensor* gathered = [g gatherWithUpdatesTensor:rowsCat
+                                            indicesTensor:sel
+                                                     axis:(NSUInteger)axis
+                                          batchDimensions:0
+                                                     name:nil];
+    NSMutableArray<NSNumber*>* hitShape = [NSMutableArray arrayWithCapacity:buffer.shape.count];
+    for (NSUInteger d = 0; d < buffer.shape.count; ++d) {
+        [hitShape addObject:(d == (NSUInteger)axis ? @(numRows) : @1)];
+    }
+    hit = [g reshapeTensor:hit withShape:hitShape name:nil];
+    return [g selectWithPredicateTensor:hit
+                    truePredicateTensor:gathered
+                   falsePredicateTensor:buffer
+                                   name:nil];
+}
+
+static NSArray<MPSGraphTensor*>*
+EvaluateBatchedWriteBody(MPSGraph* graph, mlir::Block& bodyBlock, const ValueMap& values,
+                         NSArray<MPSGraphTensor*>* iterationArguments, mlir::ModuleOp module, int depth,
+                         int unroll, const std::vector<BatchedLoopWrite>& writes, std::string* blockError,
+                         BlockProcessor processBlock) {
+    std::vector<mlir::Value> capture;
+    for (const auto& w : writes) {
+        capture.push_back(w.update);
+        capture.push_back(w.start);
+    }
+    std::vector<NSMutableArray<MPSGraphTensor*>*> rows(writes.size());
+    std::vector<NSMutableArray<MPSGraphTensor*>*> starts(writes.size());
+    for (size_t i = 0; i < writes.size(); ++i) {
+        rows[i] = [NSMutableArray arrayWithCapacity:(NSUInteger)unroll];
+        starts[i] = [NSMutableArray arrayWithCapacity:(NSUInteger)unroll];
+    }
+    NSMutableArray<MPSGraphTensor*>* args = [NSMutableArray arrayWithArray:iterationArguments];
+    for (int u = 0; u < unroll; ++u) {
+        std::vector<MPSGraphTensor*> captured;
+        NSArray<MPSGraphTensor*>* next =
+            EvaluateLoopBody(graph, bodyBlock, values, args, module, depth, true, blockError, processBlock,
+                             nullptr, &capture, &captured);
+        if (!blockError->empty()) {
+            return iterationArguments;
+        }
+        if (captured.size() != capture.size() || next.count != iterationArguments.count) {
+            *blockError = "while body: batched write capture mismatch";
+            return iterationArguments;
+        }
+        args = [NSMutableArray arrayWithArray:next];
+        for (size_t i = 0; i < writes.size(); ++i) {
+            [rows[i] addObject:captured[2 * i]];
+            [starts[i] addObject:captured[2 * i + 1]];
+            args[writes[i].carry_index] = iterationArguments[writes[i].carry_index];
+        }
+    }
+    for (size_t i = 0; i < writes.size(); ++i) {
+        const unsigned k = writes[i].carry_index;
+        args[k] = ApplyBatchedRowWrites(graph, iterationArguments[k], rows[i], starts[i], writes[i].rows,
+                                        writes[i].axis);
+    }
+    return args;
+}
+
+// True when v is a constant, possibly behind broadcast_in_dim / reshape /
+// convert (JAX emits `x + 0.0` on a tensor as add(x, broadcast(constant))).
+static bool IsConstantLikeValue(mlir::Value v) {
+    for (int hops = 0; hops < 4; ++hops) {
+        mlir::Operation* od = v.getDefiningOp();
+        if (!od) {
+            return false;
+        }
+        if (od->hasTrait<mlir::OpTrait::ConstantLike>()) {
+            return true;
+        }
+        if (!mlir::isa<mlir::stablehlo::BroadcastInDimOp, mlir::stablehlo::ReshapeOp,
+                       mlir::stablehlo::ConvertOp>(od) ||
+            od->getNumOperands() != 1) {
+            return false;
+        }
+        v = od->getOperand(0);
+    }
+    return false;
+}
+
+// Follows v back through single-result ops whose other operands are all
+// constant-like (x + 0, x * 1, copies), which MPSGraph may fold to x.
+static mlir::Value TraceForwardedValue(mlir::Value v) {
+    for (int hops = 0; hops < 8; ++hops) {
+        mlir::Operation* def = v.getDefiningOp();
+        if (!def || def->getNumResults() != 1) {
+            return v;
+        }
+        mlir::Value only;
+        for (mlir::Value operand : def->getOperands()) {
+            if (IsConstantLikeValue(operand)) {
+                continue;
+            }
+            if (only) {
+                return v;
+            }
+            only = operand;
+        }
+        if (!only || only.getType() != v.getType()) {
+            return v;
+        }
+        v = only;
+    }
+    return v;
+}
+
+// MPSGraph forLoopWithLowerBound updates carries as if in slot order: a body
+// output that is (or folds to) another slot's iteration argument read that
+// slot's new value when the source slot came first. fori_loop (a, b) ->
+// (2a + 1, a) returned b = new a; (a, b) -> (b, 2b + 1) was right. Such
+// outputs get their own tensor. Checked on tensors (also catches permutations
+// composed over unrolled sub-iterations) and, when the body is evaluated once
+// per iteration, on the MLIR return values (catches a + 0.0 folded back to a).
+// JAX_METALLIB_DISABLE_LOOP_CARRY_COPY=1 disables this.
+static NSArray<MPSGraphTensor*>* DecoupleForwardedCarries(MPSGraph* g, mlir::Block& body,
+                                                          NSArray<MPSGraphTensor*>* iterArgs,
+                                                          NSArray<MPSGraphTensor*>* outs, bool traceBody) {
+    if (!outs || outs.count != iterArgs.count || EnvFlagEnabled("JAX_METALLIB_DISABLE_LOOP_CARRY_COPY")) {
+        return outs;
+    }
+    auto ret = mlir::dyn_cast_or_null<mlir::stablehlo::ReturnOp>(body.getTerminator());
+    NSMutableArray<MPSGraphTensor*>* fixed = nil;
+    for (NSUInteger i = 0; i < outs.count; ++i) {
+        bool alias = false;
+        for (NSUInteger j = 0; j < iterArgs.count && !alias; ++j) {
+            alias = j != i && outs[i] == iterArgs[j] && outs[j] != iterArgs[j];
+        }
+        if (!alias && traceBody && ret && i < ret->getNumOperands()) {
+            auto ba = mlir::dyn_cast<mlir::BlockArgument>(TraceForwardedValue(ret->getOperand((unsigned)i)));
+            if (ba && ba.getOwner() == &body && ba.getArgNumber() != i) {
+                const unsigned j = ba.getArgNumber();
+                alias = j < outs.count && outs[j] != iterArgs[j];
+            }
+        }
+        if (!alias) {
+            continue;
+        }
+        if (!fixed) {
+            fixed = [NSMutableArray arrayWithArray:outs];
+        }
+        fixed[i] = [g identityWithTensor:outs[i] name:nil];
+    }
+    return fixed ? fixed : outs;
+}
+
 static ProcessResult HandleWhileOp(HandlerContext& ctx) {
     auto whileOp = mlir::dyn_cast<mlir::stablehlo::WhileOp>(ctx.op);
     if (!whileOp) {
@@ -528,7 +882,18 @@ static ProcessResult HandleWhileOp(HandlerContext& ctx) {
                 upperBound = [graph castTensor:upperBound toType:lowerBound.dataType name:nil];
             }
         }
-        MPSGraphTensor* step = [graph constantWithScalar:counted.step dataType:lowerBound.dataType];
+        int unroll = variables ? 1 : ChooseLoopUnroll(whileOp, bodyBlock, counted);
+        std::vector<BatchedLoopWrite> batchWrites;
+        if (unroll == 1 && !variables) {
+            std::unordered_set<mlir::Operation*> writeOps;
+            if (CollectBatchableLoopWrites(bodyBlock, counted, &batchWrites, &writeOps)) {
+                unroll = ChooseLoopUnroll(whileOp, bodyBlock, counted, &writeOps);
+            }
+            if (unroll == 1) {
+                batchWrites.clear();
+            }
+        }
+        MPSGraphTensor* step = [graph constantWithScalar:counted.step * unroll dataType:lowerBound.dataType];
 
         NSArray<MPSGraphTensor*>* outputs = [graph
             forLoopWithLowerBound:lowerBound
@@ -537,8 +902,20 @@ static ProcessResult HandleWhileOp(HandlerContext& ctx) {
              initialBodyArguments:initialInputs
                              body:^NSArray<MPSGraphTensor*>*(MPSGraphTensor*,
                                                              NSArray<MPSGraphTensor*>* iterationArguments) {
-                               return EvaluateLoopBody(graph, bodyBlock, values, iterationArguments, module,
-                                                       depth, true, &blockError, processBlock, variables);
+                               if (!batchWrites.empty()) {
+                                   NSArray<MPSGraphTensor*>* batched = EvaluateBatchedWriteBody(
+                                       graph, bodyBlock, values, iterationArguments, module, depth, unroll,
+                                       batchWrites, &blockError, processBlock);
+                                   return DecoupleForwardedCarries(graph, bodyBlock, iterationArguments,
+                                                                   batched, false);
+                               }
+                               NSArray<MPSGraphTensor*>* args = iterationArguments;
+                               for (int u = 0; u < unroll && blockError.empty(); ++u) {
+                                   args = EvaluateLoopBody(graph, bodyBlock, values, args, module, depth,
+                                                           true, &blockError, processBlock, variables);
+                               }
+                               return DecoupleForwardedCarries(graph, bodyBlock, iterationArguments, args,
+                                                               unroll == 1);
                              }
                              name:nil];
 
@@ -589,6 +966,29 @@ static ProcessResult HandleWhileOp(HandlerContext& ctx) {
     return ProcessResult{};
 }
 
+// Whether a case's branches do enough work that running only the taken one
+// (MPSGraph if) beats building both and selecting. The if materialises its
+// results, which cost more than cheap branches: A/B, one cond on f32[4M]
+// 1.12-1.15 ms as if vs 0.83-0.84 ms as select, 100 conds in a fori_loop
+// 1.39-1.41 vs 1.11-1.12 ms; an untaken matmul branch 0.48-0.62 vs 0.75-0.96.
+static bool CaseBranchesAreHeavy(mlir::Operation* caseOp) {
+    constexpr size_t kHeavyOpCount = 64;
+    bool heavy = false;
+    size_t count = 0;
+    for (mlir::Region& region : caseOp->getRegions()) {
+        region.walk([&](mlir::Operation* op) {
+            ++count;
+            llvm::StringRef name = op->getName().getStringRef();
+            if (name == "stablehlo.while" || name == "stablehlo.case" || name == "stablehlo.dot_general" ||
+                name == "stablehlo.dot" || name == "stablehlo.convolution" || name == "stablehlo.sort" ||
+                name == "stablehlo.fft" || name == "stablehlo.custom_call" || name == "func.call") {
+                heavy = true;
+            }
+        });
+    }
+    return heavy || count > kHeavyOpCount;
+}
+
 static ProcessResult HandleCaseOp(HandlerContext& ctx) {
     if (ctx.depth > 100) {
         return ProcessResult::Error("Maximum call depth exceeded - possible recursive case");
@@ -609,6 +1009,7 @@ static ProcessResult HandleCaseOp(HandlerContext& ctx) {
     const size_t numBranches = ctx.op->getNumRegions();
     const size_t numBranchOperands = ctx.op->getNumOperands() - 1;
 
+    bool branchInRegion = false;
     auto evaluateBranch = [&](size_t branchIndex, std::string* error) -> NSArray<MPSGraphTensor*>* {
         if (branchIndex >= numBranches) {
             if (error) {
@@ -660,6 +1061,7 @@ static ProcessResult HandleCaseOp(HandlerContext& ctx) {
         HandlerContext branchCtx(ctx.graph, nullptr, branchValues, ctx.module, ctx.depth + 1,
                                  ctx.processBlock);
         branchCtx.variables = ctx.variables ? &branchVariables : nullptr;
+        branchCtx.in_control_flow = ctx.in_control_flow || branchInRegion;
         ProcessResult branchResult = ctx.processBlock(branchCtx, block);
         if (!branchResult.ok()) {
             if (error) {
@@ -687,6 +1089,78 @@ static ProcessResult HandleCaseOp(HandlerContext& ctx) {
         }
         return out;
     };
+
+    // lax.cond lowers to a two-branch case (index 0 takes branch 0; StableHLO
+    // sends any other index to the last branch). Building both branches and
+    // selecting (below) runs both on every execution, so a cond-guarded body in
+    // a loop never skips work: the n >= 64 Schur sweep paid a full QR sweep on
+    // every capped iteration and hit the completion timeout. MPSGraph's if runs
+    // only the taken branch, but it costs more than select for cheap branches,
+    // so it is used only when a branch is heavy (CaseBranchesAreHeavy).
+    // JAX_METALLIB_DISABLE_CASE_GRAPH_IF=1 restores evaluate-both + select for
+    // every case.
+    static const bool disableGraphIf = [] {
+        const char* v = std::getenv("JAX_METALLIB_DISABLE_CASE_GRAPH_IF");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (numBranches == 2 && numResults > 0 && !disableGraphIf && CaseBranchesAreHeavy(ctx.op)) {
+        MPSGraphTensor* zero = [ctx.graph constantWithScalar:0 dataType:selector.dataType];
+        MPSGraphTensor* pred = [ctx.graph notEqualWithPrimaryTensor:selector secondaryTensor:zero name:nil];
+        if (pred.shape.count > 0) {
+            pred = [ctx.graph reshapeTensor:pred withShape:@[] name:nil];
+        }
+        // A failed branch must still yield tensors of the result types.
+        auto placeholderOutputs = [&]() -> NSArray<MPSGraphTensor*>* {
+            NSMutableArray<MPSGraphTensor*>* out = [NSMutableArray arrayWithCapacity:(NSUInteger)numResults];
+            for (size_t r = 0; r < numResults; ++r) {
+                auto type = mlir::dyn_cast<mlir::RankedTensorType>(ctx.op->getResult((unsigned)r).getType());
+                MPSDataType dt = type ? MlirTypeToMps(type.getElementType()) : MPSDataTypeFloat32;
+                [out addObject:[ctx.graph constantWithScalar:0
+                                                       shape:GetOutputShape(ctx.op, (unsigned)r)
+                                                    dataType:dt]];
+            }
+            return out;
+        };
+        std::string ifError;
+        std::string* ifErrorPtr = &ifError;
+        auto buildBranch = [&](size_t b) -> NSArray<MPSGraphTensor*>* {
+            if (!ifErrorPtr->empty()) {
+                return placeholderOutputs();
+            }
+            branchInRegion = true;
+            NSArray<MPSGraphTensor*>* out = nil;
+            {
+                ScopedControlFlowContext cf_guard;
+                out = evaluateBranch(b, ifErrorPtr);
+            }
+            branchInRegion = false;
+            if (!out) {
+                if (ifErrorPtr->empty()) {
+                    *ifErrorPtr = "stablehlo.case branch evaluation failed";
+                }
+                return placeholderOutputs();
+            }
+            return out;
+        };
+        NSArray<MPSGraphTensor*>* outputs = [ctx.graph ifWithPredicateTensor:pred
+            thenBlock:^NSArray<MPSGraphTensor*>*() {
+              return buildBranch(1);
+            }
+            elseBlock:^NSArray<MPSGraphTensor*>*() {
+              return buildBranch(0);
+            }
+            name:nil];
+        if (!ifError.empty()) {
+            return ProcessResult::Error(ifError);
+        }
+        if (!outputs || outputs.count != (NSUInteger)numResults) {
+            return ProcessResult::Error("stablehlo.case: ifWithPredicateTensor returned wrong arity");
+        }
+        for (size_t r = 0; r < numResults; ++r) {
+            ctx.values[ctx.op->getResult((unsigned)r).getAsOpaquePointer()] = outputs[r];
+        }
+        return ProcessResult{};
+    }
 
     std::vector<NSArray<MPSGraphTensor*>*> branchOutputs(numBranches);
     for (size_t b = 0; b < numBranches; ++b) {

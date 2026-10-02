@@ -26,6 +26,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -91,6 +92,7 @@ struct OpHandler {
 
     GraphOpHandler graph_handler = nullptr;
     NativeOpHandler native_handler = nullptr;
+    GraphOpHandler graph_fallback = nullptr;
 
     static OpHandler Graph(GraphOpHandler h) {
         OpHandler handler;
@@ -103,6 +105,15 @@ struct OpHandler {
         OpHandler handler;
         handler.kind = Kind::NATIVE;
         handler.native_handler = h;
+        return handler;
+    }
+
+    // Native op that can also be built as MPSGraph ops. The graph form is used
+    // only when the op lands inside a graph region (a case/while body), where
+    // a native kernel cannot run; top-level occurrences stay native.
+    static OpHandler NativeWithGraphFallback(NativeOpHandler h, GraphOpHandler fallback) {
+        OpHandler handler = Native(h);
+        handler.graph_fallback = fallback;
         return handler;
     }
 
@@ -259,10 +270,152 @@ inline bool InControlFlowContext() {
     return g_control_flow_depth > 0;
 }
 
+// MPSGraph evaluates float16/bfloat16 elementwise chains without rounding each
+// intermediate to the half type: round(x * 1.5) with bf16 x = 4.34375 gave 7
+// (XLA: 6, since the product 6.515625 rounds to 6.5 in bf16), exp(x * 1.5) was
+// ~2% off, and f16 (x * 1.5 == 3.00390625) was false for x = 2.001953125.
+// A reinterpret round trip through int16 forces the bf16 value to
+// materialise (same barrier as HandleConvert), but it also splits MPSGraph's
+// elementwise fusion (bf16 tanh/exp chain on 16M elements 1.1 -> 6.4 ms when
+// applied to every op). Smooth chains stay within a few bf16 ulp without it,
+// so by default only values feeding a discontinuous op (round, floor, ceil,
+// sign, compare, rem; traced through data movement) are rounded.
+// JAX_METALLIB_BF16_STRICT_ROUNDING=1 rounds every bf16 op result, which is
+// what XLA:CPU does for bf16. It is bf16-only because XLA:CPU keeps f16
+// arithmetic chains in f32 (f16 x * 1.5 - 3.00390625 is -0.0009765625 there,
+// 0 if the product were rounded), so per-op f16 rounding moves away from it.
+// JAX_METALLIB_DISABLE_HALF_ROUNDING_BARRIER=1 disables both.
+inline bool Bf16BarrierEnvFlag(const char* name) {
+    const char* v = std::getenv(name);
+    return v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+}
+
+inline bool Bf16RoundingBarrierDisabled() {
+    static const bool disabled = Bf16BarrierEnvFlag("JAX_METALLIB_DISABLE_HALF_ROUNDING_BARRIER");
+    return disabled;
+}
+
+inline bool Bf16StrictRounding() {
+    static const bool strict = Bf16BarrierEnvFlag("JAX_METALLIB_BF16_STRICT_ROUNDING");
+    return strict;
+}
+
+inline bool IsDataMovementOp(mlir::Operation* op) {
+    namespace shlo = mlir::stablehlo;
+    return mlir::isa<shlo::ReshapeOp, shlo::BroadcastInDimOp, shlo::TransposeOp, shlo::SliceOp,
+                     shlo::ConstantOp, shlo::ConcatenateOp, shlo::ConvertOp, shlo::ReverseOp, shlo::PadOp,
+                     shlo::DynamicSliceOp, shlo::BitcastConvertOp>(op);
+}
+
+inline bool IsRoundingSensitiveOp(mlir::Operation* op) {
+    namespace shlo = mlir::stablehlo;
+    return mlir::isa<shlo::RoundOp, shlo::RoundNearestEvenOp, shlo::FloorOp, shlo::CeilOp, shlo::SignOp,
+                     shlo::CompareOp, shlo::RemOp>(op);
+}
+
+inline bool FeedsRoundingSensitiveOp(mlir::Operation* op, int depth = 0) {
+    if (depth > 4) {
+        return false;
+    }
+    for (mlir::Value r : op->getResults()) {
+        for (mlir::Operation* user : r.getUsers()) {
+            if (IsRoundingSensitiveOp(user)) {
+                return true;
+            }
+            if (IsDataMovementOp(user) && !mlir::isa<mlir::stablehlo::ConvertOp>(user) &&
+                FeedsRoundingSensitiveOp(user, depth + 1)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+inline MPSGraphTensor* Bf16RoundingBarrier(MPSGraph* g, MPSGraphTensor* t) {
+    NSArray<NSNumber*>* shape = t.shape;
+    if (shape == nil) {
+        return t;
+    }
+    for (NSNumber* d : shape) {
+        if ([d longLongValue] <= 0) {
+            return t;
+        }
+    }
+    const bool scalar = shape.count == 0;
+    MPSGraphTensor* x = scalar ? [g reshapeTensor:t withShape:@[@1] name:nil] : t;
+    MPSGraphTensor* bits = [g reinterpretCastTensor:x toType:MPSDataTypeInt16 name:nil];
+    x = [g reinterpretCastTensor:bits toType:t.dataType name:nil];
+    return scalar ? [g reshapeTensor:x withShape:@[] name:nil] : x;
+}
+
+// MPSGraph negate/abs/select on float16/bfloat16 rewrote every NaN to +qNaN
+// (f16 0x7e00, bf16 0x7fc0) and flushed bf16 subnormals to zero (select too).
+// XLA:CPU does the f16 sign ops as bit arithmetic (negate 0x7e01 -> 0xfe01,
+// abs 0xfe03 -> 0x7e03) and bf16 ops through f32: subnormals and the NaN sign
+// survive and every NaN becomes sign|0x7fc0. These helpers work on the int16
+// view; HalfToBits returns nil (caller falls back) for empty or dynamic
+// shapes. Opt-in (JAX_METALLIB_HALF_BIT_SIGN_OPS=1): the int16 reinterpret
+// splits MPSGraph elementwise fusion, so 16M-element chains slowed 3x
+// (f16 where(m, -(x*y), abs(x)) + y 1.14 -> 3.52 ms, bf16 1.25 -> 4.22 ms),
+// the same trade-off as JAX_METALLIB_BF16_STRICT_ROUNDING.
+inline bool HalfBitSignOpsEnabled() {
+    static const bool enabled = Bf16BarrierEnvFlag("JAX_METALLIB_HALF_BIT_SIGN_OPS");
+    return enabled;
+}
+
+inline bool IsF16OrBf16(MPSDataType dt) {
+    return dt == MPSDataTypeFloat16 || dt == MPSDataTypeBFloat16;
+}
+
+inline MPSGraphTensor* HalfToBits(MPSGraph* g, MPSGraphTensor* t) {
+    NSArray<NSNumber*>* shape = t.shape;
+    if (shape == nil) {
+        return nil;
+    }
+    for (NSNumber* d : shape) {
+        if ([d longLongValue] <= 0) {
+            return nil;
+        }
+    }
+    if (shape.count == 0) {
+        t = [g reshapeTensor:t withShape:@[@1] name:nil];
+    }
+    return [g reinterpretCastTensor:t toType:MPSDataTypeInt16 name:nil];
+}
+
+inline MPSGraphTensor* HalfFromBits(MPSGraph* g, MPSGraphTensor* bits, MPSDataType dtype,
+                                    NSArray<NSNumber*>* shape) {
+    if (dtype == MPSDataTypeBFloat16) {
+        MPSGraphTensor* magMask = [g constantWithScalar:32767.0 dataType:MPSDataTypeInt16];
+        MPSGraphTensor* infBits = [g constantWithScalar:32640.0 dataType:MPSDataTypeInt16];
+        MPSGraphTensor* signMask = [g constantWithScalar:-32768.0 dataType:MPSDataTypeInt16];
+        MPSGraphTensor* qnan = [g constantWithScalar:32704.0 dataType:MPSDataTypeInt16];
+        MPSGraphTensor* mag = [g bitwiseANDWithPrimaryTensor:bits secondaryTensor:magMask name:nil];
+        MPSGraphTensor* isNan = [g greaterThanWithPrimaryTensor:mag secondaryTensor:infBits name:nil];
+        MPSGraphTensor* sign = [g bitwiseANDWithPrimaryTensor:bits secondaryTensor:signMask name:nil];
+        MPSGraphTensor* canon = [g bitwiseORWithPrimaryTensor:sign secondaryTensor:qnan name:nil];
+        bits = [g selectWithPredicateTensor:isNan
+                        truePredicateTensor:canon
+                       falsePredicateTensor:bits
+                                       name:nil];
+    }
+    MPSGraphTensor* out = [g reinterpretCastTensor:bits toType:dtype name:nil];
+    if (shape && ![shape isEqualToArray:out.shape]) {
+        out = [g reshapeTensor:out withShape:shape name:nil];
+    }
+    return out;
+}
+
 inline ProcessResult Result(ValueMap& values, mlir::Operation* op, MPSGraphTensor* result,
                             const char* op_name) {
     if (!result)
         return ProcessResult::Error(std::string(op_name) + ": handler returned null");
+    const bool bf16Result = result.dataType == MPSDataTypeBFloat16;
+    const bool halfResult = bf16Result || result.dataType == MPSDataTypeFloat16;
+    if (halfResult && op && !IsDataMovementOp(op) && !Bf16RoundingBarrierDisabled() &&
+        ((bf16Result && Bf16StrictRounding()) || FeedsRoundingSensitiveOp(op))) {
+        result = Bf16RoundingBarrier(result.operation.graph, result);
+    }
     SetOutputTensor(values, op, result);
     return ProcessResult{};
 }
@@ -292,6 +445,10 @@ inline ProcessResult Result(HandlerContext& ctx, MPSGraphTensor* result, const c
 #define REGISTER_NATIVE_MPS_OP(mlir_op_name, handler_fn)                                                     \
     static bool _reg_##handler_fn =                                                                          \
         ::jax_metallib::OpRegistry::Register(mlir_op_name, ::jax_metallib::OpHandler::Native(handler_fn))
+
+#define REGISTER_NATIVE_MPS_OP_WITH_GRAPH_FALLBACK(mlir_op_name, handler_fn, fallback_fn)                    \
+    static bool _reg_##handler_fn = ::jax_metallib::OpRegistry::Register(                                    \
+        mlir_op_name, ::jax_metallib::OpHandler::NativeWithGraphFallback(handler_fn, fallback_fn))
 
 #define REGISTER_MLIR_BINARY_OP(mlir_op_name, mps_method, reg_suffix)                                        \
     static ::jax_metallib::ProcessResult HandleMlir##reg_suffix(::jax_metallib::HandlerContext& ctx) {       \

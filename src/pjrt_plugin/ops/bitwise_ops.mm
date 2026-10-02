@@ -166,6 +166,55 @@ static MPSGraphTensor* BuildShiftOverflowValue(MPSGraph* g, MPSGraphTensor* inpu
                                    name:nil];
 }
 
+// x >> k with a constant k lowers to shift(x, broadcast_in_dim(constant k)).
+// The overflow guard (k >= bitWidth) and its select over that full-size
+// constant made MPSGraph fold an n-element compare and select one APInt at a
+// time on the first run: 20 rotate rounds on 4M uint32 spent ~11 s before the
+// first result, linear in n (every jax.random call hit this). When k is an
+// in-range splat constant and the input already has the output shape, feed k
+// as a [1,...,1] constant and skip the guard, which cannot fire.
+// JAX_METALLIB_DISABLE_SHIFT_SPLAT_FOLD=1 restores the guarded form.
+static bool ShiftSplatFoldEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("JAX_METALLIB_DISABLE_SHIFT_SPLAT_FOLD");
+        return !(v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0'));
+    }();
+    return enabled;
+}
+
+// Unsigned value of `v` when it is a splat integer constant, possibly behind
+// broadcast_in_dim or reshape. Negative signed amounts come out >= bitWidth.
+static bool SplatShiftAmount(mlir::Value v, uint64_t* amount) {
+    for (int depth = 0; depth < 8 && v; ++depth) {
+        mlir::Operation* def = v.getDefiningOp();
+        if (!def) {
+            return false;
+        }
+        if (auto c = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(def)) {
+            auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(c.getValue());
+            if (!dense || !dense.isSplat()) {
+                return false;
+            }
+            llvm::APInt k = dense.getSplatValue<llvm::APInt>();
+            if (k.getActiveBits() > 64) {
+                return false;
+            }
+            *amount = k.getZExtValue();
+            return true;
+        }
+        if (auto bc = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(def)) {
+            v = bc.getOperand();
+            continue;
+        }
+        if (auto rs = mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(def)) {
+            v = rs.getOperand();
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
 static MPSGraphTensor* HandleShiftOp(HandlerContext& ctx, ShiftMode mode) {
     MPSGraphTensor* input = GetInputTensor(ctx, 0);
     MPSGraphTensor* shiftAmount = GetInputTensor(ctx, 1);
@@ -177,6 +226,22 @@ static MPSGraphTensor* HandleShiftOp(HandlerContext& ctx, ShiftMode mode) {
         return nullptr;
 
     MPSGraph* g = ctx.graph;
+    bool inRangeSplat = false;
+    uint64_t splatAmount = 0;
+    if (ShiftSplatFoldEnabled() && SplatShiftAmount(ctx.op->getOperand(1), &splatAmount) &&
+        splatAmount < static_cast<uint64_t>(bitWidth)) {
+        NSArray<NSNumber*>* out = GetOutputShape(ctx.op);
+        if (out && input.shape && [input.shape isEqualToArray:out]) {
+            NSMutableArray<NSNumber*>* ones = [NSMutableArray arrayWithCapacity:out.count];
+            for (NSUInteger i = 0; i < out.count; ++i) {
+                [ones addObject:@1];
+            }
+            const double k = static_cast<double>(splatAmount);
+            shiftAmount = out.count == 0 ? [g constantWithScalar:k dataType:shiftAmount.dataType]
+                                         : [g constantWithScalar:k shape:ones dataType:shiftAmount.dataType];
+            inRangeSplat = true;
+        }
+    }
     MPSGraphTensor* shiftedResult =
         mode == ShiftMode::kLeft
             ? [g bitwiseLeftShiftWithPrimaryTensor:input secondaryTensor:shiftAmount name:nil]
@@ -212,6 +277,10 @@ static MPSGraphTensor* HandleShiftOp(HandlerContext& ctx, ShiftMode mode) {
                        falsePredicateTensor:[g constantWithScalar:0 dataType:dtype]
                                        name:nil];
         shiftedResult = [g bitwiseORWithPrimaryTensor:shiftedResult secondaryTensor:fill name:nil];
+    }
+
+    if (inRangeSplat) {
+        return shiftedResult;
     }
 
     MPSGraphTensor* overflowMask = BuildShiftOverflowMask(ctx.graph, shiftAmount, bitWidth);

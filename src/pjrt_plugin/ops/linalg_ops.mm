@@ -1220,7 +1220,110 @@ static id<MTLBuffer> NativeHandle_cholesky(id<MTLDevice> device, id<MTLCommandBu
     return outBuf;
 }
 
-REGISTER_NATIVE_MPS_OP("stablehlo.cholesky", NativeHandle_cholesky);
+static MPSGraphTensor* SwapLastTwo(MPSGraph* g, MPSGraphTensor* t) {
+    const NSUInteger r = t.shape.count;
+    return [g transposeTensor:t dimension:r - 2 withDimension:r - 1 name:nil];
+}
+
+// Graph form of cholesky for use inside case/while regions (polar's QDWH runs
+// cholesky inside a while body and failed with "Native op encountered during
+// graph building"). Column-by-column Cholesky: for column j,
+// v = A[:, j] - L[:, :j] L[j, :j]^T, L[j, j] = sqrt(v[j]), L[i>j, j] = v[i] / L[j, j].
+// Only the requested triangle is read; the other triangle of the result is
+// zero. A non-positive-definite input yields NaN, as on XLA. f16/f32, n <= 256.
+static ProcessResult GraphCholeskyFallback(HandlerContext& ctx) {
+    auto cholOp = mlir::dyn_cast<mlir::stablehlo::CholeskyOp>(ctx.op);
+    if (!cholOp) {
+        return ProcessResult::Error("cholesky: expected CholeskyOp");
+    }
+    MPSGraphTensor* a = GetInputTensor(ctx, 0);
+    if (!a) {
+        return ProcessResult::Error("cholesky: missing input tensor");
+    }
+    MPSGraph* g = ctx.graph;
+    const MPSDataType outType = a.dataType;
+    if (outType != MPSDataTypeFloat32 && outType != MPSDataTypeFloat16) {
+        return ProcessResult::Error("cholesky: inside control flow only float16/float32 is supported");
+    }
+    const NSUInteger rank = a.shape.count;
+    if (rank < 2) {
+        return ProcessResult::Error("cholesky: expected rank >= 2 operand");
+    }
+    const int64_t n = [a.shape[rank - 1] longLongValue];
+    if (n <= 0 || n > 256 || [a.shape[rank - 2] longLongValue] != n) {
+        return ProcessResult::Error("cholesky: inside control flow A must be square with n <= 256");
+    }
+    const bool lower = !cholOp.getLowerAttr() || cholOp.getLower();
+    if (outType == MPSDataTypeFloat16) {
+        a = [g castTensor:a toType:MPSDataTypeFloat32 name:nil];
+    }
+    if (!lower) { // U^T U = A  <=>  L = U^T is the lower factor of A^T.
+        a = SwapLastTwo(g, a);
+    }
+    NSMutableArray<NSNumber*>* colShape = [NSMutableArray arrayWithCapacity:rank];
+    for (NSUInteger d = 0; d + 2 < rank; ++d) {
+        [colShape addObject:@1];
+    }
+    [colShape addObject:@(n)];
+    [colShape addObject:@1];
+    std::vector<int32_t> iota(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        iota[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    }
+    MPSGraphTensor* rowIdx = [g constantWithData:[NSData dataWithBytes:iota.data() length:iota.size() * 4]
+                                           shape:colShape
+                                        dataType:MPSDataTypeInt32];
+    MPSGraphTensor* zero = [g constantWithScalar:0.0 dataType:MPSDataTypeFloat32];
+    NSMutableArray<MPSGraphTensor*>* cols = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
+    for (int64_t j = 0; j < n; ++j) {
+        MPSGraphTensor* v = [g sliceTensor:a
+                                 dimension:(NSInteger)rank - 1
+                                     start:(NSInteger)j
+                                    length:1
+                                      name:nil];
+        if (j > 0) {
+            MPSGraphTensor* lp =
+                cols.count == 1 ? cols[0] : [g concatTensors:cols dimension:(NSInteger)rank - 1 name:nil];
+            MPSGraphTensor* lrow = [g sliceTensor:lp
+                                        dimension:(NSInteger)rank - 2
+                                            start:(NSInteger)j
+                                           length:1
+                                             name:nil];
+            MPSGraphTensor* acc = [g matrixMultiplicationWithPrimaryTensor:lp
+                                                           secondaryTensor:SwapLastTwo(g, lrow)
+                                                                      name:nil];
+            v = [g subtractionWithPrimaryTensor:v secondaryTensor:acc name:nil];
+        }
+        MPSGraphTensor* d = [g sliceTensor:v
+                                 dimension:(NSInteger)rank - 2
+                                     start:(NSInteger)j
+                                    length:1
+                                      name:nil];
+        MPSGraphTensor* s = [g squareRootWithTensor:d name:nil];
+        MPSGraphTensor* below = [g divisionWithPrimaryTensor:v secondaryTensor:s name:nil];
+        MPSGraphTensor* jT = [g constantWithScalar:(double)j dataType:MPSDataTypeInt32];
+        MPSGraphTensor* isDiag = [g equalWithPrimaryTensor:rowIdx secondaryTensor:jT name:nil];
+        MPSGraphTensor* isBelow = [g greaterThanWithPrimaryTensor:rowIdx secondaryTensor:jT name:nil];
+        MPSGraphTensor* col = [g selectWithPredicateTensor:isBelow
+                                       truePredicateTensor:below
+                                      falsePredicateTensor:zero
+                                                      name:nil];
+        col = [g selectWithPredicateTensor:isDiag truePredicateTensor:s falsePredicateTensor:col name:nil];
+        [cols addObject:col];
+    }
+    MPSGraphTensor* l =
+        cols.count == 1 ? cols[0] : [g concatTensors:cols dimension:(NSInteger)rank - 1 name:nil];
+    if (!lower) {
+        l = SwapLastTwo(g, l);
+    }
+    if (outType == MPSDataTypeFloat16) {
+        l = [g castTensor:l toType:MPSDataTypeFloat16 name:nil];
+    }
+    return Result(ctx, l, "cholesky");
+}
+
+REGISTER_NATIVE_MPS_OP_WITH_GRAPH_FALLBACK("stablehlo.cholesky", NativeHandle_cholesky,
+                                           GraphCholeskyFallback);
 
 static id<MTLBuffer> NativeHandle_triangular_solve(id<MTLDevice> device, id<MTLCommandBuffer> cmdBuf,
                                                    mlir::Operation* op,
@@ -1581,7 +1684,108 @@ static id<MTLBuffer> NativeHandle_triangular_solve(id<MTLDevice> device, id<MTLC
     return outBuf;
 }
 
-REGISTER_NATIVE_MPS_OP("stablehlo.triangular_solve", NativeHandle_triangular_solve);
+// Graph form of triangular_solve for use inside case/while regions, where the
+// native MPS solver cannot run (jax.scipy.linalg.expm solves its Pade system
+// inside a runtime case and failed with "Native op encountered during graph
+// building"). Every variant is reduced to a left-side lower solve with
+// transposes and row/column reversal, then solved by unrolled forward
+// substitution. Only the requested triangle is read. float16/float32, n <= 256.
+static ProcessResult GraphTriangularSolveFallback(HandlerContext& ctx) {
+    auto triOp = mlir::dyn_cast<mlir::stablehlo::TriangularSolveOp>(ctx.op);
+    if (!triOp) {
+        return ProcessResult::Error("triangular_solve: expected TriangularSolveOp");
+    }
+    MPSGraphTensor* a = GetInputTensor(ctx, 0);
+    MPSGraphTensor* b = GetInputTensor(ctx, 1);
+    if (!a || !b) {
+        return ProcessResult::Error("triangular_solve: missing input tensor");
+    }
+    MPSGraph* g = ctx.graph;
+    const MPSDataType outType = b.dataType;
+    if ((outType != MPSDataTypeFloat32 && outType != MPSDataTypeFloat16) || a.dataType != outType) {
+        return ProcessResult::Error(
+            "triangular_solve: inside control flow only float16/float32 is supported");
+    }
+    const NSUInteger rank = a.shape.count;
+    if (rank < 2 || b.shape.count != rank) {
+        return ProcessResult::Error("triangular_solve: expected matching rank >= 2 operands");
+    }
+    const int64_t n = [a.shape[rank - 1] longLongValue];
+    if (n <= 0 || n > 256 || [a.shape[rank - 2] longLongValue] != n) {
+        return ProcessResult::Error("triangular_solve: inside control flow A must be square with n <= 256");
+    }
+    if (outType == MPSDataTypeFloat16) {
+        a = [g castTensor:a toType:MPSDataTypeFloat32 name:nil];
+        b = [g castTensor:b toType:MPSDataTypeFloat32 name:nil];
+    }
+    bool lower = triOp.getLower();
+    const bool unit = triOp.getUnitDiagonal();
+    const auto transposeA = triOp.getTransposeA();
+    const bool left = triOp.getLeftSide();
+    if (transposeA == mlir::stablehlo::Transpose::TRANSPOSE ||
+        transposeA == mlir::stablehlo::Transpose::ADJOINT) {
+        a = SwapLastTwo(g, a);
+        lower = !lower;
+    }
+    if (!left) { // X op(A) = B  <=>  op(A)^T X^T = B^T
+        a = SwapLastTwo(g, a);
+        lower = !lower;
+        b = SwapLastTwo(g, b);
+    }
+    const bool flipped = !lower; // J U J is lower; solve for J x from J b.
+    if (flipped) {
+        a = [g reverseTensor:a axes:@[@(rank - 2), @(rank - 1)] name:nil];
+        b = [g reverseTensor:b axes:@[@(rank - 2)] name:nil];
+    }
+    NSMutableArray<MPSGraphTensor*>* rows = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
+    for (int64_t i = 0; i < n; ++i) {
+        MPSGraphTensor* aRow = [g sliceTensor:a
+                                    dimension:(NSInteger)rank - 2
+                                        start:(NSInteger)i
+                                       length:1
+                                         name:nil];
+        MPSGraphTensor* bi = [g sliceTensor:b
+                                  dimension:(NSInteger)rank - 2
+                                      start:(NSInteger)i
+                                     length:1
+                                       name:nil];
+        if (i > 0) {
+            MPSGraphTensor* li = [g sliceTensor:aRow
+                                      dimension:(NSInteger)rank - 1
+                                          start:0
+                                         length:(NSInteger)i
+                                           name:nil];
+            MPSGraphTensor* xp =
+                rows.count == 1 ? rows[0] : [g concatTensors:rows dimension:(NSInteger)rank - 2 name:nil];
+            MPSGraphTensor* acc = [g matrixMultiplicationWithPrimaryTensor:li secondaryTensor:xp name:nil];
+            bi = [g subtractionWithPrimaryTensor:bi secondaryTensor:acc name:nil];
+        }
+        if (!unit) {
+            MPSGraphTensor* d = [g sliceTensor:aRow
+                                     dimension:(NSInteger)rank - 1
+                                         start:(NSInteger)i
+                                        length:1
+                                          name:nil];
+            bi = [g divisionWithPrimaryTensor:bi secondaryTensor:d name:nil];
+        }
+        [rows addObject:bi];
+    }
+    MPSGraphTensor* x =
+        rows.count == 1 ? rows[0] : [g concatTensors:rows dimension:(NSInteger)rank - 2 name:nil];
+    if (flipped) {
+        x = [g reverseTensor:x axes:@[@(rank - 2)] name:nil];
+    }
+    if (!left) {
+        x = SwapLastTwo(g, x);
+    }
+    if (outType == MPSDataTypeFloat16) {
+        x = [g castTensor:x toType:MPSDataTypeFloat16 name:nil];
+    }
+    return Result(ctx, x, "triangular_solve");
+}
+
+REGISTER_NATIVE_MPS_OP_WITH_GRAPH_FALLBACK("stablehlo.triangular_solve", NativeHandle_triangular_solve,
+                                           GraphTriangularSolveFallback);
 
 // jnp.linalg.qr lowers to two custom calls that had no MPS handler:
 //   Qr: LAPACK geqrf -> (packed R + Householder tails, tau)
