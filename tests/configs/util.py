@@ -56,6 +56,9 @@ class OperationTestConfig:
 
     EXERCISED_STABLEHLO_OPS: ClassVar[set[str]] = {
         # HACK: Register these ops as exercised because JAX doesn't seem to generate them.
+        # broadcast/dot/map and the dynamic-shape ops below are run on MPS and compared bitwise
+        # with CPU in tests/test_unemitted_ops.py (child processes, so they cannot update this set).
+        # RNG ops: tests/test_rng_uniform.py and tests/test_rng_bit_generator.py.
         "stablehlo.broadcast",
         "stablehlo.dot",
         "stablehlo.erf",

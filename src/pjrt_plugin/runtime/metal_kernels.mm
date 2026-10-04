@@ -34,6 +34,46 @@ NSString* FastNativeKernelsSource() {
 #include <metal_stdlib>
 using namespace metal;
 
+// StableHLO maximum/minimum propagate NaN; Metal max/min return the non-NaN
+// operand. NaN is tested on the bit pattern (the library is built with default
+// fast math, where isnan() may be folded) and the NaN operand is returned.
+inline float nb_max(float a, float b) {
+  float m = max(a, b);
+  m = (as_type<uint>(b) & 0x7fffffffu) > 0x7f800000u ? b : m;
+  return (as_type<uint>(a) & 0x7fffffffu) > 0x7f800000u ? a : m;
+}
+inline float nb_min(float a, float b) {
+  float m = min(a, b);
+  m = (as_type<uint>(b) & 0x7fffffffu) > 0x7f800000u ? b : m;
+  return (as_type<uint>(a) & 0x7fffffffu) > 0x7f800000u ? a : m;
+}
+inline half nb_max(half a, half b) {
+  half m = max(a, b);
+  m = (as_type<ushort>(b) & 0x7fffu) > 0x7c00u ? b : m;
+  return (as_type<ushort>(a) & 0x7fffu) > 0x7c00u ? a : m;
+}
+inline half nb_min(half a, half b) {
+  half m = min(a, b);
+  m = (as_type<ushort>(b) & 0x7fffu) > 0x7c00u ? b : m;
+  return (as_type<ushort>(a) & 0x7fffu) > 0x7c00u ? a : m;
+}
+inline float4 nb_max(float4 a, float4 b) {
+  float4 m = select(max(a, b), b, (as_type<uint4>(b) & uint4(0x7fffffffu)) > uint4(0x7f800000u));
+  return select(m, a, (as_type<uint4>(a) & uint4(0x7fffffffu)) > uint4(0x7f800000u));
+}
+inline float4 nb_min(float4 a, float4 b) {
+  float4 m = select(min(a, b), b, (as_type<uint4>(b) & uint4(0x7fffffffu)) > uint4(0x7f800000u));
+  return select(m, a, (as_type<uint4>(a) & uint4(0x7fffffffu)) > uint4(0x7f800000u));
+}
+inline half4 nb_max(half4 a, half4 b) {
+  half4 m = select(max(a, b), b, (as_type<ushort4>(b) & ushort4(0x7fffu)) > ushort4(0x7c00u));
+  return select(m, a, (as_type<ushort4>(a) & ushort4(0x7fffu)) > ushort4(0x7c00u));
+}
+inline half4 nb_min(half4 a, half4 b) {
+  half4 m = select(min(a, b), b, (as_type<ushort4>(b) & ushort4(0x7fffu)) > ushort4(0x7c00u));
+  return select(m, a, (as_type<ushort4>(a) & ushort4(0x7fffu)) > ushort4(0x7c00u));
+}
+
 kernel void unary_neg_f16(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
                           constant uint& n [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
   if (gid < n) y[gid] = -x[gid];
@@ -209,22 +249,22 @@ kernel void binary_div_f32(device const float* a [[buffer(0)]], device const flo
 kernel void binary_max_f16(device const half* a [[buffer(0)]], device const half* b [[buffer(1)]],
                            device half* y [[buffer(2)]], constant uint& n [[buffer(3)]],
                            uint gid [[thread_position_in_grid]]) {
-  if (gid < n) y[gid] = max(a[gid], b[gid]);
+  if (gid < n) y[gid] = nb_max(a[gid], b[gid]);
 }
 kernel void binary_max_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
                            device float* y [[buffer(2)]], constant uint& n [[buffer(3)]],
                            uint gid [[thread_position_in_grid]]) {
-  if (gid < n) y[gid] = max(a[gid], b[gid]);
+  if (gid < n) y[gid] = nb_max(a[gid], b[gid]);
 }
 kernel void binary_min_f16(device const half* a [[buffer(0)]], device const half* b [[buffer(1)]],
                            device half* y [[buffer(2)]], constant uint& n [[buffer(3)]],
                            uint gid [[thread_position_in_grid]]) {
-  if (gid < n) y[gid] = min(a[gid], b[gid]);
+  if (gid < n) y[gid] = nb_min(a[gid], b[gid]);
 }
 kernel void binary_min_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
                            device float* y [[buffer(2)]], constant uint& n [[buffer(3)]],
                            uint gid [[thread_position_in_grid]]) {
-  if (gid < n) y[gid] = min(a[gid], b[gid]);
+  if (gid < n) y[gid] = nb_min(a[gid], b[gid]);
 }
 kernel void ternary_select_f16(device const uchar* p [[buffer(0)]], device const half* a [[buffer(1)]],
                                device const half* b [[buffer(2)]], device half* y [[buffer(3)]],
@@ -265,22 +305,22 @@ kernel void binary_mul_vec4_f16(device const half4* a [[buffer(0)]], device cons
 kernel void binary_max_vec4_f32(device const float4* a [[buffer(0)]], device const float4* b [[buffer(1)]],
                                 device float4* y [[buffer(2)]], constant uint& n4 [[buffer(3)]],
                                 uint gid [[thread_position_in_grid]]) {
-  if (gid < n4) y[gid] = max(a[gid], b[gid]);
+  if (gid < n4) y[gid] = nb_max(a[gid], b[gid]);
 }
 kernel void binary_max_vec4_f16(device const half4* a [[buffer(0)]], device const half4* b [[buffer(1)]],
                                 device half4* y [[buffer(2)]], constant uint& n4 [[buffer(3)]],
                                 uint gid [[thread_position_in_grid]]) {
-  if (gid < n4) y[gid] = max(a[gid], b[gid]);
+  if (gid < n4) y[gid] = nb_max(a[gid], b[gid]);
 }
 kernel void binary_min_vec4_f32(device const float4* a [[buffer(0)]], device const float4* b [[buffer(1)]],
                                 device float4* y [[buffer(2)]], constant uint& n4 [[buffer(3)]],
                                 uint gid [[thread_position_in_grid]]) {
-  if (gid < n4) y[gid] = min(a[gid], b[gid]);
+  if (gid < n4) y[gid] = nb_min(a[gid], b[gid]);
 }
 kernel void binary_min_vec4_f16(device const half4* a [[buffer(0)]], device const half4* b [[buffer(1)]],
                                 device half4* y [[buffer(2)]], constant uint& n4 [[buffer(3)]],
                                 uint gid [[thread_position_in_grid]]) {
-  if (gid < n4) y[gid] = min(a[gid], b[gid]);
+  if (gid < n4) y[gid] = nb_min(a[gid], b[gid]);
 }
 kernel void ternary_select_vec4_f32(device const uchar4* p [[buffer(0)]],
                                     device const float4* a [[buffer(1)]],
@@ -432,12 +472,12 @@ kernel void binary_div_vec8_f32(device const float4* a [[buffer(0)]], device con
 kernel void binary_max_vec8_f32(device const float4* a [[buffer(0)]], device const float4* b [[buffer(1)]],
                                 device float4* y [[buffer(2)]], constant uint& n8 [[buffer(3)]],
                                 uint gid [[thread_position_in_grid]]) {
-  if (gid < n8) { uint i = gid * 2; y[i] = max(a[i], b[i]); y[i+1] = max(a[i+1], b[i+1]); }
+  if (gid < n8) { uint i = gid * 2; y[i] = nb_max(a[i], b[i]); y[i+1] = nb_max(a[i+1], b[i+1]); }
 }
 kernel void binary_min_vec8_f32(device const float4* a [[buffer(0)]], device const float4* b [[buffer(1)]],
                                 device float4* y [[buffer(2)]], constant uint& n8 [[buffer(3)]],
                                 uint gid [[thread_position_in_grid]]) {
-  if (gid < n8) { uint i = gid * 2; y[i] = min(a[i], b[i]); y[i+1] = min(a[i+1], b[i+1]); }
+  if (gid < n8) { uint i = gid * 2; y[i] = nb_min(a[i], b[i]); y[i+1] = nb_min(a[i+1], b[i+1]); }
 }
 // ── vec8 fp16 kernels: each thread processes 8 halfs (two half4 loads) ──
 // Doubles work-per-thread for fp16, matching MLX's "8 bytes per thread" strategy.
@@ -560,8 +600,8 @@ kernel void binary_max_vec8_f16(device const half4* a [[buffer(0)]], device cons
                                 uint gid [[thread_position_in_grid]]) {
   if (gid < n8) {
     uint i = gid * 2;
-    y[i] = max(a[i], b[i]);
-    y[i + 1] = max(a[i + 1], b[i + 1]);
+    y[i] = nb_max(a[i], b[i]);
+    y[i + 1] = nb_max(a[i + 1], b[i + 1]);
   }
 }
 kernel void binary_min_vec8_f16(device const half4* a [[buffer(0)]], device const half4* b [[buffer(1)]],
@@ -569,8 +609,8 @@ kernel void binary_min_vec8_f16(device const half4* a [[buffer(0)]], device cons
                                 uint gid [[thread_position_in_grid]]) {
   if (gid < n8) {
     uint i = gid * 2;
-    y[i] = min(a[i], b[i]);
-    y[i + 1] = min(a[i + 1], b[i + 1]);
+    y[i] = nb_min(a[i], b[i]);
+    y[i + 1] = nb_min(a[i + 1], b[i + 1]);
   }
 }
 kernel void ternary_select_vec8_f16(device const uchar4* p [[buffer(0)]],
@@ -643,8 +683,8 @@ BINARY_STRIDE_F32(add, a[i] + b[i])
 BINARY_STRIDE_F32(sub, a[i] - b[i])
 BINARY_STRIDE_F32(mul, a[i] * b[i])
 BINARY_STRIDE_F32(div, a[i] / b[i])
-BINARY_STRIDE_F32(max, max(a[i], b[i]))
-BINARY_STRIDE_F32(min, min(a[i], b[i]))
+BINARY_STRIDE_F32(max, nb_max(a[i], b[i]))
+BINARY_STRIDE_F32(min, nb_min(a[i], b[i]))
 #undef BINARY_STRIDE_F32
 
 // === Ternary select stride f32 ===
@@ -710,8 +750,8 @@ BINARY_STRIDE_F16(add, a[i] + b[i])
 BINARY_STRIDE_F16(sub, a[i] - b[i])
 BINARY_STRIDE_F16(mul, a[i] * b[i])
 BINARY_STRIDE_F16(div, a[i] / b[i])
-BINARY_STRIDE_F16(max, max(a[i], b[i]))
-BINARY_STRIDE_F16(min, min(a[i], b[i]))
+BINARY_STRIDE_F16(max, nb_max(a[i], b[i]))
+BINARY_STRIDE_F16(min, nb_min(a[i], b[i]))
 #undef BINARY_STRIDE_F16
 
 // === Ternary select stride f16 ===
@@ -787,126 +827,68 @@ kernel void reduce_sum_last_f32_tg(device const float* x [[buffer(0)]], device f
     if (lane == 0) y[row] = total;
   }
 }
-kernel void reduce_max_last_f16_tg(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
-                                   constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                   uint tid [[thread_index_in_threadgroup]],
-                                   uint row [[threadgroup_position_in_grid]],
-                                   uint lane [[thread_index_in_simdgroup]],
-                                   uint simd_group [[simdgroup_index_in_threadgroup]],
-                                   uint tg_size [[threads_per_threadgroup]]) {
-  if (row >= rows) return;
-  uint base = row * cols;
-  float acc = -INFINITY;
-  uint vec8_cols = cols & ~7u;
-  for (uint i = tid * 8; i < vec8_cols; i += tg_size * 8) {
-    half4 v0 = *reinterpret_cast<device const half4*>(x + base + i);
-    half4 v1 = *reinterpret_cast<device const half4*>(x + base + i + 4);
-    acc = max(acc, max(max(max((float)v0[0], (float)v0[1]), max((float)v0[2], (float)v0[3])),
-                       max(max((float)v1[0], (float)v1[1]), max((float)v1[2], (float)v1[3]))));
-  }
-  for (uint i = vec8_cols + tid; i < cols; i += tg_size) acc = max(acc, (float)x[base + i]);
-  float simd_acc = simd_max(acc);
-  constexpr uint kMaxSimdGroups = 32;
-  threadgroup float partial[kMaxSimdGroups];
-  if (lane == 0) partial[simd_group] = simd_acc;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group == 0) {
-    uint num_simd = (tg_size + 31) >> 5;
-    float block = (lane < num_simd) ? partial[lane] : -INFINITY;
-    float total = simd_max(block);
-    if (lane == 0) y[row] = (half)total;
-  }
+// Max/min reductions must propagate NaN (StableHLO maximum/minimum do), but
+// Metal max/min and simd_max/simd_min return the non-NaN operand, and this
+// library is compiled with the default (fast) math mode, where isnan() may be
+// folded away. The max/min kernels below therefore carry an integer NaN flag
+// built from the bit pattern and store a quiet NaN when any element was NaN
+// (before this, jnp.max/min over >= 4096 elements silently dropped NaN).
+inline uint rd_nan4(float4 v) { return any((as_type<uint4>(v) & uint4(0x7fffffffu)) > uint4(0x7f800000u)) ? 1u : 0u; }
+inline uint rd_nan4(half4 v) { return any((as_type<ushort4>(v) & ushort4(0x7fffu)) > ushort4(0x7c00u)) ? 1u : 0u; }
+inline uint rd_nan(float v) { return (as_type<uint>(v) & 0x7fffffffu) > 0x7f800000u ? 1u : 0u; }
+inline uint rd_nan(half v) { return (uint(as_type<ushort>(v)) & 0x7fffu) > 0x7c00u ? 1u : 0u; }
+inline float rd_qnan_like(float) { return as_type<float>(0x7fc00000u); }
+inline half rd_qnan_like(half) { return as_type<half>((ushort)0x7e00u); }
+
+#define REDUCE_MINMAX_LAST_TG(NAME, T, V4, OP, INIT) \
+kernel void NAME(device const T* x [[buffer(0)]], device T* y [[buffer(1)]], \
+                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]], \
+                 uint tid [[thread_index_in_threadgroup]], \
+                 uint row [[threadgroup_position_in_grid]], \
+                 uint lane [[thread_index_in_simdgroup]], \
+                 uint simd_group [[simdgroup_index_in_threadgroup]], \
+                 uint tg_size [[threads_per_threadgroup]]) { \
+  if (row >= rows) return; \
+  uint base = row * cols; \
+  float acc = INIT; \
+  uint nan_seen = 0u; \
+  uint vec8_cols = cols & ~7u; \
+  for (uint i = tid * 8; i < vec8_cols; i += tg_size * 8) { \
+    V4 v0 = *reinterpret_cast<device const V4*>(x + base + i); \
+    V4 v1 = *reinterpret_cast<device const V4*>(x + base + i + 4); \
+    nan_seen |= rd_nan4(v0) | rd_nan4(v1); \
+    float4 f0 = float4(v0), f1 = float4(v1); \
+    acc = OP(acc, OP(OP(OP(f0[0], f0[1]), OP(f0[2], f0[3])), OP(OP(f1[0], f1[1]), OP(f1[2], f1[3])))); \
+  } \
+  for (uint i = vec8_cols + tid; i < cols; i += tg_size) { \
+    T v = x[base + i]; \
+    nan_seen |= rd_nan(v); \
+    acc = OP(acc, float(v)); \
+  } \
+  float simd_acc = simd_##OP(acc); \
+  uint simd_nan = simd_max(nan_seen); \
+  constexpr uint kMaxSimdGroups = 32; \
+  threadgroup float partial[kMaxSimdGroups]; \
+  threadgroup uint partial_nan[kMaxSimdGroups]; \
+  if (lane == 0) { \
+    partial[simd_group] = simd_acc; \
+    partial_nan[simd_group] = simd_nan; \
+  } \
+  threadgroup_barrier(mem_flags::mem_threadgroup); \
+  if (simd_group == 0) { \
+    uint num_simd = (tg_size + 31) >> 5; \
+    float block = (lane < num_simd) ? partial[lane] : INIT; \
+    uint block_nan = (lane < num_simd) ? partial_nan[lane] : 0u; \
+    float total = simd_##OP(block); \
+    uint any_nan = simd_max(block_nan); \
+    if (lane == 0) y[row] = any_nan ? rd_qnan_like(T(0)) : T(total); \
+  } \
 }
-kernel void reduce_max_last_f32_tg(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
-                                   constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                   uint tid [[thread_index_in_threadgroup]],
-                                   uint row [[threadgroup_position_in_grid]],
-                                   uint lane [[thread_index_in_simdgroup]],
-                                   uint simd_group [[simdgroup_index_in_threadgroup]],
-                                   uint tg_size [[threads_per_threadgroup]]) {
-  if (row >= rows) return;
-  uint base = row * cols;
-  float acc = -INFINITY;
-  uint vec8_cols = cols & ~7u;
-  for (uint i = tid * 8; i < vec8_cols; i += tg_size * 8) {
-    float4 v0 = *reinterpret_cast<device const float4*>(x + base + i);
-    float4 v1 = *reinterpret_cast<device const float4*>(x + base + i + 4);
-    acc = max(acc, max(max(max(v0[0], v0[1]), max(v0[2], v0[3])),
-                       max(max(v1[0], v1[1]), max(v1[2], v1[3]))));
-  }
-  for (uint i = vec8_cols + tid; i < cols; i += tg_size) acc = max(acc, x[base + i]);
-  float simd_acc = simd_max(acc);
-  constexpr uint kMaxSimdGroups = 32;
-  threadgroup float partial[kMaxSimdGroups];
-  if (lane == 0) partial[simd_group] = simd_acc;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group == 0) {
-    uint num_simd = (tg_size + 31) >> 5;
-    float block = (lane < num_simd) ? partial[lane] : -INFINITY;
-    float total = simd_max(block);
-    if (lane == 0) y[row] = total;
-  }
-}
-kernel void reduce_min_last_f16_tg(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
-                                   constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                   uint tid [[thread_index_in_threadgroup]],
-                                   uint row [[threadgroup_position_in_grid]],
-                                   uint lane [[thread_index_in_simdgroup]],
-                                   uint simd_group [[simdgroup_index_in_threadgroup]],
-                                   uint tg_size [[threads_per_threadgroup]]) {
-  if (row >= rows) return;
-  uint base = row * cols;
-  float acc = INFINITY;
-  uint vec8_cols = cols & ~7u;
-  for (uint i = tid * 8; i < vec8_cols; i += tg_size * 8) {
-    half4 v0 = *reinterpret_cast<device const half4*>(x + base + i);
-    half4 v1 = *reinterpret_cast<device const half4*>(x + base + i + 4);
-    acc = min(acc, min(min(min((float)v0[0], (float)v0[1]), min((float)v0[2], (float)v0[3])),
-                       min(min((float)v1[0], (float)v1[1]), min((float)v1[2], (float)v1[3]))));
-  }
-  for (uint i = vec8_cols + tid; i < cols; i += tg_size) acc = min(acc, (float)x[base + i]);
-  float simd_acc = simd_min(acc);
-  constexpr uint kMaxSimdGroups = 32;
-  threadgroup float partial[kMaxSimdGroups];
-  if (lane == 0) partial[simd_group] = simd_acc;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group == 0) {
-    uint num_simd = (tg_size + 31) >> 5;
-    float block = (lane < num_simd) ? partial[lane] : INFINITY;
-    float total = simd_min(block);
-    if (lane == 0) y[row] = (half)total;
-  }
-}
-kernel void reduce_min_last_f32_tg(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
-                                   constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                   uint tid [[thread_index_in_threadgroup]],
-                                   uint row [[threadgroup_position_in_grid]],
-                                   uint lane [[thread_index_in_simdgroup]],
-                                   uint simd_group [[simdgroup_index_in_threadgroup]],
-                                   uint tg_size [[threads_per_threadgroup]]) {
-  if (row >= rows) return;
-  uint base = row * cols;
-  float acc = INFINITY;
-  uint vec8_cols = cols & ~7u;
-  for (uint i = tid * 8; i < vec8_cols; i += tg_size * 8) {
-    float4 v0 = *reinterpret_cast<device const float4*>(x + base + i);
-    float4 v1 = *reinterpret_cast<device const float4*>(x + base + i + 4);
-    acc = min(acc, min(min(min(v0[0], v0[1]), min(v0[2], v0[3])),
-                       min(min(v1[0], v1[1]), min(v1[2], v1[3]))));
-  }
-  for (uint i = vec8_cols + tid; i < cols; i += tg_size) acc = min(acc, x[base + i]);
-  float simd_acc = simd_min(acc);
-  constexpr uint kMaxSimdGroups = 32;
-  threadgroup float partial[kMaxSimdGroups];
-  if (lane == 0) partial[simd_group] = simd_acc;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group == 0) {
-    uint num_simd = (tg_size + 31) >> 5;
-    float block = (lane < num_simd) ? partial[lane] : INFINITY;
-    float total = simd_min(block);
-    if (lane == 0) y[row] = total;
-  }
-}
+REDUCE_MINMAX_LAST_TG(reduce_max_last_f16_tg, half, half4, max, -INFINITY)
+REDUCE_MINMAX_LAST_TG(reduce_max_last_f32_tg, float, float4, max, -INFINITY)
+REDUCE_MINMAX_LAST_TG(reduce_min_last_f16_tg, half, half4, min, INFINITY)
+REDUCE_MINMAX_LAST_TG(reduce_min_last_f32_tg, float, float4, min, INFINITY)
+#undef REDUCE_MINMAX_LAST_TG
 kernel void reduce_sum_last_f16_lin(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
                                     constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
                                     uint gid [[thread_position_in_grid]]) {
@@ -941,74 +923,36 @@ kernel void reduce_sum_last_f32_lin(device const float* x [[buffer(0)]], device 
     y[gid] = acc;
   }
 }
-kernel void reduce_max_last_f16_lin(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
-                                    constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                    uint gid [[thread_position_in_grid]]) {
-  if (gid < rows) {
-    uint base = gid * cols;
-    float acc = -INFINITY;
-    uint vec8_cols = cols & ~7u;
-    for (uint i = 0; i < vec8_cols; i += 8) {
-      half4 v0 = *reinterpret_cast<device const half4*>(x + base + i);
-      half4 v1 = *reinterpret_cast<device const half4*>(x + base + i + 4);
-      acc = max(acc, max(max(max((float)v0[0], (float)v0[1]), max((float)v0[2], (float)v0[3])),
-                         max(max((float)v1[0], (float)v1[1]), max((float)v1[2], (float)v1[3]))));
-    }
-    for (uint i = vec8_cols; i < cols; ++i) acc = max(acc, (float)x[base + i]);
-    y[gid] = (half)acc;
-  }
+// NaN-propagating per-thread row max/min (see rd_nan above).
+#define REDUCE_MINMAX_LAST_LIN(NAME, T, V4, OP, INIT) \
+kernel void NAME(device const T* x [[buffer(0)]], device T* y [[buffer(1)]], \
+                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]], \
+                 uint gid [[thread_position_in_grid]]) { \
+  if (gid < rows) { \
+    uint base = gid * cols; \
+    float acc = INIT; \
+    uint nan_seen = 0u; \
+    uint vec8_cols = cols & ~7u; \
+    for (uint i = 0; i < vec8_cols; i += 8) { \
+      V4 v0 = *reinterpret_cast<device const V4*>(x + base + i); \
+      V4 v1 = *reinterpret_cast<device const V4*>(x + base + i + 4); \
+      nan_seen |= rd_nan4(v0) | rd_nan4(v1); \
+      float4 f0 = float4(v0), f1 = float4(v1); \
+      acc = OP(acc, OP(OP(OP(f0[0], f0[1]), OP(f0[2], f0[3])), OP(OP(f1[0], f1[1]), OP(f1[2], f1[3])))); \
+    } \
+    for (uint i = vec8_cols; i < cols; ++i) { \
+      T v = x[base + i]; \
+      nan_seen |= rd_nan(v); \
+      acc = OP(acc, float(v)); \
+    } \
+    y[gid] = nan_seen ? rd_qnan_like(T(0)) : T(acc); \
+  } \
 }
-kernel void reduce_max_last_f32_lin(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
-                                    constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                    uint gid [[thread_position_in_grid]]) {
-  if (gid < rows) {
-    uint base = gid * cols;
-    float acc = -INFINITY;
-    uint vec8_cols = cols & ~7u;
-    for (uint i = 0; i < vec8_cols; i += 8) {
-      float4 v0 = *reinterpret_cast<device const float4*>(x + base + i);
-      float4 v1 = *reinterpret_cast<device const float4*>(x + base + i + 4);
-      acc = max(acc, max(max(max(v0[0], v0[1]), max(v0[2], v0[3])),
-                         max(max(v1[0], v1[1]), max(v1[2], v1[3]))));
-    }
-    for (uint i = vec8_cols; i < cols; ++i) acc = max(acc, x[base + i]);
-    y[gid] = acc;
-  }
-}
-kernel void reduce_min_last_f16_lin(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
-                                    constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                    uint gid [[thread_position_in_grid]]) {
-  if (gid < rows) {
-    uint base = gid * cols;
-    float acc = INFINITY;
-    uint vec8_cols = cols & ~7u;
-    for (uint i = 0; i < vec8_cols; i += 8) {
-      half4 v0 = *reinterpret_cast<device const half4*>(x + base + i);
-      half4 v1 = *reinterpret_cast<device const half4*>(x + base + i + 4);
-      acc = min(acc, min(min(min((float)v0[0], (float)v0[1]), min((float)v0[2], (float)v0[3])),
-                         min(min((float)v1[0], (float)v1[1]), min((float)v1[2], (float)v1[3]))));
-    }
-    for (uint i = vec8_cols; i < cols; ++i) acc = min(acc, (float)x[base + i]);
-    y[gid] = (half)acc;
-  }
-}
-kernel void reduce_min_last_f32_lin(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
-                                    constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                    uint gid [[thread_position_in_grid]]) {
-  if (gid < rows) {
-    uint base = gid * cols;
-    float acc = INFINITY;
-    uint vec8_cols = cols & ~7u;
-    for (uint i = 0; i < vec8_cols; i += 8) {
-      float4 v0 = *reinterpret_cast<device const float4*>(x + base + i);
-      float4 v1 = *reinterpret_cast<device const float4*>(x + base + i + 4);
-      acc = min(acc, min(min(min(v0[0], v0[1]), min(v0[2], v0[3])),
-                         min(min(v1[0], v1[1]), min(v1[2], v1[3]))));
-    }
-    for (uint i = vec8_cols; i < cols; ++i) acc = min(acc, x[base + i]);
-    y[gid] = acc;
-  }
-}
+REDUCE_MINMAX_LAST_LIN(reduce_max_last_f16_lin, half, half4, max, -INFINITY)
+REDUCE_MINMAX_LAST_LIN(reduce_max_last_f32_lin, float, float4, max, -INFINITY)
+REDUCE_MINMAX_LAST_LIN(reduce_min_last_f16_lin, half, half4, min, INFINITY)
+REDUCE_MINMAX_LAST_LIN(reduce_min_last_f32_lin, float, float4, min, INFINITY)
+#undef REDUCE_MINMAX_LAST_LIN
 kernel void reduce_mean_last_f16_tg(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
                                     constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
                                     uint tid [[thread_index_in_threadgroup]],
@@ -1138,41 +1082,77 @@ kernel void reduce_mean_axis0_f16(device const half* x [[buffer(0)]], device hal
   for (uint r = 0; r < rows; r++) acc += (float)x[r * cols + gid];
   y[gid] = (half)(acc / (float)rows);
 }
-kernel void reduce_max_axis0_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
-                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                 uint gid [[thread_position_in_grid]]) {
-  if (gid >= cols) return;
-  float acc = -INFINITY;
-  for (uint r = 0; r < rows; r++) acc = max(acc, x[r * cols + gid]);
-  y[gid] = acc;
+// NaN-propagating column max/min (see rd_nan above).
+#define REDUCE_MINMAX_AXIS0(NAME, T, OP, INIT) \
+kernel void NAME(device const T* x [[buffer(0)]], device T* y [[buffer(1)]], \
+                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]], \
+                 uint gid [[thread_position_in_grid]]) { \
+  if (gid >= cols) return; \
+  float acc = INIT; \
+  uint nan_seen = 0u; \
+  for (uint r = 0; r < rows; r++) { \
+    T v = x[r * cols + gid]; \
+    nan_seen |= rd_nan(v); \
+    acc = OP(acc, float(v)); \
+  } \
+  y[gid] = nan_seen ? rd_qnan_like(T(0)) : T(acc); \
 }
-kernel void reduce_max_axis0_f16(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
-                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                 uint gid [[thread_position_in_grid]]) {
-  if (gid >= cols) return;
-  float acc = -INFINITY;
-  for (uint r = 0; r < rows; r++) acc = max(acc, (float)x[r * cols + gid]);
-  y[gid] = (half)acc;
+REDUCE_MINMAX_AXIS0(reduce_max_axis0_f32, float, max, -INFINITY)
+REDUCE_MINMAX_AXIS0(reduce_max_axis0_f16, half, max, -INFINITY)
+REDUCE_MINMAX_AXIS0(reduce_min_axis0_f32, float, min, INFINITY)
+REDUCE_MINMAX_AXIS0(reduce_min_axis0_f16, half, min, INFINITY)
+#undef REDUCE_MINMAX_AXIS0
+// XLA float sort order: every NaN sorts after +inf, and -0 == +0. A plain `>`
+// never moves NaN, and +INF padding would sort ahead of real NaNs.
+inline bool xla_sort_gt(float a, float b) {
+  bool an = isnan(a), bn = isnan(b);
+  if (an || bn) return an && !bn;
+  return a > b;
 }
-kernel void reduce_min_axis0_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
-                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                 uint gid [[thread_position_in_grid]]) {
-  if (gid >= cols) return;
-  float acc = INFINITY;
-  for (uint r = 0; r < rows; r++) acc = min(acc, x[r * cols + gid]);
-  y[gid] = acc;
+// Order-preserving key for XLA's float sort comparator: -0, +0 and every
+// subnormal share one key (XLA:CPU compares with denormals-as-zero, so they
+// tie and keep input order), every NaN gets one key above +inf, and
+// 0xFFFFFFFF is reserved for padding. No finite value or inf maps to
+// 0xFFFFFFFE or 0xFFFFFFFF.
+inline uint xla_sort_key(float v) {
+  uint b = as_type<uint>(v);
+  uint m = b & 0x7fffffffu;
+  if (m > 0x7f800000u) return 0xfffffffeu;
+  if (m < 0x00800000u) return 0x80000000u;
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
-kernel void reduce_min_axis0_f16(device const half* x [[buffer(0)]], device half* y [[buffer(1)]],
-                                 constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]],
-                                 uint gid [[thread_position_in_grid]]) {
-  if (gid >= cols) return;
-  float acc = INFINITY;
-  for (uint r = 0; r < rows; r++) acc = min(acc, (float)x[r * cols + gid]);
-  y[gid] = (half)acc;
+// Stable bitonic sort over (key, original index) pairs, keys in the first
+// padded_n uints of threadgroup memory and ushort indices right after them
+// (padded_n * 6 bytes, so padded_n <= 4096). Ties resolve by index, which is
+// XLA's stable order, and the store gathers raw input bits by index, so NaN
+// payloads and the sign of zero are preserved.
+inline void bitonic_stable_network(threadgroup uint* keys, threadgroup ushort* idx, uint padded_n, uint tid,
+                                   uint tg_size) {
+  uint half_n = padded_n >> 1;
+  for (uint size = 2; size <= padded_n; size <<= 1) {
+    for (uint stride = size >> 1; stride >= 1; stride >>= 1) {
+      uint stride_mask = stride - 1;
+      for (uint i = tid; i < half_n; i += tg_size) {
+        uint left = ((i & ~stride_mask) << 1) | (i & stride_mask);
+        uint right = left + stride;
+        bool ascending = (left & size) == 0;
+        uint kl = keys[left], kr = keys[right];
+        ushort il = idx[left], ir = idx[right];
+        bool gt = (kl > kr) || (kl == kr && il > ir);
+        if (ascending == gt) {
+          keys[left] = kr;
+          keys[right] = kl;
+          idx[left] = ir;
+          idx[right] = il;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
 }
 // --- Bitonic sort kernel (single threadgroup, in-place) ---
 // Sorts up to padded_n elements in threadgroup memory using bitonic merge.
-// Input: n actual elements, padded to next power-of-2 with +INF.
+// Input: n actual elements, padded to next power-of-2 with NaN (largest).
 // Output: sorted n elements written back to device memory.
 kernel void bitonic_sort_asc_f32(device const float* input [[buffer(0)]],
                                  device float* output [[buffer(1)]],
@@ -1181,34 +1161,16 @@ kernel void bitonic_sort_asc_f32(device const float* input [[buffer(0)]],
                                  threadgroup float* shared [[threadgroup(0)]],
                                  uint tid [[thread_index_in_threadgroup]],
                                  uint tg_size [[threads_per_threadgroup]]) {
-  // Load input into threadgroup memory, pad with +INF
+  threadgroup uint* keys = (threadgroup uint*)shared;
+  threadgroup ushort* idx = (threadgroup ushort*)(keys + padded_n);
   for (uint i = tid; i < padded_n; i += tg_size) {
-    shared[i] = (i < n) ? input[i] : INFINITY;
+    keys[i] = (i < n) ? xla_sort_key(input[i]) : 0xffffffffu;
+    idx[i] = (ushort)i;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  uint half_n = padded_n >> 1;
-  // Bitonic sort with bitwise operations (no integer division)
-  for (uint size = 2; size <= padded_n; size <<= 1) {
-    for (uint stride = size >> 1; stride >= 1; stride >>= 1) {
-      uint stride_mask = stride - 1;
-      for (uint i = tid; i < half_n; i += tg_size) {
-        uint left = ((i & ~stride_mask) << 1) | (i & stride_mask);
-        uint right = left + stride;
-        bool ascending = (left & size) == 0;
-        float lv = shared[left], rv = shared[right];
-        if (ascending ? (lv > rv) : (lv < rv)) {
-          shared[left] = rv;
-          shared[right] = lv;
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-  }
-
-  // Write back sorted results (only first n elements)
+  bitonic_stable_network(keys, idx, padded_n, tid, tg_size);
   for (uint i = tid; i < n; i += tg_size) {
-    output[i] = shared[i];
+    output[i] = input[idx[i]];
   }
 }
 // --- Bitonic sort kernel for 2D row-wise sort ---
@@ -1225,36 +1187,16 @@ kernel void bitonic_sort_rows_asc_f32(device const float* input [[buffer(0)]],
                                        uint tg_size [[threads_per_threadgroup]],
                                        uint row [[threadgroup_position_in_grid]]) {
   uint base = row * row_stride;
-  // Load row into threadgroup memory, pad with +INF
+  threadgroup uint* keys = (threadgroup uint*)shared;
+  threadgroup ushort* idx = (threadgroup ushort*)(keys + padded_n);
   for (uint i = tid; i < padded_n; i += tg_size) {
-    shared[i] = (i < n) ? input[base + i] : INFINITY;
+    keys[i] = (i < n) ? xla_sort_key(input[base + i]) : 0xffffffffu;
+    idx[i] = (ushort)i;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  uint half_n = padded_n >> 1;
-  // Bitonic sort with bitwise operations (no integer division)
-  for (uint size = 2; size <= padded_n; size <<= 1) {
-    for (uint stride = size >> 1; stride >= 1; stride >>= 1) {
-      uint stride_mask = stride - 1;
-      for (uint i = tid; i < half_n; i += tg_size) {
-        // Insert a 0-bit at the stride position: left = ((i & ~mask) << 1) | (i & mask)
-        uint left = ((i & ~stride_mask) << 1) | (i & stride_mask);
-        uint right = left + stride;
-        // ascending = ((left / size) & 1) == 0, but size is power-of-2:
-        bool ascending = (left & size) == 0;
-        float lv = shared[left], rv = shared[right];
-        if (ascending ? (lv > rv) : (lv < rv)) {
-          shared[left] = rv;
-          shared[right] = lv;
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-  }
-
-  // Write back sorted row (only first n elements)
+  bitonic_stable_network(keys, idx, padded_n, tid, tg_size);
   for (uint i = tid; i < n; i += tg_size) {
-    output[base + i] = shared[i];
+    output[base + i] = input[base + idx[i]];
   }
 }
 
@@ -1368,7 +1310,7 @@ kernel void bitonic_sort_rows_reg_f32(device const float* input [[buffer(0)]],
   // Load with padding
   for (uint k = 0; k < elems; ++k) {
     uint pos = tid + k * 32;
-    reg[k] = (pos < n) ? input[base + pos] : INFINITY;
+    reg[k] = (pos < n) ? input[base + pos] : NAN;
   }
 
   // Bitonic sort network — all passes done in registers + simd_shuffle
@@ -1386,7 +1328,7 @@ kernel void bitonic_sort_rows_reg_f32(device const float* input [[buffer(0)]],
             if (partner_k < elems) {
               bool ascending = (global_pos & size) == 0;
               float lv = reg[k], rv = reg[partner_k];
-              if (ascending ? (lv > rv) : (lv < rv)) {
+              if (ascending ? xla_sort_gt(lv, rv) : xla_sort_gt(rv, lv)) {
                 reg[k] = rv;
                 reg[partner_k] = lv;
               }
@@ -1480,7 +1422,9 @@ kernel void softmax_pass1_f32_tg(device const float* x [[buffer(0)]],
       local_sum = local_sum * exp(local_max - v) + 1.0f;
       local_max = v;
     } else {
-      local_sum += exp(v - local_max);
+      // -inf contributes exp(-inf) = 0; without this guard a thread whose
+      // first element is -inf computed exp(-inf - -inf) = NaN for the row.
+      if (v != -INFINITY) local_sum += exp(v - local_max);
     }
   }
   for (ushort offset = 16; offset >= 1; offset >>= 1) {
@@ -1542,7 +1486,9 @@ kernel void softmax_pass1_f16_tg(device const half* x [[buffer(0)]],
       local_sum = local_sum * exp(local_max - v) + 1.0f;
       local_max = v;
     } else {
-      local_sum += exp(v - local_max);
+      // -inf contributes exp(-inf) = 0; without this guard a thread whose
+      // first element is -inf computed exp(-inf - -inf) = NaN for the row.
+      if (v != -INFINITY) local_sum += exp(v - local_max);
     }
   }
   for (ushort offset = 16; offset >= 1; offset >>= 1) {
@@ -1637,7 +1583,9 @@ kernel void softmax_full_f32_tg(device const float* x [[buffer(0)]],
       local_sum = local_sum * exp(local_max - v) + 1.0f;
       local_max = v;
     } else {
-      local_sum += exp(v - local_max);
+      // -inf contributes exp(-inf) = 0; without this guard a thread whose
+      // first element is -inf computed exp(-inf - -inf) = NaN for the row.
+      if (v != -INFINITY) local_sum += exp(v - local_max);
     }
   }
 
@@ -1717,7 +1665,9 @@ kernel void softmax_full_f16_tg(device const half* x [[buffer(0)]],
       local_sum = local_sum * exp(local_max - v) + 1.0f;
       local_max = v;
     } else {
-      local_sum += exp(v - local_max);
+      // -inf contributes exp(-inf) = 0; without this guard a thread whose
+      // first element is -inf computed exp(-inf - -inf) = NaN for the row.
+      if (v != -INFINITY) local_sum += exp(v - local_max);
     }
   }
 
@@ -1773,6 +1723,85 @@ kernel void softmax_full_f16_tg(device const half* x [[buffer(0)]],
   }
 }
 
+// --- f16 softmax with XLA:CPU rounding points ---
+// JAX lowers f16 softmax as max -> sub (f16) -> exp (f16) -> convert f32 ->
+// sum -> convert f16 -> divide, and XLA:CPU evaluates the divide as a multiply
+// by an f16 reciprocal. Bit-exact emulation: d = half(x - m), e = half(exp(d)),
+// s = half(sum_f32(e)), r = half(1 / s), y = half(e * r). This library compiles
+// with fast math, so exp/divide use precise:: and NaN/inf are tested by bits.
+// A row whose max is NaN, +inf or -inf (all -inf) is all NaN, as in XLA.
+// Requires cols <= 8192 (threadgroup memory holds the row as float).
+kernel void softmax_full_f16_xla_tg(device const half* x [[buffer(0)]],
+                                    device half* y [[buffer(1)]],
+                                    constant uint& rows [[buffer(2)]],
+                                    constant uint& cols [[buffer(3)]],
+                                    threadgroup float* shared [[threadgroup(0)]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint row [[threadgroup_position_in_grid]],
+                                    uint lane [[thread_index_in_simdgroup]],
+                                    uint simd_group [[simdgroup_index_in_threadgroup]],
+                                    uint tg_size [[threads_per_threadgroup]]) {
+  if (row >= rows) return;
+  uint base = row * cols;
+  constexpr uint kMaxSimdGroups = 32;
+  threadgroup float pmax[kMaxSimdGroups];
+  threadgroup uint pnan[kMaxSimdGroups];
+  threadgroup float psum[kMaxSimdGroups];
+  uint num_simd = (tg_size + 31) >> 5;
+
+  float m = -INFINITY;
+  uint nan_seen = 0;
+  for (uint i = tid; i < cols; i += tg_size) {
+    half h = x[base + i];
+    ushort b = as_type<ushort>(h);
+    if ((b & 0x7fffu) > 0x7c00u) nan_seen = 1u;
+    float v = float(h);
+    shared[i] = v;
+    m = max(m, v);
+  }
+  float sm = simd_max(m);
+  uint sn = simd_max(nan_seen);
+  if (lane == 0) {
+    pmax[simd_group] = sm;
+    pnan[simd_group] = sn;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float rm = -INFINITY;
+  uint rn = 0u;
+  for (uint g = 0; g < num_simd; ++g) {
+    rm = max(rm, pmax[g]);
+    rn |= pnan[g];
+  }
+  // Uniform across the threadgroup: every thread takes the same branch.
+  if (rn != 0u || (as_type<uint>(rm) & 0x7fffffffu) == 0x7f800000u) {
+    for (uint i = tid; i < cols; i += tg_size) {
+      y[base + i] = as_type<half>((ushort)0x7e00u);
+    }
+    return;
+  }
+
+  float lsum = 0.0f;
+  for (uint i = tid; i < cols; i += tg_size) {
+    float v = shared[i];
+    float e = 0.0f;
+    if (as_type<uint>(v) != 0xff800000u) {  // -inf contributes exp(-inf) = 0
+      half d = half(v - rm);
+      e = float(half(precise::exp(float(d))));
+    }
+    shared[i] = e;
+    lsum += e;
+  }
+  float ss = simd_sum(lsum);
+  if (lane == 0) psum[simd_group] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float s = 0.0f;
+  for (uint g = 0; g < num_simd; ++g) s += psum[g];
+  float r = float(half(precise::divide(1.0f, float(half(s)))));
+  for (uint i = tid; i < cols; i += tg_size) {
+    y[base + i] = half(shared[i] * r);
+  }
+}
+
 // --- Fused softmax numerator: exp(x - max(x, axis=-1, keepdims=True)) ---
 // Single kernel: reads each row once into threadgroup memory, finds max,
 // then computes exp(x - max) and writes output. Memory traffic = 1R + 1W
@@ -1792,18 +1821,27 @@ kernel void softmax_numerator_f32_tg(device const float* x [[buffer(0)]],
   uint base = row * cols;
 
   // Phase 1: Load row into threadgroup memory AND find partial max.
+  // max/simd_max drop NaN, so a bit-pattern NaN flag is carried alongside:
+  // XLA's x - max(x) is NaN for the whole row when the row holds a NaN.
   float local_max = -INFINITY;
+  uint nan_seen = 0u;
   for (uint i = tid; i < cols; i += tg_size) {
     float v = x[base + i];
     shared[i] = v;
+    nan_seen |= rd_nan(v);
     local_max = max(local_max, v);
   }
 
   // Reduce max across SIMD group
   float simd_max_val = simd_max(local_max);
+  uint simd_nan = simd_max(nan_seen);
   constexpr uint kMaxSimdGroups = 32;
   threadgroup float partial_max[kMaxSimdGroups];
-  if (lane == 0) partial_max[simd_group] = simd_max_val;
+  threadgroup uint partial_nan[kMaxSimdGroups];
+  if (lane == 0) {
+    partial_max[simd_group] = simd_max_val;
+    partial_nan[simd_group] = simd_nan;
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Final reduce (first SIMD group)
@@ -1811,11 +1849,21 @@ kernel void softmax_numerator_f32_tg(device const float* x [[buffer(0)]],
   if (simd_group == 0) {
     uint num_simd = (tg_size + 31) >> 5;
     float m = (lane < num_simd) ? partial_max[lane] : -INFINITY;
+    uint nn = (lane < num_simd) ? partial_nan[lane] : 0u;
     m = simd_max(m);
-    if (lane == 0) partial_max[0] = m; // broadcast via shared memory
+    nn = simd_max(nn);
+    if (lane == 0) {
+      partial_max[0] = m; // broadcast via shared memory
+      partial_nan[0] = nn;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   row_max = partial_max[0];
+  // Uniform across the threadgroup: every thread takes the same branch.
+  if (partial_nan[0] != 0u) {
+    for (uint i = tid; i < cols; i += tg_size) y[base + i] = rd_qnan_like(0.0f);
+    return;
+  }
 
   // Phase 2: Read from threadgroup memory (free!) and write exp(x - max).
   for (uint i = tid; i < cols; i += tg_size) {
@@ -1836,28 +1884,46 @@ kernel void softmax_numerator_f16_tg(device const half* x [[buffer(0)]],
   if (row >= rows) return;
   uint base = row * cols;
 
+  // NaN flag as in softmax_numerator_f32_tg.
   float local_max = -INFINITY;
+  uint nan_seen = 0u;
   for (uint i = tid; i < cols; i += tg_size) {
-    float v = (float)x[base + i];
+    half h = x[base + i];
+    nan_seen |= rd_nan(h);
+    float v = (float)h;
     shared[i] = v;
     local_max = max(local_max, v);
   }
 
   float simd_max_val = simd_max(local_max);
+  uint simd_nan = simd_max(nan_seen);
   constexpr uint kMaxSimdGroups = 32;
   threadgroup float partial_max[kMaxSimdGroups];
-  if (lane == 0) partial_max[simd_group] = simd_max_val;
+  threadgroup uint partial_nan[kMaxSimdGroups];
+  if (lane == 0) {
+    partial_max[simd_group] = simd_max_val;
+    partial_nan[simd_group] = simd_nan;
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   float row_max;
   if (simd_group == 0) {
     uint num_simd = (tg_size + 31) >> 5;
     float m = (lane < num_simd) ? partial_max[lane] : -INFINITY;
+    uint nn = (lane < num_simd) ? partial_nan[lane] : 0u;
     m = simd_max(m);
-    if (lane == 0) partial_max[0] = m;
+    nn = simd_max(nn);
+    if (lane == 0) {
+      partial_max[0] = m;
+      partial_nan[0] = nn;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   row_max = partial_max[0];
+  if (partial_nan[0] != 0u) {
+    for (uint i = tid; i < cols; i += tg_size) y[base + i] = rd_qnan_like(half(0));
+    return;
+  }
 
   for (uint i = tid; i < cols; i += tg_size) {
     y[base + i] = (half)exp(shared[i] - row_max);

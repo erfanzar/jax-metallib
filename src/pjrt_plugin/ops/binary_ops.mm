@@ -14,6 +14,7 @@
 
 #import "pjrt_plugin/ops/registry.h"
 
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 
@@ -27,10 +28,67 @@ static bool IsEightBitInt(MPSDataType t) {
     return t == MPSDataTypeInt8 || t == MPSDataTypeUInt8;
 }
 
+// x + 1.0 lowers to add(x, broadcast_in_dim(constant)). Handing MPSGraph the
+// explicitly broadcast operand made it materialise and re-read a full-size
+// tensor: a scalar add on 16M f32 took 1.78 ms vs 1.24 ms for a unary op (and
+// vs jax-mps). When one operand is a broadcast of a one-element tensor and the
+// other already has the output shape, feed the source reshaped to [1,...,1] and
+// let MPSGraph broadcast implicitly.
+// JAX_METALLIB_DISABLE_SCALAR_OPERAND_BROADCAST=1 restores the explicit form.
+static bool ScalarOperandFoldEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("JAX_METALLIB_DISABLE_SCALAR_OPERAND_BROADCAST");
+        return !(v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0'));
+    }();
+    return enabled;
+}
+
+// Source of operand `index` when it is a broadcast_in_dim of a one-element
+// tensor with the same dtype, else nil.
+static MPSGraphTensor* ScalarBroadcastSource(HandlerContext& ctx, unsigned index, MPSGraphTensor* t) {
+    auto bc =
+        mlir::dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(ctx.op->getOperand(index).getDefiningOp());
+    if (!bc) {
+        return nil;
+    }
+    MPSGraphTensor* src = GetTensor(ctx.values, bc.getOperand());
+    if (!src || !src.shape || src.dataType != t.dataType) {
+        return nil;
+    }
+    for (NSNumber* d in src.shape) {
+        if ([d longLongValue] != 1) {
+            return nil;
+        }
+    }
+    return src;
+}
+
+static MPSGraphTensor* BinaryOperand(HandlerContext& ctx, unsigned index) {
+    MPSGraphTensor* t = GetInputTensor(ctx, index);
+    if (!t || !ScalarOperandFoldEnabled() || ctx.variables || ctx.op->getNumOperands() != 2) {
+        return t;
+    }
+    MPSGraphTensor* src = ScalarBroadcastSource(ctx, index, t);
+    MPSGraphTensor* other = GetInputTensor(ctx, 1 - index);
+    NSArray<NSNumber*>* out = GetOutputShape(ctx.op);
+    // Fold only one side: if both operands are scalar broadcasts, folding both
+    // collapses the result to one element (MultivariateNormal grad aborted in
+    // a later reshape [1] -> [3,1]).
+    if (!src || !other || !out || out.count == 0 || !other.shape || ![other.shape isEqualToArray:out] ||
+        ScalarBroadcastSource(ctx, 1 - index, other)) {
+        return t;
+    }
+    NSMutableArray<NSNumber*>* ones = [NSMutableArray arrayWithCapacity:out.count];
+    for (NSUInteger i = 0; i < out.count; ++i) {
+        [ones addObject:@1];
+    }
+    return [ctx.graph reshapeTensor:src withShape:ones name:nil];
+}
+
 template <typename Op>
 static ProcessResult HandleWrappingBinary(HandlerContext& ctx, const char* name, Op op) {
-    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
-    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    MPSGraphTensor* lhs = BinaryOperand(ctx, 0);
+    MPSGraphTensor* rhs = BinaryOperand(ctx, 1);
     if (!lhs || !rhs)
         return ProcessResult::Error(std::string(name) + ": missing input tensor");
     MPSDataType dtype = lhs.dataType;
@@ -43,7 +101,50 @@ static ProcessResult HandleWrappingBinary(HandlerContext& ctx, const char* name,
     return Result(ctx, op(lhs, rhs), name);
 }
 
+// True when `v` is a splat integer constant (possibly behind broadcast_in_dim
+// or reshape) equal to the type's signed minimum (only the sign bit set).
+static bool IsSignBitSplat(mlir::Value v) {
+    for (int depth = 0; depth < 8 && v; ++depth) {
+        mlir::Operation* def = v.getDefiningOp();
+        if (!def) {
+            return false;
+        }
+        if (auto c = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(def)) {
+            auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(c.getValue());
+            if (!dense || !dense.isSplat()) {
+                return false;
+            }
+            auto intType = mlir::dyn_cast<mlir::IntegerType>(dense.getElementType());
+            if (!intType || intType.getWidth() < 8) {
+                return false;
+            }
+            return dense.getSplatValue<llvm::APInt>().isMinSignedValue();
+        }
+        if (auto bc = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(def)) {
+            v = bc.getOperand();
+            continue;
+        }
+        if (auto rs = mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(def)) {
+            v = rs.getOperand();
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+// MPSGraph add of a splat INT32_MIN / INT64_MIN constant returned the other
+// operand unchanged wherever the sum overflows (jit `x + int32(-2**31)`), while
+// the same value as an argument, a non-splat constant, sub/mul/xor with it,
+// and int8/int16 minimums all wrapped correctly. Adding the sign bit only
+// flips the top bit, so x + MIN == x ^ MIN exactly in two's complement.
 static ProcessResult HandleAdd(HandlerContext& ctx) {
+    if (ctx.op->getNumOperands() == 2 &&
+        (IsSignBitSplat(ctx.op->getOperand(0)) || IsSignBitSplat(ctx.op->getOperand(1)))) {
+        return HandleWrappingBinary(ctx, "add", [&](MPSGraphTensor* a, MPSGraphTensor* b) {
+            return [ctx.graph bitwiseXORWithPrimaryTensor:a secondaryTensor:b name:nil];
+        });
+    }
     return HandleWrappingBinary(ctx, "add", [&](MPSGraphTensor* a, MPSGraphTensor* b) {
         return [ctx.graph additionWithPrimaryTensor:a secondaryTensor:b name:nil];
     });
@@ -62,8 +163,8 @@ REGISTER_MPS_OP("stablehlo.subtract", HandleSubtract);
 // so the plugin cannot detect every square. Compute every integer multiply as
 // lhs*(rhs+1) - lhs: identical modulo 2**n, and never a literal square.
 static ProcessResult HandleMultiply(HandlerContext& ctx) {
-    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
-    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    MPSGraphTensor* lhs = BinaryOperand(ctx, 0);
+    MPSGraphTensor* rhs = BinaryOperand(ctx, 1);
     if (!lhs || !rhs)
         return ProcessResult::Error("multiply: missing input tensor");
     MPSDataType dtype = lhs.dataType;
@@ -97,8 +198,8 @@ REGISTER_MPS_OP("stablehlo.multiply", HandleMultiply);
 // wrapping cast back (int8 -128/-1 -> -128), then select all ones where the
 // divisor was 0.
 static ProcessResult HandleDivide(HandlerContext& ctx) {
-    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
-    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    MPSGraphTensor* lhs = BinaryOperand(ctx, 0);
+    MPSGraphTensor* rhs = BinaryOperand(ctx, 1);
     if (!lhs || !rhs)
         return ProcessResult::Error("divide: missing input tensor");
     MPSGraph* g = ctx.graph;
@@ -155,24 +256,177 @@ static MPSGraphTensor* NaNMin(MPSGraph* g, MPSGraphTensor* a, MPSGraphTensor* b)
     return [g minimumWithPrimaryTensor:a secondaryTensor:b name:nil];
 }
 
+// XLA orders -0 < +0 in max/min: max(-0, +0) == +0 and min(-0, +0) == -0 in
+// either operand order. MPSGraph maximum/minimum return the secondary operand
+// on a tie, so a +-0 tie came back order-dependent (clip(x, -0., 1.) gave -0
+// for x == +0, jnp.maximum(-0., +0.) gave -0). Equal non-zero floats are
+// bit-identical, so only zero ties need fixing. Non-zero splat constants
+// cannot tie at zero and keep the plain op; zero constants and two tensors get
+// a select fix-up (see TieAwareMaxMin).
+// JAX_METALLIB_DISABLE_MAXMIN_ZERO_TIE=1 restores the plain lowering.
+static bool MaxMinZeroTieEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("JAX_METALLIB_DISABLE_MAXMIN_ZERO_TIE");
+        return !(v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0'));
+    }();
+    return enabled;
+}
+
+enum class FloatSplatKind { kNone, kNonZero, kPosZero, kNegZero };
+
+// Kind of `v` when it is a splat float constant (possibly behind
+// broadcast_in_dim or reshape), else kNone.
+static FloatSplatKind GetFloatSplatKind(mlir::Value v) {
+    for (int depth = 0; depth < 8 && v; ++depth) {
+        mlir::Operation* def = v.getDefiningOp();
+        if (!def) {
+            return FloatSplatKind::kNone;
+        }
+        if (auto c = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(def)) {
+            auto dense = mlir::dyn_cast<mlir::DenseFPElementsAttr>(c.getValue());
+            if (!dense || !dense.isSplat()) {
+                return FloatSplatKind::kNone;
+            }
+            llvm::APFloat f = dense.getSplatValue<llvm::APFloat>();
+            if (!f.isZero()) {
+                return FloatSplatKind::kNonZero;
+            }
+            return f.isNegative() ? FloatSplatKind::kNegZero : FloatSplatKind::kPosZero;
+        }
+        if (auto bc = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(def)) {
+            v = bc.getOperand();
+            continue;
+        }
+        if (auto rs = mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(def)) {
+            v = rs.getOperand();
+            continue;
+        }
+        return FloatSplatKind::kNone;
+    }
+    return FloatSplatKind::kNone;
+}
+
+// NaN-propagating max/min with XLA's -0 < +0 ordering. `av`/`bv` are the MLIR
+// values behind `a`/`b` (or a null value when unknown).
+static MPSGraphTensor* TieAwareMaxMin(MPSGraph* g, MPSGraphTensor* a, mlir::Value av, MPSGraphTensor* b,
+                                      mlir::Value bv, bool isMax) {
+    auto plain = [&](MPSGraphTensor* x, MPSGraphTensor* y) {
+        return isMax ? NaNMax(g, x, y) : NaNMin(g, x, y);
+    };
+    if (!IsRealFloatDtype(a.dataType) || b.dataType != a.dataType || !MaxMinZeroTieEnabled()) {
+        return plain(a, b);
+    }
+    FloatSplatKind ka = GetFloatSplatKind(av);
+    FloatSplatKind kb = GetFloatSplatKind(bv);
+    if (ka == FloatSplatKind::kNonZero || kb == FloatSplatKind::kNonZero) {
+        return plain(a, b);
+    }
+    MPSGraphTensor* m = plain(a, b);
+    MPSGraphTensor* zero = [g constantWithScalar:0.0 dataType:a.dataType];
+    // The zero that should win a tie: +0 for max, -0 for min.
+    const FloatSplatKind winner = isMax ? FloatSplatKind::kPosZero : FloatSplatKind::kNegZero;
+    if ((ka == FloatSplatKind::kNone) != (kb == FloatSplatKind::kNone)) {
+        // One operand is a +-0 splat constant c. MPSGraph canonicalises the
+        // operand order of max/min (max(b,a) was CSE'd with max(a,b)), so
+        // swapping operands cannot steer the tie. It returned c on a tie, which
+        // is right when c is the winning zero (relu, max(x, +0), costs nothing;
+        // tests/test_maxmin_signed_zero.py pins both operand orders); when c is
+        // the losing zero, take x wherever x == 0.
+        const bool constIsB = kb != FloatSplatKind::kNone;
+        if ((constIsB ? kb : ka) == winner) {
+            return m;
+        }
+        MPSGraphTensor* x = constIsB ? a : b;
+        MPSGraphTensor* xZero = [g equalWithPrimaryTensor:x secondaryTensor:zero name:nil];
+        return [g selectWithPredicateTensor:xZero truePredicateTensor:x falsePredicateTensor:m name:nil];
+    }
+    if (a.dataType == MPSDataTypeFloat32) {
+        // f32: with s = a + b (min: s = -((-a) - b)), m == s holds exactly when
+        // the other operand is zero or too small to change m, and then s equals
+        // m numerically (equal non-zero floats are bit-identical); at a +-0 tie
+        // s carries the AND (min: OR) of the signs. NaN fails the compare and
+        // keeps m. This kept fused f32 chains at plain speed, where the both-zero
+        // select below cost 3.4x on a tanh chain; in f16/bf16 this rule cost up
+        // to 5x on affine chains, so half dtypes keep the both-zero select
+        // (build/probe_maxmin_heldout_r20.py).
+        MPSGraphTensor* s =
+            isMax ? [g additionWithPrimaryTensor:a secondaryTensor:b name:nil]
+                  : [g negativeWithTensor:[g subtractionWithPrimaryTensor:[g negativeWithTensor:a name:nil]
+                                                          secondaryTensor:b
+                                                                     name:nil]
+                                     name:nil];
+        MPSGraphTensor* same = [g equalWithPrimaryTensor:m secondaryTensor:s name:nil];
+        return [g selectWithPredicateTensor:same truePredicateTensor:s falsePredicateTensor:m name:nil];
+    }
+    // Two tensors (or two zero constants): where both are zero, max is a + b
+    // (-0 only if both are -0) and min is -((-a) + (-b)) (-0 if either is -0).
+    MPSGraphTensor* both =
+        [g logicalANDWithPrimaryTensor:[g equalWithPrimaryTensor:a secondaryTensor:zero name:nil]
+                       secondaryTensor:[g equalWithPrimaryTensor:b secondaryTensor:zero name:nil]
+                                  name:nil];
+    MPSGraphTensor* fixed =
+        isMax ? [g additionWithPrimaryTensor:a secondaryTensor:b name:nil]
+              : [g negativeWithTensor:[g additionWithPrimaryTensor:[g negativeWithTensor:a name:nil]
+                                                   secondaryTensor:[g negativeWithTensor:b name:nil]
+                                                              name:nil]
+                                 name:nil];
+    return [g selectWithPredicateTensor:both truePredicateTensor:fixed falsePredicateTensor:m name:nil];
+}
+
 static ProcessResult HandleMaximum(HandlerContext& ctx) {
-    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
-    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    MPSGraphTensor* lhs = BinaryOperand(ctx, 0);
+    MPSGraphTensor* rhs = BinaryOperand(ctx, 1);
     if (!lhs || !rhs)
         return ProcessResult::Error("maximum: missing input tensor");
-    return Result(ctx, NaNMax(ctx.graph, lhs, rhs), "maximum");
+    return Result(ctx,
+                  TieAwareMaxMin(ctx.graph, lhs, ctx.op->getOperand(0), rhs, ctx.op->getOperand(1), true),
+                  "maximum");
 }
 REGISTER_MPS_OP("stablehlo.maximum", HandleMaximum);
 
 static ProcessResult HandleMinimum(HandlerContext& ctx) {
-    MPSGraphTensor* lhs = GetInputTensor(ctx, 0);
-    MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
+    MPSGraphTensor* lhs = BinaryOperand(ctx, 0);
+    MPSGraphTensor* rhs = BinaryOperand(ctx, 1);
     if (!lhs || !rhs)
         return ProcessResult::Error("minimum: missing input tensor");
-    return Result(ctx, NaNMin(ctx.graph, lhs, rhs), "minimum");
+    return Result(ctx,
+                  TieAwareMaxMin(ctx.graph, lhs, ctx.op->getOperand(0), rhs, ctx.op->getOperand(1), false),
+                  "minimum");
 }
 REGISTER_MPS_OP("stablehlo.minimum", HandleMinimum);
-REGISTER_MLIR_BINARY_OP("stablehlo.remainder", modulo, remainder);
+// XLA defines integer x % 0 == x. MPSGraph modulo got that right for a runtime
+// zero divisor but returned junk when the zero divisor was a compile-time
+// constant ([7,-7,0,5] % 0 -> [1,1,0,1]), which also broke JAX's floor_divide
+// correction (a // 0 gave -1 instead of -2). Take the remainder by a safe
+// divisor (0 -> 1) and select the dividend where the divisor is 0.
+static ProcessResult HandleRemainder(HandlerContext& ctx) {
+    MPSGraphTensor* lhs = BinaryOperand(ctx, 0);
+    MPSGraphTensor* rhs = BinaryOperand(ctx, 1);
+    if (!lhs || !rhs)
+        return ProcessResult::Error("remainder: missing input tensor");
+    MPSGraph* g = ctx.graph;
+    const MPSDataType dtype = lhs.dataType;
+    const bool isInteger = dtype == MPSDataTypeInt8 || dtype == MPSDataTypeInt16 ||
+                           dtype == MPSDataTypeInt32 || dtype == MPSDataTypeInt64 ||
+                           dtype == MPSDataTypeUInt8 || dtype == MPSDataTypeUInt16 ||
+                           dtype == MPSDataTypeUInt32 || dtype == MPSDataTypeUInt64;
+    if (!isInteger || rhs.dataType != dtype) {
+        return Result(ctx, [g moduloWithPrimaryTensor:lhs secondaryTensor:rhs name:nil], "remainder");
+    }
+    MPSGraphTensor* zero = [g constantWithScalar:0 dataType:dtype];
+    MPSGraphTensor* isZero = [g equalWithPrimaryTensor:rhs secondaryTensor:zero name:nil];
+    MPSGraphTensor* safe = [g selectWithPredicateTensor:isZero
+                                    truePredicateTensor:[g constantWithScalar:1 dataType:dtype]
+                                   falsePredicateTensor:rhs
+                                                   name:nil];
+    MPSGraphTensor* rem = [g moduloWithPrimaryTensor:lhs secondaryTensor:safe name:nil];
+    MPSGraphTensor* out = [g selectWithPredicateTensor:isZero
+                                   truePredicateTensor:lhs
+                                  falsePredicateTensor:rem
+                                                  name:nil];
+    return Result(ctx, out, "remainder");
+}
+REGISTER_MPS_OP("stablehlo.remainder", HandleRemainder);
 REGISTER_MLIR_BINARY_OP("stablehlo.power", power, power);
 REGISTER_MLIR_BINARY_OP("stablehlo.atan2", atan2, atan2);
 
@@ -225,17 +479,32 @@ static ProcessResult HandleDot(HandlerContext& ctx) {
     MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
     if (!lhs || !rhs)
         return ProcessResult::Error("dot: missing input tensor");
+    // StableHLO dot allows a rank-1 operand on either side ([M,K].[K] -> [M],
+    // [K].[K,N] -> [N]); MPSGraph matmul does not, and aborted the process with
+    // "K dimension is inconsistently defined". Promote the vector to a matrix
+    // and reshape the product to the declared result shape below.
+    // vector.vector already matches XLA:CPU and is left unchanged.
+    if (lhs.shape.count == 2 && rhs.shape.count == 1) {
+        rhs = [ctx.graph reshapeTensor:rhs withShape:@[rhs.shape[0], @1] name:nil];
+    } else if (lhs.shape.count == 1 && rhs.shape.count == 2) {
+        lhs = [ctx.graph reshapeTensor:lhs withShape:@[@1, lhs.shape[0]] name:nil];
+    }
+    NSArray<NSNumber*>* declaredShape = GetOutputShape(ctx.op);
     if (IsIntegerMatmulDtype(lhs.dataType) && IsIntegerMatmulDtype(rhs.dataType)) {
         MPSGraphTensor* result = IntegerMatMul(ctx.graph, lhs, rhs, GetResultMpsType(ctx.op));
-        NSArray<NSNumber*>* outShape = GetOutputShape(ctx.op);
-        if (result && outShape && ![outShape isEqualToArray:result.shape]) {
-            result = [ctx.graph reshapeTensor:result withShape:outShape name:nil];
+        if (result && declaredShape && ![declaredShape isEqualToArray:result.shape]) {
+            result = [ctx.graph reshapeTensor:result withShape:declaredShape name:nil];
         }
         return Result(ctx, result, "dot");
     }
     // float16 matmul overflowed to inf near the float16 max; compute in
     // float32 and cast back (see HandleDotGeneral).
-    const bool widenF16 = lhs.dataType == MPSDataTypeFloat16 && rhs.dataType == MPSDataTypeFloat16;
+    // bf16 operands with preferred_element_type=f32 are widened too (exact): the
+    // bf16 matmul result was stored under the f32 result type and read back as
+    // garbage (relative error ~1.0-1.5, no error raised).
+    const bool widenF16 = (lhs.dataType == MPSDataTypeFloat16 && rhs.dataType == MPSDataTypeFloat16) ||
+                          (lhs.dataType == MPSDataTypeBFloat16 && rhs.dataType == MPSDataTypeBFloat16 &&
+                           GetResultMpsType(ctx.op) == MPSDataTypeFloat32);
     if (widenF16) {
         lhs = [ctx.graph castTensor:lhs toType:MPSDataTypeFloat32 name:nil];
         rhs = [ctx.graph castTensor:rhs toType:MPSDataTypeFloat32 name:nil];
@@ -248,6 +517,9 @@ static ProcessResult HandleDot(HandlerContext& ctx) {
         if (outType == MPSDataTypeInvalid)
             outType = MPSDataTypeFloat16;
         result = [ctx.graph castTensor:result toType:outType name:nil];
+    }
+    if (result && declaredShape && ![declaredShape isEqualToArray:result.shape]) {
+        result = [ctx.graph reshapeTensor:result withShape:declaredShape name:nil];
     }
     return Result(ctx, result, "dot");
 }
@@ -443,12 +715,56 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
     // native float16 operands to float32 (exact) and cast the result back to
     // the declared result type. This sits after the fp32->fp16 mixed-precision
     // block, which only triggers on float32 inputs, so it cannot re-narrow.
-    // Measured cost: none at >= 1024^3, ~+60 us at 256^3.
+    // Measured cost: ~+60 us at 256^3 and 1.2-2.7x slower than native f16 at
+    // MLP/GPT-2 sizes. A standalone Level0 probe (5x1x7 plus 128x256x768 up to
+    // 4096x2048x512 with rows engineered into [60000,65504]) found no spurious
+    // inf in native f16 matmul, f32 accumulation (4096 ones sum to 4096), and
+    // error within the same bound as the widened path; the overflow appears to
+    // have come from Level1/ANE placement. Large dots whose declared result is
+    // f16 therefore run natively; small ones and preferred_element_type=f32
+    // keep the widening. JAX_METALLIB_F16_NATIVE_DOT=0 widens everything.
+    bool nativeF16Dot = false;
+    if (!mixedFp32 && lhsInput.dataType == MPSDataTypeFloat16 && rhsInput.dataType == MPSDataTypeFloat16 &&
+        GetResultMpsType(ctx.op) == MPSDataTypeFloat16) {
+        static const bool enabled = []() {
+            const char* v = std::getenv("JAX_METALLIB_F16_NATIVE_DOT");
+            return !(v && v[0] == '0' && v[1] == '\0');
+        }();
+        if (enabled) {
+            auto dimNumbers = dotOp.getDotDimensionNumbers();
+            auto lhsContracting = dimNumbers.getLhsContractingDimensions();
+            NSArray<NSNumber*>* lhsShape = lhsInput.shape;
+            NSArray<NSNumber*>* rhsShape = rhsInput.shape;
+            uint64_t lhsElems = 1, rhsElems = 1, k = 1;
+            for (NSNumber* d in lhsShape) {
+                lhsElems *= [d unsignedLongLongValue];
+            }
+            for (NSNumber* d in rhsShape) {
+                rhsElems *= [d unsignedLongLongValue];
+            }
+            for (int64_t d : lhsContracting) {
+                k *= [lhsShape[(NSUInteger)d] unsignedLongLongValue];
+            }
+            // (lhsElems / k) * rhsElems == batch^2 * M * N * K: an upper bound on
+            // the dot's M*N*K*batch work, used only as a size gate.
+            uint64_t work = (k > 0) ? (lhsElems / k) * rhsElems : 0;
+            nativeF16Dot = lhsShape && rhsShape && work >= (1ULL << 20);
+        }
+    }
     bool widenedF16 = false;
-    if (!mixedFp32 && lhsInput.dataType == MPSDataTypeFloat16 && rhsInput.dataType == MPSDataTypeFloat16) {
+    if (!mixedFp32 && !nativeF16Dot && lhsInput.dataType == MPSDataTypeFloat16 &&
+        rhsInput.dataType == MPSDataTypeFloat16) {
         lhsInput = [ctx.graph castTensor:lhsInput toType:MPSDataTypeFloat32 name:nil];
         rhsInput = [ctx.graph castTensor:rhsInput toType:MPSDataTypeFloat32 name:nil];
         widenedF16 = true;
+    }
+    // bf16 x bf16 with preferred_element_type=f32: widen (exact) so the matmul
+    // accumulates and returns f32 like XLA:CPU. Placed after the fp32->fp16
+    // mixed-precision block so it can never be re-narrowed to f16's smaller range.
+    if (!mixedFp32 && lhsInput.dataType == MPSDataTypeBFloat16 && rhsInput.dataType == MPSDataTypeBFloat16 &&
+        GetResultMpsType(ctx.op) == MPSDataTypeFloat32) {
+        lhsInput = [ctx.graph castTensor:lhsInput toType:MPSDataTypeFloat32 name:nil];
+        rhsInput = [ctx.graph castTensor:rhsInput toType:MPSDataTypeFloat32 name:nil];
     }
     // Wrap result with fp16→f32 cast when mixed precision is active.
     auto DotResult = [&](MPSGraphTensor* result, const char* name) -> ProcessResult {
@@ -460,6 +776,16 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
                 outType = MPSDataTypeFloat16;
             if (result.dataType != outType)
                 result = [ctx.graph castTensor:result toType:outType name:nil];
+        }
+        // Result() never converts to the declared type; a float result whose
+        // dtype differs from it would be reinterpreted, so cast as a backstop.
+        if (result) {
+            MPSDataType declared = GetResultMpsType(ctx.op);
+            auto isFloat = [](MPSDataType t) {
+                return t == MPSDataTypeFloat32 || t == MPSDataTypeFloat16 || t == MPSDataTypeBFloat16;
+            };
+            if (isFloat(declared) && isFloat(result.dataType) && result.dataType != declared)
+                result = [ctx.graph castTensor:result toType:declared name:nil];
         }
         return Result(ctx, result, name);
     };
@@ -490,8 +816,18 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
                                     DotGeneralDebugString(dotOp, lhsShape, rhsShape, outShape) + ")");
     }
     if (hasZero) {
-        return ProcessResult::Error("dot_general: zero-sized dimensions are not supported yet (" +
-                                    DotGeneralDebugString(dotOp, lhsShape, rhsShape, outShape) + ")");
+        // XLA: a zero-length contraction is an empty sum (zeros) and an empty output has
+        // no elements, so the result is zeros of the declared type in either case.
+        MPSDataType declared = GetResultMpsType(ctx.op);
+        if (declared == MPSDataTypeInvalid || !outShape) {
+            return ProcessResult::Error("dot_general: zero-sized dimensions with unknown result type (" +
+                                        DotGeneralDebugString(dotOp, lhsShape, rhsShape, outShape) + ")");
+        }
+        MPSGraphTensor* zeros = [ctx.graph constantWithScalar:0.0 dataType:declared];
+        if (outShape.count > 0) {
+            zeros = [ctx.graph broadcastTensor:zeros toShape:outShape name:nil];
+        }
+        return Result(ctx, zeros, "dot_general_zero_dim");
     }
 
     if (lhsBatchDims.size() != rhsBatchDims.size()) {
@@ -548,6 +884,108 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
                                         ShapeToString(lhsShape) + ", rhs_shape=" + ShapeToString(rhsShape) +
                                         ", lhs_contracting=" + JoinInts(lhsContractingDims) +
                                         ", rhs_contracting=" + JoinInts(rhsContractingDims) + ")");
+        }
+    }
+
+    // A float dot whose contraction has exactly one element (K=1, including the
+    // no-contraction outer product) is a plain product. XLA:CPU folds it into a
+    // multiply, so 0 * -3 gives -0, while the MPSGraph matmul accumulates from +0
+    // and returns +0 (K >= 2 agree: both start from +0). Lower it as a broadcast
+    // multiply in f32: the product of two f32 values rounds once, and the product
+    // of two halves is exact in f32, so the cast to the declared type rounds once.
+    // JAX_METALLIB_DISABLE_DOT_K1_MULTIPLY=1 keeps the matmul.
+    {
+        static const bool k1Enabled = []() {
+            const char* v = std::getenv("JAX_METALLIB_DISABLE_DOT_K1_MULTIPLY");
+            return !(v && v[0] == '1' && v[1] == '\0');
+        }();
+        auto isFloatType = [](MPSDataType t) {
+            return t == MPSDataTypeFloat32 || t == MPSDataTypeFloat16 || t == MPSDataTypeBFloat16;
+        };
+        int64_t contractElems = 1;
+        for (int64_t d : lhsContractingDims) {
+            contractElems *= [lhsShape[(NSUInteger)d] longLongValue];
+        }
+        MPSGraphTensor* lhsOrig = GetInputTensor(ctx, 0);
+        MPSGraphTensor* rhsOrig = GetInputTensor(ctx, 1);
+        MPSDataType declared = GetResultMpsType(ctx.op);
+        if (k1Enabled && contractElems == 1 && !integerDot && outShape && isFloatType(declared) &&
+            isFloatType(lhsOrig.dataType) && isFloatType(rhsOrig.dataType)) {
+            std::vector<NSUInteger> lhsFree;
+            std::vector<NSUInteger> rhsFree;
+            for (NSUInteger d = 0; d < lhsRank; ++d) {
+                if (!lhsUsed[d])
+                    lhsFree.push_back(d);
+            }
+            for (NSUInteger d = 0; d < rhsRank; ++d) {
+                if (!rhsUsed[d])
+                    rhsFree.push_back(d);
+            }
+            // Same-type half dots multiply natively: the exact product of two halves
+            // fits in f32, so one rounding to the half type is the correctly rounded
+            // product either way, and the native multiply skips the f32 intermediate
+            // (f16/bf16 [4096,1]@[1,4096] ~1.1 ms widened vs ~0.6 ms matmul).
+            // JAX_METALLIB_DOT_K1_WIDEN_HALF=1 keeps the f32 multiply.
+            static const bool k1WidenHalf = []() {
+                const char* v = std::getenv("JAX_METALLIB_DOT_K1_WIDEN_HALF");
+                return v && v[0] == '1' && v[1] == '\0';
+            }();
+            MPSDataType computeType = MPSDataTypeFloat32;
+            if (!k1WidenHalf && lhsOrig.dataType == declared && rhsOrig.dataType == declared &&
+                (declared == MPSDataTypeFloat16 || declared == MPSDataTypeBFloat16))
+                computeType = declared;
+            // Lay each side out as [batch..., lhsFree..., rhsFree...] with size-1
+            // placeholders for the other side's free dims; the multiply broadcasts.
+            auto arrange = [&](MPSGraphTensor* t, NSArray<NSNumber*>* shape, llvm::ArrayRef<int64_t> batch,
+                               const std::vector<NSUInteger>& own, llvm::ArrayRef<int64_t> contracting,
+                               bool ownFirst, size_t otherCount) -> MPSGraphTensor* {
+                NSMutableArray<NSNumber*>* perm = [NSMutableArray array];
+                NSMutableArray<NSNumber*>* target = [NSMutableArray array];
+                for (int64_t d : batch) {
+                    [perm addObject:@(d)];
+                    [target addObject:shape[(NSUInteger)d]];
+                }
+                if (!ownFirst) {
+                    for (size_t i = 0; i < otherCount; ++i)
+                        [target addObject:@1];
+                }
+                for (NSUInteger d : own) {
+                    [perm addObject:@(d)];
+                    [target addObject:shape[d]];
+                }
+                if (ownFirst) {
+                    for (size_t i = 0; i < otherCount; ++i)
+                        [target addObject:@1];
+                }
+                for (int64_t d : contracting)
+                    [perm addObject:@(d)];
+                bool identity = true;
+                for (NSUInteger i = 0; i < perm.count; ++i) {
+                    if ([perm[i] unsignedIntegerValue] != i)
+                        identity = false;
+                }
+                if (!identity)
+                    t = [ctx.graph transposeTensor:t permutation:perm name:nil];
+                if (target.count == 0)
+                    [target addObject:@1];
+                if (![t.shape isEqualToArray:target])
+                    t = [ctx.graph reshapeTensor:t withShape:target name:nil];
+                if (t.dataType != computeType)
+                    t = [ctx.graph castTensor:t toType:computeType name:nil];
+                return t;
+            };
+            MPSGraphTensor* lhsK1 =
+                arrange(lhsOrig, lhsShape, lhsBatchDims, lhsFree, lhsContractingDims, true, rhsFree.size());
+            MPSGraphTensor* rhsK1 =
+                arrange(rhsOrig, rhsShape, rhsBatchDims, rhsFree, rhsContractingDims, false, lhsFree.size());
+            MPSGraphTensor* product = [ctx.graph multiplicationWithPrimaryTensor:lhsK1
+                                                                 secondaryTensor:rhsK1
+                                                                            name:nil];
+            if (product.dataType != declared)
+                product = [ctx.graph castTensor:product toType:declared name:nil];
+            if (![product.shape isEqualToArray:outShape])
+                product = [ctx.graph reshapeTensor:product withShape:outShape name:nil];
+            return Result(ctx, product, "dot_general_k1");
         }
     }
 
@@ -749,6 +1187,37 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
 }
 REGISTER_MPS_OP("stablehlo.dot_general", HandleDotGeneral);
 
+// XLA TOTALORDER compares (jax lt_to/le_to/eq_to, searchsorted, sort
+// comparators) order -NaN < -Inf < ... < -0 < +0 < ... < +Inf < +NaN, NaNs by
+// payload. Reinterpret the float bits as a signed integer and flip every bit
+// but the sign of negative values: the integer order is then the total order.
+// Returns nil for types without a total-order key (integers, complex).
+static MPSGraphTensor* TotalOrderKey(MPSGraph* g, MPSGraphTensor* x) {
+    MPSDataType intType;
+    double magnitudeMask;
+    switch (x.dataType) {
+    case MPSDataTypeFloat32:
+        intType = MPSDataTypeInt32;
+        magnitudeMask = 2147483647.0;
+        break;
+    case MPSDataTypeFloat16:
+    case MPSDataTypeBFloat16:
+        intType = MPSDataTypeInt16;
+        magnitudeMask = 32767.0;
+        break;
+    default:
+        return nil;
+    }
+    MPSGraphTensor* bits = [g reinterpretCastTensor:x toType:intType name:nil];
+    MPSGraphTensor* zero = [g constantWithScalar:0 dataType:intType];
+    MPSGraphTensor* negative = [g lessThanWithPrimaryTensor:bits secondaryTensor:zero name:nil];
+    MPSGraphTensor* mask = [g selectWithPredicateTensor:negative
+                                    truePredicateTensor:[g constantWithScalar:magnitudeMask dataType:intType]
+                                   falsePredicateTensor:zero
+                                                   name:nil];
+    return [g bitwiseXORWithPrimaryTensor:bits secondaryTensor:mask name:nil];
+}
+
 static ProcessResult HandleCompare(HandlerContext& ctx) {
     auto compareOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(ctx.op);
     if (!compareOp) {
@@ -759,6 +1228,31 @@ static ProcessResult HandleCompare(HandlerContext& ctx) {
     MPSGraphTensor* rhs = GetInputTensor(ctx, 1);
     if (!lhs || !rhs)
         return ProcessResult::Error("compare: missing input tensor");
+
+    // compare_type was ignored, so TOTALORDER compares used IEEE semantics:
+    // lt_to(-0, 0), lt_to(1, nan) and eq_to(nan, nan) were false, and
+    // searchsorted placed NaN queries at the end instead of before +NaN.
+    // Rank-0 operands are keyed as [1]: MPSGraph's compile-time optimizer
+    // asserts (SIGABRT) on reinterpretCastTensor of a scalar (jnp.digitize on
+    // a scalar, hence jsl.expm, aborted). The result is reshaped back below.
+    bool scalarKeyed = false;
+    auto compareType = compareOp.getCompareTypeAttr();
+    if (compareType && compareType.getValue() == mlir::stablehlo::ComparisonType::TOTALORDER) {
+        MPSGraphTensor* lhsIn = lhs;
+        MPSGraphTensor* rhsIn = rhs;
+        const bool scalar = (lhs.shape && lhs.shape.count == 0) || (rhs.shape && rhs.shape.count == 0);
+        if (scalar) {
+            lhsIn = [ctx.graph reshapeTensor:lhs withShape:@[@1] name:nil];
+            rhsIn = [ctx.graph reshapeTensor:rhs withShape:@[@1] name:nil];
+        }
+        MPSGraphTensor* lhsKey = TotalOrderKey(ctx.graph, lhsIn);
+        MPSGraphTensor* rhsKey = TotalOrderKey(ctx.graph, rhsIn);
+        if (lhsKey && rhsKey) {
+            lhs = lhsKey;
+            rhs = rhsKey;
+            scalarKeyed = scalar;
+        }
+    }
 
     auto direction = compareOp.getComparisonDirection();
     using Dir = mlir::stablehlo::ComparisonDirection;
@@ -787,6 +1281,10 @@ static ProcessResult HandleCompare(HandlerContext& ctx) {
         return ProcessResult::Error("compare: unknown compare direction");
     }
 
+    if (scalarKeyed) {
+        NSArray<NSNumber*>* outShape = GetOutputShape(ctx.op);
+        result = [ctx.graph reshapeTensor:result withShape:outShape ? outShape : @[] name:nil];
+    }
     return Result(ctx, result, "compare");
 }
 REGISTER_MPS_OP("stablehlo.compare", HandleCompare);
@@ -797,6 +1295,26 @@ static ProcessResult HandleSelect(HandlerContext& ctx) {
     MPSGraphTensor* onFalse = GetInputTensor(ctx, 2);
     if (!pred || !onTrue || !onFalse)
         return ProcessResult::Error("select: missing input tensor");
+
+    // bf16 select flushed subnormals and dropped the NaN sign; select the int16
+    // view instead (f16 select was already exact). See HalfToBits in registry.h.
+    if (onTrue.dataType == MPSDataTypeBFloat16 && onFalse.dataType == MPSDataTypeBFloat16 &&
+        HalfBitSignOpsEnabled()) {
+        MPSGraphTensor* tBits = HalfToBits(ctx.graph, onTrue);
+        MPSGraphTensor* fBits = HalfToBits(ctx.graph, onFalse);
+        NSArray<NSNumber*>* outShape = GetOutputShape(ctx.op);
+        if (tBits && fBits && outShape) {
+            MPSGraphTensor* p = pred;
+            if (p.shape && p.shape.count == 0 && outShape.count > 0) {
+                p = [ctx.graph reshapeTensor:p withShape:@[@1] name:nil];
+            }
+            MPSGraphTensor* bits = [ctx.graph selectWithPredicateTensor:p
+                                                    truePredicateTensor:tBits
+                                                   falsePredicateTensor:fBits
+                                                                   name:nil];
+            return Result(ctx, HalfFromBits(ctx.graph, bits, MPSDataTypeBFloat16, outShape), "select");
+        }
+    }
 
     MPSGraphTensor* result = [ctx.graph selectWithPredicateTensor:pred
                                               truePredicateTensor:onTrue
@@ -821,7 +1339,13 @@ static ProcessResult HandleClamp(HandlerContext& ctx) {
         MPSGraphTensor* hi = maxVal.dataType == operand.dataType
                                  ? maxVal
                                  : [ctx.graph castTensor:maxVal toType:operand.dataType name:nil];
-        return Result(ctx, NaNMin(ctx.graph, NaNMax(ctx.graph, operand, lo), hi), "clamp");
+        // max/min with XLA's -0 < +0 tie order; free when lo/hi are splat constants.
+        MPSGraphTensor* lower = TieAwareMaxMin(ctx.graph, operand, ctx.op->getOperand(1), lo,
+                                               minVal == lo ? ctx.op->getOperand(0) : mlir::Value(), true);
+        return Result(ctx,
+                      TieAwareMaxMin(ctx.graph, lower, mlir::Value(), hi,
+                                     maxVal == hi ? ctx.op->getOperand(2) : mlir::Value(), false),
+                      "clamp");
     }
     MPSGraphTensor* result = [ctx.graph clampWithTensor:operand
                                          minValueTensor:minVal

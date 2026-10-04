@@ -20,6 +20,7 @@
 #include "llvm/ADT/SmallSet.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 
 namespace jax_metallib {
@@ -37,18 +38,47 @@ MPSGraphTensor* ExactGatherAlongAxis(MPSGraph* graph, NSInteger axis, MPSGraphTe
     if (dtype == MPSDataTypeComplexFloat32 || dtype == MPSDataTypeComplexFloat16) {
         MPSGraphTensor* re = [graph realPartOfTensor:updates name:nil];
         MPSGraphTensor* im = [graph imaginaryPartOfTensor:updates name:nil];
-        MPSGraphTensor* gRe = [graph gatherAlongAxis:axis
-                                   withUpdatesTensor:re
-                                       indicesTensor:indices
-                                                name:nil];
-        MPSGraphTensor* gIm = [graph gatherAlongAxis:axis
-                                   withUpdatesTensor:im
-                                       indicesTensor:indices
-                                                name:nil];
+        MPSGraphTensor* gRe = ExactGatherAlongAxis(graph, axis, re, indices);
+        MPSGraphTensor* gIm = ExactGatherAlongAxis(graph, axis, im, indices);
         if (!gRe || !gIm) {
             return nil;
         }
         return [graph complexTensorWithRealTensor:gRe imaginaryTensor:gIm name:nil];
+    }
+    // gatherAlongAxis rewrote 16-bit float NaNs to +qNaN (-NaN 0xfe00 and payload
+    // NaNs became 0x7e00) and flushed bf16 subnormals to zero; move the raw bits.
+    // XLA:CPU sorts bf16 through f32 and narrows back, so every bf16 NaN it
+    // emits is sign|0x7fc0 (keys and values, both directions); a length-1 axis
+    // is a no-op there and keeps the raw bits. f16 keeps raw bits throughout.
+    if (dtype == MPSDataTypeFloat16 || dtype == MPSDataTypeBFloat16) {
+        MPSGraphTensor* raw = [graph reinterpretCastTensor:updates toType:MPSDataTypeInt16 name:nil];
+        MPSGraphTensor* moved = [graph gatherAlongAxis:axis
+                                     withUpdatesTensor:raw
+                                         indicesTensor:indices
+                                                  name:nil];
+        if (!moved) {
+            return nil;
+        }
+        NSArray<NSNumber*>* shape = updates.shape;
+        const bool trivialAxis =
+            shape && axis >= 0 && axis < (NSInteger)shape.count && shape[axis].longLongValue == 1;
+        if (dtype == MPSDataTypeBFloat16 && !trivialAxis) {
+            MPSGraphTensor* magMask = [graph constantWithScalar:32767.0 dataType:MPSDataTypeInt16];
+            MPSGraphTensor* infBits = [graph constantWithScalar:32640.0 dataType:MPSDataTypeInt16];
+            MPSGraphTensor* signMask = [graph constantWithScalar:-32768.0 dataType:MPSDataTypeInt16];
+            MPSGraphTensor* qnan = [graph constantWithScalar:32704.0 dataType:MPSDataTypeInt16];
+            MPSGraphTensor* mag = [graph bitwiseANDWithPrimaryTensor:moved secondaryTensor:magMask name:nil];
+            MPSGraphTensor* isNan = [graph greaterThanWithPrimaryTensor:mag secondaryTensor:infBits name:nil];
+            MPSGraphTensor* sign = [graph bitwiseANDWithPrimaryTensor:moved
+                                                      secondaryTensor:signMask
+                                                                 name:nil];
+            MPSGraphTensor* canon = [graph bitwiseORWithPrimaryTensor:sign secondaryTensor:qnan name:nil];
+            moved = [graph selectWithPredicateTensor:isNan
+                                 truePredicateTensor:canon
+                                falsePredicateTensor:moved
+                                                name:nil];
+        }
+        return [graph reinterpretCastTensor:moved toType:dtype name:nil];
     }
     if (dtype != MPSDataTypeInt32 && dtype != MPSDataTypeUInt32) {
         return [graph gatherAlongAxis:axis withUpdatesTensor:updates indicesTensor:indices name:nil];
@@ -80,13 +110,180 @@ bool IsComplexDtype(MPSDataType t) {
 // operands with a process-aborting assertion, and JAX orders complex values
 // lexicographically by (real, imag): stable-argsort the imaginary parts, then
 // stable-argsort the real parts taken in that order, and compose the two.
+// XLA's float sort comparator maps every NaN to +NaN (sorted after +inf) and
+// -0.0 to +0.0 (equal, so a stable sort keeps their input order). MPSGraph
+// sort/argSort order by sign instead: -NaN sorted first and -0 before +0.
+// JAX_METALLIB_SORT_LEGACY_VALUES=1 restores the old sortWithTensor values path.
+static bool EnvFlagEnabledSort(const char* name) {
+    const char* v = std::getenv(name);
+    return v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+}
+
+static bool IsRealFloatDtype(MPSDataType dt) {
+    return dt == MPSDataTypeFloat32 || dt == MPSDataTypeFloat16 || dt == MPSDataTypeBFloat16;
+}
+
+static MPSGraphTensor* CanonicalizeSortNaN(MPSGraph* graph, MPSGraphTensor* t) {
+    if (!IsRealFloatDtype(t.dataType)) {
+        return t;
+    }
+    MPSGraphTensor* nan = [graph constantWithScalar:NAN dataType:t.dataType];
+    return [graph selectWithPredicateTensor:[graph isNaNWithTensor:t name:nil]
+                        truePredicateTensor:nan
+                       falsePredicateTensor:t
+                                       name:nil];
+}
+
+static MPSGraphTensor* CanonicalSortKey(MPSGraph* graph, MPSGraphTensor* t) {
+    if (!IsRealFloatDtype(t.dataType)) {
+        return t;
+    }
+    MPSGraphTensor* zero = [graph constantWithScalar:0.0 dataType:t.dataType];
+    MPSGraphTensor* isZero = [graph equalWithPrimaryTensor:t secondaryTensor:zero name:nil];
+    MPSGraphTensor* noNegZero = [graph selectWithPredicateTensor:isZero
+                                             truePredicateTensor:zero
+                                            falsePredicateTensor:t
+                                                            name:nil];
+    return CanonicalizeSortNaN(graph, noNegZero);
+}
+
+// MPSGraph argSort costs a roughly fixed ~1.3-2 us per row, so many short rows
+// are slow (f32 [65536,64] ~79 ms, [16384,256] ~24 ms for 4M elements) while one
+// long row is not. Rows of at most JAX_METALLIB_SORT_COMPOSITE_MAX_ROW elements
+// on the last axis are sorted as ONE flat stable argSort of an int64 composite
+// key row * 2^32 + (s + 2^31), where s is an order-preserving int32 key
+// (canonical -0/NaN like XLA's comparator; ~s for descending so ties keep
+// input order). The composite costs ~5.3 ms per 1M elements whatever the row
+// length, so it is gated on short AND numerous rows: 32-bit keys L <= 256 and
+// rows >= 1024 (f32 4M L=64 88 -> 32 ms, 1M L=256 8.3 -> 5.3 ms); 16-bit and
+// narrower keys (argSort is ~2x cheaper per row) L <= 64 and rows >= 4096.
+// JAX_METALLIB_SORT_COMPOSITE_MAX_ROW overrides: 0 disables, N > 0 uses it for
+// every rows >= 2 with L <= N. Returns -1 when unset (auto gate).
+static int64_t SortCompositeMaxRow() {
+    const char* v = std::getenv("JAX_METALLIB_SORT_COMPOSITE_MAX_ROW");
+    if (!v || v[0] == '\0') {
+        return -1;
+    }
+    return std::max<int64_t>(0, std::strtoll(v, nullptr, 10));
+}
+
+static MPSGraphTensor* OrderedInt32SortKey(MPSGraph* graph, MPSGraphTensor* t) {
+    MPSDataType dt = t.dataType;
+    if (IsRealFloatDtype(dt)) {
+        if (dt != MPSDataTypeFloat32) {
+            t = [graph castTensor:t toType:MPSDataTypeFloat32 name:nil];
+        }
+        t = CanonicalizeSortNaN(graph, t);
+        MPSGraphTensor* bits = [graph reinterpretCastTensor:t toType:MPSDataTypeInt32 name:nil];
+        MPSGraphTensor* zero = [graph constantWithScalar:0 dataType:MPSDataTypeInt32];
+        MPSGraphTensor* magMask = [graph constantWithScalar:2147483647.0 dataType:MPSDataTypeInt32];
+        // -0, +0 and subnormals share key 0 (XLA:CPU compares with
+        // denormals-as-zero); decided on the bits, not on a float compare.
+        MPSGraphTensor* minNormal = [graph constantWithScalar:8388608.0 dataType:MPSDataTypeInt32];
+        MPSGraphTensor* mag = [graph bitwiseANDWithPrimaryTensor:bits secondaryTensor:magMask name:nil];
+        MPSGraphTensor* tiny = [graph lessThanWithPrimaryTensor:mag secondaryTensor:minNormal name:nil];
+        bits = [graph selectWithPredicateTensor:tiny
+                            truePredicateTensor:zero
+                           falsePredicateTensor:bits
+                                           name:nil];
+        MPSGraphTensor* flipped = [graph bitwiseXORWithPrimaryTensor:bits secondaryTensor:magMask name:nil];
+        MPSGraphTensor* neg = [graph lessThanWithPrimaryTensor:bits secondaryTensor:zero name:nil];
+        return [graph selectWithPredicateTensor:neg
+                            truePredicateTensor:flipped
+                           falsePredicateTensor:bits
+                                           name:nil];
+    }
+    if (dt == MPSDataTypeUInt32) {
+        MPSGraphTensor* bits = [graph reinterpretCastTensor:t toType:MPSDataTypeInt32 name:nil];
+        MPSGraphTensor* signBit = [graph constantWithScalar:-2147483648.0 dataType:MPSDataTypeInt32];
+        return [graph bitwiseXORWithPrimaryTensor:bits secondaryTensor:signBit name:nil];
+    }
+    if (dt == MPSDataTypeInt32) {
+        return t;
+    }
+    if (dt == MPSDataTypeInt16 || dt == MPSDataTypeUInt16 || dt == MPSDataTypeInt8 ||
+        dt == MPSDataTypeUInt8 || dt == MPSDataTypeBool) {
+        return [graph castTensor:t toType:MPSDataTypeInt32 name:nil];
+    }
+    return nil;
+}
+
+static MPSGraphTensor* CompositeRowArgSort(MPSGraph* graph, MPSGraphTensor* key, NSInteger axis,
+                                           bool descending) {
+    const int64_t forcedMaxRow = SortCompositeMaxRow();
+    const MPSDataType kdt = key.dataType;
+    const bool wideKey = kdt == MPSDataTypeFloat32 || kdt == MPSDataTypeInt32 || kdt == MPSDataTypeUInt32;
+    int64_t maxRow = wideKey ? 256 : 64;
+    int64_t minRows = wideKey ? 1024 : 4096;
+    if (forcedMaxRow >= 0) {
+        maxRow = forcedMaxRow;
+        minRows = 2;
+    }
+    NSArray<NSNumber*>* shape = key.shape;
+    if (maxRow <= 0 || !shape || shape.count < 2 || axis != (NSInteger)shape.count - 1) {
+        return nil;
+    }
+    int64_t total = 1;
+    for (NSNumber* d : shape) {
+        if (d.longLongValue <= 0) {
+            return nil;
+        }
+        total *= d.longLongValue;
+    }
+    const int64_t cols = shape.lastObject.longLongValue;
+    const int64_t rows = total / cols;
+    if (rows < minRows || cols < 2 || cols > maxRow || total >= (int64_t{1} << 31)) {
+        return nil;
+    }
+    MPSGraphTensor* s = OrderedInt32SortKey(graph, key);
+    if (!s) {
+        return nil;
+    }
+    if (descending) {
+        s = [graph bitwiseNOTWithTensor:s name:nil];
+    }
+    NSArray<NSNumber*>* shape2d = @[@(rows), @(cols)];
+    s = [graph reshapeTensor:s withShape:shape2d name:nil];
+    MPSGraphTensor* row = EnsureInt32(graph, [graph coordinateAlongAxis:0 withShape:shape2d name:nil]);
+    MPSGraphTensor* row64 = [graph castTensor:row toType:MPSDataTypeInt64 name:nil];
+    MPSGraphTensor* twoPow32 = [graph constantWithScalar:4294967296.0 dataType:MPSDataTypeInt64];
+    MPSGraphTensor* twoPow31 = [graph constantWithScalar:2147483648.0 dataType:MPSDataTypeInt64];
+    MPSGraphTensor* low = [graph additionWithPrimaryTensor:[graph castTensor:s
+                                                                      toType:MPSDataTypeInt64
+                                                                        name:nil]
+                                           secondaryTensor:twoPow31
+                                                      name:nil];
+    MPSGraphTensor* composite =
+        [graph additionWithPrimaryTensor:[graph multiplicationWithPrimaryTensor:row64
+                                                                secondaryTensor:twoPow32
+                                                                           name:nil]
+                         secondaryTensor:low
+                                    name:nil];
+    composite = [graph reshapeTensor:composite withShape:@[@(total)] name:nil];
+    MPSGraphTensor* flat = [graph argSortWithTensor:composite axis:0 descending:NO name:nil];
+    if (!flat) {
+        return nil;
+    }
+    flat = [graph reshapeTensor:EnsureInt32(graph, flat) withShape:shape2d name:nil];
+    MPSGraphTensor* colsT = [graph constantWithScalar:(double)cols dataType:MPSDataTypeInt32];
+    MPSGraphTensor* rowStart = [graph multiplicationWithPrimaryTensor:row secondaryTensor:colsT name:nil];
+    MPSGraphTensor* local = [graph subtractionWithPrimaryTensor:flat secondaryTensor:rowStart name:nil];
+    return [graph reshapeTensor:local withShape:shape name:nil];
+}
+
 MPSGraphTensor* ArgSortKey(MPSGraph* graph, MPSGraphTensor* key, NSInteger axis, bool descending) {
     if (!IsComplexDtype(key.dataType)) {
-        MPSGraphTensor* perm = [graph argSortWithTensor:key axis:axis descending:descending name:nil];
+        if (MPSGraphTensor* composite = CompositeRowArgSort(graph, key, axis, descending)) {
+            return composite;
+        }
+        MPSGraphTensor* perm = [graph argSortWithTensor:CanonicalSortKey(graph, key)
+                                                   axis:axis
+                                             descending:descending
+                                                   name:nil];
         return perm ? EnsureInt32(graph, perm) : nil;
     }
-    MPSGraphTensor* re = [graph realPartOfTensor:key name:nil];
-    MPSGraphTensor* im = [graph imaginaryPartOfTensor:key name:nil];
+    MPSGraphTensor* re = CanonicalSortKey(graph, [graph realPartOfTensor:key name:nil]);
+    MPSGraphTensor* im = CanonicalSortKey(graph, [graph imaginaryPartOfTensor:key name:nil]);
     MPSGraphTensor* order = [graph argSortWithTensor:im axis:axis descending:descending name:nil];
     if (!order) {
         return nil;
@@ -106,8 +303,22 @@ MPSGraphTensor* ArgSortKey(MPSGraph* graph, MPSGraphTensor* key, NSInteger axis,
 
 MPSGraphTensor* ExactSortValues(MPSGraph* graph, MPSGraphTensor* input, NSInteger axis, bool descending) {
     const bool int32Like = input.dataType == MPSDataTypeInt32 || input.dataType == MPSDataTypeUInt32;
-    if (!int32Like && !IsComplexDtype(input.dataType)) {
+    if (!int32Like && !IsComplexDtype(input.dataType) && !IsRealFloatDtype(input.dataType)) {
         return [graph sortWithTensor:input axis:axis descending:descending name:nil];
+    }
+    // Real floats go through argsort + gather: XLA canonicalizes -0 and NaN only
+    // inside the comparator and returns the original bits in stable order.
+    // Sorting canonicalized values directly rewrote every NaN to +NaN, and
+    // sortWithTensor is not stable on -0/+0 ties.
+    if (IsRealFloatDtype(input.dataType) && !EnvFlagEnabledSort("JAX_METALLIB_SORT_LEGACY_VALUES")) {
+        MPSGraphTensor* perm = ArgSortKey(graph, input, axis, descending);
+        return perm ? ExactGatherAlongAxis(graph, axis, input, perm) : nil;
+    }
+    if (IsRealFloatDtype(input.dataType)) {
+        return [graph sortWithTensor:CanonicalizeSortNaN(graph, input)
+                                axis:axis
+                          descending:descending
+                                name:nil];
     }
     MPSGraphTensor* perm = ArgSortKey(graph, input, axis, descending);
     if (!perm) {
@@ -210,6 +421,159 @@ NSInteger inferTopKAxisFromShapes(NSArray<NSNumber*>* inputShape, NSArray<NSNumb
 
 } // namespace
 
+static MPSGraphTensor* TopKOrderKey(MPSGraph* graph, MPSGraphTensor* input);
+
+// lax.top_k arrives as iota -> stable sort (GT TOTALORDER) -> slice[..., 0:k]
+// on both results. Returns the widest leading-slice limit along `axis` when
+// every user of every sort result is such a slice (start 0, stride 1), else -1.
+static int64_t LeadingSliceWidth(mlir::Operation* op, NSInteger axis) {
+    int64_t width = 0;
+    for (mlir::Value result : op->getResults()) {
+        for (mlir::Operation* user : result.getUsers()) {
+            auto slice = mlir::dyn_cast<mlir::stablehlo::SliceOp>(user);
+            if (!slice) {
+                return -1;
+            }
+            auto starts = slice.getStartIndices();
+            auto limits = slice.getLimitIndices();
+            auto strides = slice.getStrides();
+            if (axis < 0 || (size_t)axis >= starts.size() || starts[axis] != 0 || strides[axis] != 1) {
+                return -1;
+            }
+            width = std::max<int64_t>(width, limits[axis]);
+        }
+    }
+    return width;
+}
+
+// A full argsort costs a flat ~5.5 ms per 1M f32 elements on rows <= 256 (3.6
+// ms at L=1024, 1.7 at 4096, 1.3 at 16384; ~1.1 ms at 256K), while top_k keeps
+// only k. Selecting the permutation costs ~0.04 ms + ~0.2 ms per 1M elements
+// per round (~0.55 per 1M at L=16), so the auto cap depends on the row length
+// L and the total size N (measured f32, 64K-1M elements): 16 for 64 <= L <= 512
+// and N >= 2^20; 12 for 64 <= L <= 1024 and N >= 2^18; 8 for L < 64 and N >=
+// 2^20; 4 with >= 32 rows; 2 with >= 8 rows; else 1 (64K L=16384, 4 rows: k=2
+// 0.32 vs 0.31 ms, k=1 0.27 vs 0.32). f32 1M k=1:
+// 5.4 -> 0.40-0.56 ms. JAX_METALLIB_TOPK_SELECT_MAX_K=N > 0 forces a flat
+// cap, 0 disables.
+static int64_t TopKSelectMaxK(int64_t len, int64_t total) {
+    const char* v = std::getenv("JAX_METALLIB_TOPK_SELECT_MAX_K");
+    if (v && v[0] != '\0') {
+        return std::max<int64_t>(0, std::strtoll(v, nullptr, 10));
+    }
+    if (len >= 64 && len <= 512 && total >= (int64_t{1} << 20)) {
+        return 16;
+    }
+    if (len >= 64 && len <= 1024 && total >= (int64_t{1} << 18)) {
+        return 12;
+    }
+    if (len < 64 && total >= (int64_t{1} << 20)) {
+        return 8;
+    }
+    const int64_t rows = len > 0 ? total / len : 0;
+    if (rows >= 32) {
+        return 4;
+    }
+    return rows >= 8 ? 2 : 1;
+}
+
+// int32 key whose signed order is the integer order of `t` (raw GT compare of
+// integer top_k), or nil for dtypes the selection path does not take.
+static MPSGraphTensor* IntSelectKey(MPSGraph* g, MPSGraphTensor* t) {
+    const MPSDataType dt = t.dataType;
+    if (dt == MPSDataTypeInt32 || dt == MPSDataTypeUInt32) {
+        return TopKOrderKey(g, t);
+    }
+    if (dt == MPSDataTypeInt16 || dt == MPSDataTypeUInt16 || dt == MPSDataTypeInt8 ||
+        dt == MPSDataTypeUInt8) {
+        // Sign-/zero-extension keeps the order.
+        return [g castTensor:t toType:MPSDataTypeInt32 name:nil];
+    }
+    return nil;
+}
+
+// First k positions of a stable descending sort of the int32 `key` along
+// `axis`: each round takes the max over not-yet-taken elements and the first
+// untaken index holding it. Taken elements are masked to INT32_MIN, which a
+// real key can also equal (f32 -NaN 0xFFFFFFFF), so the hit test excludes
+// taken positions explicitly instead of relying on the mask value.
+static MPSGraphTensor* TopKSelectPerm(MPSGraph* g, MPSGraphTensor* key, NSInteger axis, int64_t k) {
+    MPSGraphTensor* coord = EnsureInt32(g, [g coordinateAlongAxis:axis withShape:key.shape name:nil]);
+    MPSGraphTensor* minKey = [g constantWithScalar:-2147483648.0 dataType:MPSDataTypeInt32];
+    MPSGraphTensor* zero = [g constantWithScalar:0 dataType:MPSDataTypeInt32];
+    MPSGraphTensor* taken = nil;
+    NSMutableArray<MPSGraphTensor*>* picks = [NSMutableArray arrayWithCapacity:(NSUInteger)k];
+    for (int64_t r = 0; r < k; ++r) {
+        MPSGraphTensor* masked = taken ? [g selectWithPredicateTensor:taken
+                                                  truePredicateTensor:minKey
+                                                 falsePredicateTensor:key
+                                                                 name:nil]
+                                       : key;
+        MPSGraphTensor* best = [g reductionMaximumWithTensor:masked axis:axis name:nil];
+        MPSGraphTensor* hit = [g equalWithPrimaryTensor:key secondaryTensor:best name:nil];
+        if (taken) {
+            hit = [g logicalANDWithPrimaryTensor:hit
+                                 secondaryTensor:[g notWithTensor:taken name:nil]
+                                            name:nil];
+        }
+        MPSGraphTensor* hitU8 = [g castTensor:hit toType:MPSDataTypeUInt8 name:nil];
+        MPSGraphTensor* idx = [g reductionArgMaximumWithTensor:hitU8 axis:axis name:nil];
+        if (!best || !idx) {
+            return nil;
+        }
+        // Arg-reductions can return -1 when every element equals the sentinel;
+        // a hit always exists, so that case means all hit and index 0 is first.
+        idx = [g maximumWithPrimaryTensor:EnsureInt32(g, idx) secondaryTensor:zero name:nil];
+        [picks addObject:idx];
+        MPSGraphTensor* pick = [g equalWithPrimaryTensor:coord secondaryTensor:idx name:nil];
+        taken = taken ? [g logicalORWithPrimaryTensor:taken secondaryTensor:pick name:nil] : pick;
+    }
+    return picks.count == 1 ? picks[0] : [g concatTensors:picks dimension:axis name:nil];
+}
+
+static bool PadExactSupported(MPSDataType dt) {
+    return dt == MPSDataTypeFloat32 || dt == MPSDataTypeInt32 || dt == MPSDataTypeUInt32 ||
+           dt == MPSDataTypeFloat16 || dt == MPSDataTypeBFloat16 || dt == MPSDataTypeInt16 ||
+           dt == MPSDataTypeUInt16;
+}
+
+// Zero-pads `t` along `axis` up to `len` without moving values through a float
+// path: 32-bit dtypes pad as int32 bits, 16-bit dtypes as their sign-extended
+// int32 bits, cast back afterwards. Returns nil for other dtypes.
+static MPSGraphTensor* PadAlongAxisExact(MPSGraph* g, MPSGraphTensor* t, NSInteger axis, int64_t len) {
+    const MPSDataType dt = t.dataType;
+    NSArray<NSNumber*>* shape = t.shape;
+    if (!PadExactSupported(dt) || !shape || axis < 0 || axis >= (NSInteger)shape.count) {
+        return nil;
+    }
+    const int64_t cur = shape[(NSUInteger)axis].longLongValue;
+    if (cur >= len) {
+        return t;
+    }
+    const bool wide = dt == MPSDataTypeFloat32 || dt == MPSDataTypeInt32 || dt == MPSDataTypeUInt32;
+    const MPSDataType bitsType = wide ? MPSDataTypeInt32 : MPSDataTypeInt16;
+    MPSGraphTensor* bits = dt == bitsType ? t : [g reinterpretCastTensor:t toType:bitsType name:nil];
+    if (!wide) {
+        bits = [g castTensor:bits toType:MPSDataTypeInt32 name:nil];
+    }
+    NSMutableArray<NSNumber*>* left = [NSMutableArray arrayWithCapacity:shape.count];
+    NSMutableArray<NSNumber*>* right = [NSMutableArray arrayWithCapacity:shape.count];
+    for (NSUInteger d = 0; d < shape.count; ++d) {
+        [left addObject:@0];
+        [right addObject:@(d == (NSUInteger)axis ? len - cur : 0)];
+    }
+    bits = [g padTensor:bits
+        withPaddingMode:MPSGraphPaddingModeConstant
+            leftPadding:left
+           rightPadding:right
+          constantValue:0.0
+                   name:nil];
+    if (!wide) {
+        bits = [g castTensor:bits toType:MPSDataTypeInt16 name:nil];
+    }
+    return dt == bitsType ? bits : [g reinterpretCastTensor:bits toType:dt name:nil];
+}
+
 static ProcessResult HandleSort(HandlerContext& ctx) {
     auto sortOp = mlir::dyn_cast<mlir::stablehlo::SortOp>(ctx.op);
     if (!sortOp) {
@@ -223,6 +587,13 @@ static ProcessResult HandleSort(HandlerContext& ctx) {
     NSInteger axis = (NSInteger)dimAttr.getInt();
 
     bool descending = false;
+    // jnp.sort/argsort/lexsort canonicalise -0 and NaN with selects before a
+    // TOTALORDER compare; lax.top_k (the chlo.top_k composite decomposition)
+    // compares the raw block arguments with TOTALORDER, i.e. IEEE totalOrder
+    // on the bits (-NaN < -0 < +0 < subnormals < +NaN, no DAZ). Only the latter
+    // takes the raw total-order key below; every other comparator is unchanged.
+    bool rawTotalOrder = false;
+    bool rawIntGT = false;
     if (!sortOp.getComparator().empty()) {
         for (mlir::Operation& nestedOp : sortOp.getComparator().front()) {
             auto compareOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(&nestedOp);
@@ -235,16 +606,87 @@ static ProcessResult HandleSort(HandlerContext& ctx) {
             auto direction = compareOp.getComparisonDirection();
             descending = direction == mlir::stablehlo::ComparisonDirection::GT ||
                          direction == mlir::stablehlo::ComparisonDirection::GE;
+            auto compareType = compareOp.getCompareType();
+            const bool rawArgs = mlir::isa<mlir::BlockArgument>(compareOp.getLhs()) &&
+                                 mlir::isa<mlir::BlockArgument>(compareOp.getRhs());
+            rawTotalOrder =
+                rawArgs && compareType && *compareType == mlir::stablehlo::ComparisonType::TOTALORDER;
+            // Integer lax.top_k: raw GT with the element type's own signedness.
+            if (rawArgs && direction == mlir::stablehlo::ComparisonDirection::GT) {
+                auto shaped = mlir::dyn_cast<mlir::ShapedType>(compareOp.getLhs().getType());
+                auto intTy =
+                    shaped ? mlir::dyn_cast<mlir::IntegerType>(shaped.getElementType()) : mlir::IntegerType();
+                if (intTy && intTy.getWidth() > 1 && intTy.getWidth() <= 32) {
+                    const auto want = intTy.isUnsigned() ? mlir::stablehlo::ComparisonType::UNSIGNED
+                                                         : mlir::stablehlo::ComparisonType::SIGNED;
+                    rawIntGT = !compareType || *compareType == want;
+                }
+            }
             break;
         }
     }
+    // Stable permutation in raw total order for a real-float key, or nil to use
+    // the canonical sort path (JAX_METALLIB_TOPK_LEGACY_FLOAT=1 forces nil).
+    // Integer keys only take the small-k selection path (integer sorts are
+    // already exact); JAX_METALLIB_TOPK_SELECT_INT=0 keeps them on the full sort.
+    if (const char* v = std::getenv("JAX_METALLIB_TOPK_SELECT_INT"); v && v[0] == '0' && v[1] == '\0') {
+        rawIntGT = false;
+    }
+    const int64_t sliceWidth =
+        (rawTotalOrder || rawIntGT) && descending ? LeadingSliceWidth(ctx.op, axis) : -1;
+    // Set when totalOrderPerm returned only the leading sliceWidth positions.
+    int64_t selectPadTo = 0;
+    auto totalOrderPerm = [&](MPSGraphTensor* key) -> MPSGraphTensor* {
+        if (!key) {
+            return nil;
+        }
+        const bool intKey = rawIntGT && !IsRealFloatDtype(key.dataType);
+        if (!intKey && (!rawTotalOrder || !IsRealFloatDtype(key.dataType))) {
+            return nil;
+        }
+        MPSGraphTensor* k = intKey ? IntSelectKey(ctx.graph, key) : TopKOrderKey(ctx.graph, key);
+        if (!k) {
+            return nil;
+        }
+        NSArray<NSNumber*>* shape = k.shape;
+        const int64_t len =
+            shape && axis >= 0 && axis < (NSInteger)shape.count ? shape[(NSUInteger)axis].longLongValue : -1;
+        int64_t total = 1;
+        for (NSNumber* d in shape) {
+            total *= std::max<int64_t>(0, d.longLongValue);
+        }
+        bool padOk = true;
+        for (unsigned i = 0; i < ctx.op->getNumOperands(); ++i) {
+            MPSGraphTensor* operand = GetInputTensor(ctx, i);
+            padOk = padOk && operand && PadExactSupported(operand.dataType);
+        }
+        if (padOk && sliceWidth > 0 && len > 0 && sliceWidth < len &&
+            sliceWidth <= TopKSelectMaxK(len, total)) {
+            if (MPSGraphTensor* sel = TopKSelectPerm(ctx.graph, k, axis, sliceWidth)) {
+                selectPadTo = len;
+                return sel;
+            }
+        }
+        if (intKey) {
+            return nil; // integer sorts outside the selection gate keep the exact sort path
+        }
+        if (descending) {
+            k = [ctx.graph bitwiseNOTWithTensor:k name:nil];
+        }
+        return ArgSortKey(ctx.graph, k, axis, false);
+    };
 
     if (ctx.op->getNumOperands() == 1 && ctx.op->getNumResults() == 1) {
         MPSGraphTensor* input = GetInputTensor(ctx, 0);
         if (!input) {
             return ProcessResult::Error("stablehlo.sort input tensor not found");
         }
-        MPSGraphTensor* sorted = ExactSortValues(ctx.graph, input, axis, descending);
+        MPSGraphTensor* rawPerm = totalOrderPerm(input);
+        MPSGraphTensor* sorted = rawPerm ? ExactGatherAlongAxis(ctx.graph, axis, input, rawPerm)
+                                         : ExactSortValues(ctx.graph, input, axis, descending);
+        if (sorted && selectPadTo > 0) {
+            sorted = PadAlongAxisExact(ctx.graph, sorted, axis, selectPadTo);
+        }
         if (!sorted) {
             return ProcessResult::Error("stablehlo.sort lowering failed");
         }
@@ -301,8 +743,16 @@ static ProcessResult HandleSort(HandlerContext& ctx) {
             if (!keyTensor) {
                 return ProcessResult::Error("stablehlo.sort key tensor missing");
             }
-            MPSGraphTensor* sortedKey = ExactSortValues(ctx.graph, keyTensor, axis, descending);
-            perm = ArgSortKey(ctx.graph, keyTensor, axis, descending);
+            MPSGraphTensor* sortedKey = nil;
+            if ((perm = totalOrderPerm(keyTensor))) {
+                sortedKey = ExactGatherAlongAxis(ctx.graph, axis, keyTensor, perm);
+                if (sortedKey && selectPadTo > 0) {
+                    sortedKey = PadAlongAxisExact(ctx.graph, sortedKey, axis, selectPadTo);
+                }
+            } else {
+                sortedKey = ExactSortValues(ctx.graph, keyTensor, axis, descending);
+                perm = ArgSortKey(ctx.graph, keyTensor, axis, descending);
+            }
             if (!sortedKey || !perm) {
                 return ProcessResult::Error("stablehlo.sort lowering failed");
             }
@@ -319,6 +769,9 @@ static ProcessResult HandleSort(HandlerContext& ctx) {
                     return ProcessResult::Error("stablehlo.sort operand tensor missing");
                 }
                 MPSGraphTensor* sorted = ExactGatherAlongAxis(ctx.graph, axis, operand, perm);
+                if (sorted && selectPadTo > 0) {
+                    sorted = PadAlongAxisExact(ctx.graph, sorted, axis, selectPadTo);
+                }
                 if (!sorted) {
                     return ProcessResult::Error("stablehlo.sort gather lowering failed");
                 }
@@ -369,6 +822,51 @@ static ProcessResult HandleSort(HandlerContext& ctx) {
     return ProcessResult::Error("Unsupported stablehlo.sort operand/result shape");
 }
 
+// XLA's TopK comparator (is_stable = true) is IEEE totalOrder on the raw bits:
+// key = bits < 0 ? bits ^ 0x7FF..F : bits, compared as signed integers, so
+// -NaN < -inf < ... < -0 < +0 < subnormals < ... < +inf < +NaN with no NaN/-0
+// canonicalisation and no denormal flush; f16/bf16 compare their 16-bit
+// patterns. MPSGraph topK compares floats (-0 == +0, NaN unordered) and is not
+// stable on ties (75/247 float probe cases differed from XLA:CPU, plain ties
+// included); int32/uint32 topK compared through float32. Returns an int32 key
+// whose ascending order is XLA's, or nil for dtypes that keep MPSGraph topK.
+// JAX_METALLIB_TOPK_LEGACY_FLOAT=1 sends floats to MPSGraph topK again.
+static MPSGraphTensor* TopKOrderKey(MPSGraph* graph, MPSGraphTensor* input) {
+    const MPSDataType dt = input.dataType;
+    if (dt == MPSDataTypeInt32) {
+        return input;
+    }
+    if (dt == MPSDataTypeUInt32) {
+        MPSGraphTensor* bits = [graph reinterpretCastTensor:input toType:MPSDataTypeInt32 name:nil];
+        MPSGraphTensor* signBit = [graph constantWithScalar:-2147483648.0 dataType:MPSDataTypeInt32];
+        return [graph bitwiseXORWithPrimaryTensor:bits secondaryTensor:signBit name:nil];
+    }
+    if (!IsRealFloatDtype(dt) || EnvFlagEnabledSort("JAX_METALLIB_TOPK_LEGACY_FLOAT")) {
+        return nil;
+    }
+    MPSGraphTensor* bits = nil;
+    MPSGraphTensor* magMask = nil;
+    if (dt == MPSDataTypeFloat32) {
+        bits = [graph reinterpretCastTensor:input toType:MPSDataTypeInt32 name:nil];
+        magMask = [graph constantWithScalar:2147483647.0 dataType:MPSDataTypeInt32];
+    } else {
+        // Sign-extending int16 -> int32 keeps the 16-bit total order.
+        MPSGraphTensor* raw = [graph reinterpretCastTensor:input toType:MPSDataTypeInt16 name:nil];
+        bits = [graph castTensor:raw toType:MPSDataTypeInt32 name:nil];
+        magMask = [graph constantWithScalar:32767.0 dataType:MPSDataTypeInt32];
+    }
+    if (!bits) {
+        return nil;
+    }
+    MPSGraphTensor* zero = [graph constantWithScalar:0 dataType:MPSDataTypeInt32];
+    MPSGraphTensor* neg = [graph lessThanWithPrimaryTensor:bits secondaryTensor:zero name:nil];
+    MPSGraphTensor* flipped = [graph bitwiseXORWithPrimaryTensor:bits secondaryTensor:magMask name:nil];
+    return [graph selectWithPredicateTensor:neg
+                        truePredicateTensor:flipped
+                       falsePredicateTensor:bits
+                                       name:nil];
+}
+
 static ProcessResult HandleTopK(HandlerContext& ctx) {
     if (ctx.op->getNumOperands() < 1 || ctx.op->getNumResults() != 2) {
         return ProcessResult::Error("Unsupported top_k operand/result shape");
@@ -406,29 +904,20 @@ static ProcessResult HandleTopK(HandlerContext& ctx) {
 
     MPSGraphTensor* valueOut = nil;
     MPSGraphTensor* indexOut = nil;
-    if (input.dataType == MPSDataTypeInt32 || input.dataType == MPSDataTypeUInt32) {
-        // MPSGraph topK returned wrong int32/uint32 values (consistent with a
-        // float32 comparison). Build an order-preserving int32 key (sign-bit
-        // flip for uint32; bitwise NOT so ascending means largest first),
-        // stable-argsort it, keep the first k and gather the values exactly.
-        MPSGraphTensor* key = input.dataType == MPSDataTypeInt32
-                                  ? input
-                                  : [ctx.graph reinterpretCastTensor:input toType:MPSDataTypeInt32 name:nil];
-        if (input.dataType == MPSDataTypeUInt32) {
-            MPSGraphTensor* signBit = [ctx.graph constantWithScalar:-2147483648.0 dataType:MPSDataTypeInt32];
-            key = [ctx.graph bitwiseXORWithPrimaryTensor:key secondaryTensor:signBit name:nil];
-        }
+    if (MPSGraphTensor* key = TopKOrderKey(ctx.graph, input)) {
+        // Bitwise NOT so an ascending stable argsort puts the largest first and
+        // equal keys keep input order; keep the first k and gather the values
+        // exactly (raw bits for f16, XLA's sign|0x7fc0 NaN for bf16).
         key = [ctx.graph bitwiseNOTWithTensor:key name:nil];
-        MPSGraphTensor* order = [ctx.graph argSortWithTensor:key axis:axis descending:NO name:nil];
+        MPSGraphTensor* order = ArgSortKey(ctx.graph, key, axis, false);
         if (!order) {
             return ProcessResult::Error("top_k argSort lowering failed");
         }
-        order = EnsureInt32(ctx.graph, order);
         order = [ctx.graph sliceTensor:order dimension:axis start:0 length:(NSInteger)k name:nil];
         valueOut = ExactGatherAlongAxis(ctx.graph, axis, input, order);
         indexOut = order;
         if (!valueOut || !indexOut) {
-            return ProcessResult::Error("top_k integer lowering failed");
+            return ProcessResult::Error("top_k exact gather lowering failed");
         }
     } else {
         NSArray<MPSGraphTensor*>* topk = nil;
@@ -558,12 +1047,46 @@ static ProcessResult HandleApproxTopK(HandlerContext& ctx) {
     }
 
     MPSGraph* g = ctx.graph;
-    MPSGraphTensor* perm = ArgSortKey(g, input, (NSInteger)axis, dir > 0);
-    if (!perm) {
-        return ProcessResult::Error("ApproxTopK: argsort lowering failed");
+    // Small k reuses the lax.top_k selection (k max-reductions over an int32
+    // order key) instead of a full argsort. OrderedInt32SortKey is the key the
+    // composite argsort already uses (NaN largest, -0 == +0 == denormals), ~key
+    // reverses it for min, and TopKSelectPerm takes the first index on ties like
+    // the stable argsort. JAX_METALLIB_APPROX_TOPK_SELECT=0 keeps the argsort.
+    MPSGraphTensor* perm = nil;
+    const char* selectEnv = std::getenv("JAX_METALLIB_APPROX_TOPK_SELECT");
+    const bool selectOff = selectEnv && selectEnv[0] == '0' && selectEnv[1] == '\0';
+    if (!selectOff && k > 0 && k < n) {
+        int64_t total = 1;
+        for (NSNumber* d in inShape) {
+            total *= std::max<int64_t>(0, d.longLongValue);
+        }
+        // 16-bit inputs fall back to a 16-bit argsort, about half the cost of the
+        // 32-bit one, so selection wins only for smaller k (f16/bf16 1M elements:
+        // L <= 256 k <= 8, L <= 1024 k <= 4, longer rows k = 1). An explicit
+        // JAX_METALLIB_TOPK_SELECT_MAX_K still forces its own cap.
+        int64_t cap = TopKSelectMaxK(n, total);
+        const char* forcedCap = std::getenv("JAX_METALLIB_TOPK_SELECT_MAX_K");
+        const bool half = input.dataType == MPSDataTypeFloat16 || input.dataType == MPSDataTypeBFloat16;
+        if (half && !(forcedCap && forcedCap[0] != '\0')) {
+            cap = std::min<int64_t>(cap, n <= 256 ? 8 : (n <= 1024 ? 4 : 1));
+        }
+        if (k <= cap) {
+            if (MPSGraphTensor* key = OrderedInt32SortKey(g, input)) {
+                if (dir < 0) {
+                    key = [g bitwiseNOTWithTensor:key name:nil];
+                }
+                perm = TopKSelectPerm(g, key, (NSInteger)axis, k);
+            }
+        }
     }
-    if (k < n) {
-        perm = [g sliceTensor:perm dimension:(NSInteger)axis start:0 length:(NSInteger)k name:nil];
+    if (!perm) {
+        perm = ArgSortKey(g, input, (NSInteger)axis, dir > 0);
+        if (!perm) {
+            return ProcessResult::Error("ApproxTopK: argsort lowering failed");
+        }
+        if (k < n) {
+            perm = [g sliceTensor:perm dimension:(NSInteger)axis start:0 length:(NSInteger)k name:nil];
+        }
     }
     MPSGraphTensor* values = ExactGatherAlongAxis(g, (NSInteger)axis, input, perm);
     MPSGraphTensor* indices =

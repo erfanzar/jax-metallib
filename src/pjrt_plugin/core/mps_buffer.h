@@ -103,6 +103,11 @@ private:
 
 size_t DtypeByteSize(int dtype);
 
+// Bytes to allocate for a zero-element tensor. Metal rejects zero-length buffers and
+// MPSNDArray binds a tensor as if every zero dimension were 1 ([0,4] f32 needs 16 bytes),
+// so a 4-byte placeholder aborts the process. Capped at 64 MiB (4 bytes beyond that).
+size_t ZeroElementPlaceholderBytes(int dtype, const std::vector<int64_t>& dims);
+
 // Compute row-major byte strides for a given shape and element size.
 std::vector<int64_t> ComputeRowMajorByteStrides(const std::vector<int64_t>& dims, size_t elem_size);
 

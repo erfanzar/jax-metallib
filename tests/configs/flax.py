@@ -95,6 +95,9 @@ def make_flax_op_configs():
                 lambda rng: rng.integers(0, 100, (3, 4)),
                 name="nnx.Embed",
                 grad_transform=_GT,
+                # The indices are integers, so the auto rule found nothing to
+                # differentiate; take the gradient w.r.t. the embedding table.
+                differentiable_argnums=(0,),
             ),
             # BatchNorm
             OperationTestConfig(

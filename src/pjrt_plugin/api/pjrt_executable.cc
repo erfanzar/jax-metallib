@@ -61,6 +61,19 @@ PJRT_Error* MPS_Executable_GetCostAnalysis(PJRT_Executable_GetCostAnalysis_Args*
     return nullptr;
 }
 
+#if PJRT_API_MINOR >= 102
+PJRT_Error* MPS_Executable_ParameterMemoryKinds(PJRT_Executable_ParameterMemoryKinds_Args* args) {
+    if (!args || args->struct_size < PJRT_Executable_ParameterMemoryKinds_Args_STRUCT_SIZE ||
+        !args->executable) {
+        return MakeError("ParameterMemoryKinds: invalid executable arguments",
+                         PJRT_Error_Code_INVALID_ARGUMENT);
+    }
+    // Match the consumer's pre-API102 fallback until parameter placement
+    // metadata is supported. A version-required entry must not be a null call.
+    return MakeError("ParameterMemoryKinds not implemented", PJRT_Error_Code_UNIMPLEMENTED);
+}
+#endif
+
 PJRT_Error* MPS_Executable_OutputMemoryKinds(PJRT_Executable_OutputMemoryKinds_Args* args) {
     MPS_LOG_DEBUG(" PJRT_Executable_OutputMemoryKinds called\n");
 

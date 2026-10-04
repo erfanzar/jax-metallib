@@ -483,6 +483,65 @@ _add(
 """,
 )
 
+# ===== 8b. Loop-carried updates (decode / KV-cache patterns) =====
+_add(
+    "loop.decode_slice_update_f32",
+    "scan: dynamic_slice + one-row dynamic_update_slice per step, [1024,256], float32",
+    """
+    rng = np.random.default_rng(42)
+    x = jnp.array(rng.standard_normal((1024, 256)).astype(np.float32))
+    def decode(x):
+        T, D = x.shape
+        def step(buf, t):
+            row = jax.lax.dynamic_slice(buf, (t, 0), (1, D)).reshape((D,))
+            new_row = jnp.tanh(row + x[t])
+            buf = jax.lax.dynamic_update_slice(buf, new_row.reshape((1, D)), (t, 0))
+            return buf, new_row.sum()
+        buf, sums = jax.lax.scan(step, jnp.zeros((T, D), x.dtype), jnp.arange(T, dtype=jnp.int32))
+        return buf + sums.mean()
+    result = bench(decode, (x,), warmup=3, iters=20)
+    result["dtype"] = "float32"
+    print(json.dumps(result))
+""",
+)
+
+_add(
+    "loop.kv_cache_write_f32",
+    "fori_loop: write one [8,64] K row per step into a [1,512,8,64] cache, float32",
+    """
+    rng = np.random.default_rng(42)
+    k = jnp.array(rng.standard_normal((512, 8, 64)).astype(np.float32))
+    def fill(k):
+        cache = jnp.zeros((1, 512, 8, 64), k.dtype)
+        def body(t, c):
+            row = jax.lax.dynamic_slice(k, (t, 0, 0), (1, 8, 64)).reshape((1, 1, 8, 64))
+            return jax.lax.dynamic_update_slice(c, row, (0, t, 0, 0))
+        return jax.lax.fori_loop(0, 512, body, cache)
+    result = bench(fill, (k,), warmup=3, iters=20)
+    result["dtype"] = "float32"
+    print(json.dumps(result))
+""",
+)
+
+_add(
+    "loop.scan_rnn_f32",
+    "scan: tanh RNN cell, 256 steps, batch 8, hidden 128, float32",
+    """
+    rng = np.random.default_rng(42)
+    w = jnp.array((rng.standard_normal((128, 128)) * 0.05).astype(np.float32))
+    xs = jnp.array(rng.standard_normal((256, 8, 128)).astype(np.float32))
+    def rnn(w, xs):
+        def step(h, x):
+            h = jnp.tanh(h @ w + x)
+            return h, h
+        _, hs = jax.lax.scan(step, jnp.zeros((8, 128), xs.dtype), xs)
+        return hs
+    result = bench(rnn, (w, xs), warmup=3, iters=20)
+    result["dtype"] = "float32"
+    print(json.dumps(result))
+""",
+)
+
 # ===== 9. Real-world patterns =====
 _add(
     "pattern.layernorm_f32",

@@ -1,4 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Minimum macOS version. Must precede project(): project() creates this cache
+# entry (empty, i.e. the host SDK version), and a later set(... CACHE) does not
+# overwrite it, so the dylib declared minos = host OS (27.0) instead of 13.0.
+# 15.0, not 13.0: a 13.0 build warned on 272 unguarded uses of newer APIs
+# (reinterpretCastTensor 13.2, bf16/FFT/complex parts 14.0, sliceUpdateDataTensor
+# and reciprocalSquareRoot 15.0) that would raise unrecognized-selector at runtime.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
+
 project(jax_metallib LANGUAGES C CXX OBJCXX)
 
 # Dependency install prefix (used by scripts/setup_deps.sh)
@@ -24,9 +33,6 @@ set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 
 # Export compile commands for clang-tidy
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# macOS specific settings
-set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum macOS version")
 
 # Use Accelerate's modern LAPACK entry points. Required: linalg_ops.mm uses
 # __LAPACK_int / spotrf_ from the new interface (CLAPACK is deprecated).

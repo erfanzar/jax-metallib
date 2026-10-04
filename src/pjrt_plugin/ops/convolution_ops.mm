@@ -171,14 +171,42 @@ static int64_t forwardPadding(int64_t kernelSize, int64_t dilation, int64_t tran
     return std::max(0LL, effectiveK - 1 - transposedPad);
 }
 
+// The lhs-dilated (transposed) conv is lowered as the data gradient of a forward
+// conv whose source has O channels and whose output has C = G*I channels. That
+// forward conv needs OI.. weights of shape [G*I, O/G, ...]: W[g*I + c, o] =
+// w[g*(O/G) + o, c]. With G > 1 the O/I swap must therefore happen per group;
+// swapping the whole kernel gave [I, O] and MPSGraph aborted the process with
+// "Source and weight input channels mismatch" (input grad of any strided
+// grouped/depthwise conv). G == 1 reduces to the plain O/I transpose.
 static MPSGraphTensor* prepareKernelForDataGradient(MPSGraph* g, MPSGraphTensor* kernel,
-                                                    NSArray<NSNumber*>* spatialAxes) {
+                                                    NSArray<NSNumber*>* spatialAxes, int64_t groups) {
 
     MPSGraphTensor* unreversed = [g reverseTensor:kernel axes:spatialAxes name:nil];
 
-    NSUInteger rank = unreversed.shape.count;
+    NSArray<NSNumber*>* kshape = unreversed.shape;
+    NSUInteger rank = kshape.count;
     if (rank < 2) {
         return unreversed;
+    }
+    if (groups > 1) {
+        int64_t outCh = [kshape[0] longLongValue];
+        int64_t inCh = [kshape[1] longLongValue];
+        if (outCh > 0 && inCh > 0 && outCh % groups == 0) {
+            NSMutableArray<NSNumber*>* split = [NSMutableArray arrayWithCapacity:rank + 1];
+            NSMutableArray<NSNumber*>* merged = [NSMutableArray arrayWithCapacity:rank];
+            NSMutableArray<NSNumber*>* perm = [NSMutableArray arrayWithCapacity:rank + 1];
+            [split addObjectsFromArray:@[@(groups), @(outCh / groups), @(inCh)]];
+            [merged addObjectsFromArray:@[@(groups * inCh), @(outCh / groups)]];
+            [perm addObjectsFromArray:@[@0, @2, @1]];
+            for (NSUInteger i = 2; i < rank; ++i) {
+                [split addObject:kshape[i]];
+                [merged addObject:kshape[i]];
+                [perm addObject:@(i + 1)];
+            }
+            MPSGraphTensor* grouped = [g reshapeTensor:unreversed withShape:split name:nil];
+            MPSGraphTensor* swapped = [g transposeTensor:grouped permutation:perm name:nil];
+            return [g reshapeTensor:swapped withShape:merged name:nil];
+        }
     }
     NSMutableArray<NSNumber*>* perm = [NSMutableArray arrayWithCapacity:rank];
     [perm addObject:@1];
@@ -216,6 +244,178 @@ static MPSGraphTensor* convert2DOutputTo1D(MPSGraph* g, MPSGraphTensor* result, 
         result = [g transposeTensor:result permutation:perm name:nil];
     }
     return result;
+}
+
+static bool IsIntegerConvDtype(MPSDataType t) {
+    return t == MPSDataTypeInt8 || t == MPSDataTypeUInt8 || t == MPSDataTypeInt16 || t == MPSDataTypeUInt16 ||
+           t == MPSDataTypeInt32 || t == MPSDataTypeUInt32;
+}
+
+static bool IsFloatConvDtype(MPSDataType t) {
+    return t == MPSDataTypeFloat32 || t == MPSDataTypeFloat16 || t == MPSDataTypeBFloat16;
+}
+
+static MPSGraphTensor* ToInt32ConvWork(MPSGraph* g, MPSGraphTensor* t) {
+    if (t.dataType == MPSDataTypeInt32)
+        return t;
+    if (t.dataType == MPSDataTypeUInt32)
+        return [g reinterpretCastTensor:t toType:MPSDataTypeInt32 name:nil];
+    return [g castTensor:t toType:MPSDataTypeInt32 name:nil];
+}
+
+// Zero-pad one axis by concatenating broadcast zeros. padTensor round-trips
+// int32 operands through f32 in some shapes (the rank-6 lhs-dilation pad got
+// 2253/2280 outputs wrong for |x| > 2^24: -1269186511 -> -1269186468), so the
+// integer conv path never uses it. Exact for every dtype.
+static MPSGraphTensor* ZeroPadAxisExact(MPSGraph* g, MPSGraphTensor* t, NSUInteger axis, int64_t low,
+                                        int64_t high) {
+    if (low <= 0 && high <= 0) {
+        return t;
+    }
+    MPSGraphTensor* zero = [g constantWithScalar:0 dataType:t.dataType];
+    auto block = [&](int64_t n) {
+        NSMutableArray<NSNumber*>* shape = [NSMutableArray arrayWithArray:t.shape];
+        shape[axis] = @(n);
+        return [g broadcastTensor:zero toShape:shape name:nil];
+    };
+    NSMutableArray<MPSGraphTensor*>* parts = [NSMutableArray arrayWithCapacity:3];
+    if (low > 0) {
+        [parts addObject:block(low)];
+    }
+    [parts addObject:t];
+    if (high > 0) {
+        [parts addObject:block(high)];
+    }
+    return [g concatTensors:parts dimension:(NSInteger)axis name:nil];
+}
+
+// Result() stores the handler tensor as is, so a conv whose declared element
+// type differs from the MPSGraph result (f16/bf16 operands with
+// preferred_element_type=f32, integer accumulation) must be converted here;
+// otherwise the f16 bytes were read back as f32 garbage without any error.
+static MPSGraphTensor* CastConvResult(MPSGraph* g, MPSGraphTensor* t, mlir::Operation* op) {
+    MPSDataType want = GetResultMpsType(op);
+    if (!t || want == MPSDataTypeInvalid || t.dataType == want)
+        return t;
+    if ((t.dataType == MPSDataTypeInt32 && want == MPSDataTypeUInt32) ||
+        (t.dataType == MPSDataTypeUInt32 && want == MPSDataTypeInt32)) {
+        return [g reinterpretCastTensor:t toType:want name:nil];
+    }
+    return [g castTensor:t toType:want name:nil];
+}
+
+// MPSGraph convolution accepts only FP32/FP16 and aborts the process on integer
+// operands. Lower integer convs exactly in int32 straight from the StableHLO
+// definition instead (products and sums wrap modulo 2**32 like XLA:CPU, the
+// same approach as IntegerMatMul): lhs dilation inserts zeros, padding may be
+// negative (crop), then every kernel tap is a strided slice of the padded input
+// contracted over the input channels of its feature group. The contraction is
+// chunked over input channels so the broadcast product stays <= 2**24 elements.
+// x is NHWC, k is OIHW; returns NHWC [N, Ho, Wo, O] in int32 or nil with err.
+static MPSGraphTensor* IntegerConv2DNHWC(MPSGraph* g, MPSGraphTensor* x, MPSGraphTensor* k,
+                                         const ConvParams& p, std::string& err) {
+    NSArray<NSNumber*>* xs = x.shape;
+    NSArray<NSNumber*>* ks = k.shape;
+    if (!xs || xs.count != 4 || !ks || ks.count != 4) {
+        err = "integer convolution expects rank-4 NHWC input and OIHW kernel";
+        return nil;
+    }
+    int64_t N = [xs[0] longLongValue], H = [xs[1] longLongValue], W = [xs[2] longLongValue];
+    int64_t C = [xs[3] longLongValue];
+    int64_t O = [ks[0] longLongValue], I = [ks[1] longLongValue], KH = [ks[2] longLongValue];
+    int64_t KW = [ks[3] longLongValue];
+    int64_t G = p.featureGroupCount;
+    if (N <= 0 || H <= 0 || W <= 0 || C <= 0 || O <= 0 || I <= 0 || KH <= 0 || KW <= 0) {
+        err = "integer convolution requires static non-empty shapes";
+        return nil;
+    }
+    if (G < 1 || C != G * I || O % G != 0) {
+        err = "integer convolution: channel counts do not match feature_group_count";
+        return nil;
+    }
+    if (p.strideH < 1 || p.strideW < 1 || p.dilationH < 1 || p.dilationW < 1 || p.inputDilationH < 1 ||
+        p.inputDilationW < 1) {
+        err = "integer convolution: strides and dilations must be >= 1";
+        return nil;
+    }
+    int64_t Og = O / G;
+    x = ToInt32ConvWork(g, x);
+    k = ToInt32ConvWork(g, k);
+
+    if (p.inputDilationH > 1 || p.inputDilationW > 1) {
+        int64_t dh = p.inputDilationH, dw = p.inputDilationW;
+        x = [g reshapeTensor:x withShape:@[@(N), @(H), @1, @(W), @1, @(C)] name:nil];
+        x = ZeroPadAxisExact(g, x, 2, 0, dh - 1);
+        x = ZeroPadAxisExact(g, x, 4, 0, dw - 1);
+        x = [g reshapeTensor:x withShape:@[@(N), @(H * dh), @(W * dw), @(C)] name:nil];
+        H = (H - 1) * dh + 1;
+        W = (W - 1) * dw + 1;
+        x = [g sliceTensor:x
+                    starts:@[@0, @0, @0, @0]
+                      ends:@[@(N), @(H), @(W), @(C)]
+                   strides:@[@1, @1, @1, @1]
+                      name:nil];
+    }
+
+    int64_t pt = p.padTop, pb = p.padBottom, pl = p.padLeft, pr = p.padRight;
+    x = ZeroPadAxisExact(g, x, 1, std::max<int64_t>(pt, 0), std::max<int64_t>(pb, 0));
+    x = ZeroPadAxisExact(g, x, 2, std::max<int64_t>(pl, 0), std::max<int64_t>(pr, 0));
+    // Negative padding crops: the valid region starts at (h0, w0) of the padded tensor.
+    int64_t h0 = std::max<int64_t>(-pt, 0), w0 = std::max<int64_t>(-pl, 0);
+    int64_t Hp = H + pt + pb, Wp = W + pl + pr;
+    int64_t effH = (KH - 1) * p.dilationH + 1, effW = (KW - 1) * p.dilationW + 1;
+    if (Hp < effH || Wp < effW) {
+        err = "integer convolution: empty output is not supported";
+        return nil;
+    }
+    int64_t Ho = (Hp - effH) / p.strideH + 1, Wo = (Wp - effW) / p.strideW + 1;
+    int64_t M = N * Ho * Wo;
+
+    // [O, I, KH, KW] -> [G, Og, I, KH, KW] -> [KH, KW, G, I, Og]
+    MPSGraphTensor* kt = [g reshapeTensor:k withShape:@[@(G), @(Og), @(I), @(KH), @(KW)] name:nil];
+    kt = [g transposeTensor:kt permutation:@[@3, @4, @0, @2, @1] name:nil];
+
+    const int64_t budget = int64_t{1} << 24;
+    int64_t per = M * G * Og;
+    int64_t chunk = per >= budget ? 1 : std::min<int64_t>(I, budget / per);
+
+    MPSGraphTensor* acc = nil;
+    for (int64_t kh = 0; kh < KH; ++kh) {
+        for (int64_t kw = 0; kw < KW; ++kw) {
+            int64_t hs = h0 + kh * p.dilationH, ws = w0 + kw * p.dilationW;
+            MPSGraphTensor* tap = [g
+                sliceTensor:x
+                     starts:@[@0, @(hs), @(ws), @0]
+                       ends:@[@(N), @(hs + (Ho - 1) * p.strideH + 1), @(ws + (Wo - 1) * p.strideW + 1), @(C)]
+                    strides:@[@1, @(p.strideH), @(p.strideW), @1]
+                       name:nil];
+            tap = [g reshapeTensor:tap withShape:@[@(M), @(G), @(I)] name:nil];
+            for (int64_t i0 = 0; i0 < I; i0 += chunk) {
+                int64_t i1 = std::min<int64_t>(I, i0 + chunk);
+                int64_t cnt = i1 - i0;
+                MPSGraphTensor* xt = tap;
+                if (cnt != I) {
+                    xt = [g sliceTensor:tap
+                                 starts:@[@0, @0, @(i0)]
+                                   ends:@[@(M), @(G), @(i1)]
+                                strides:@[@1, @1, @1]
+                                   name:nil];
+                }
+                xt = [g reshapeTensor:xt withShape:@[@(M), @(G), @(cnt), @1] name:nil];
+                MPSGraphTensor* w = [g sliceTensor:kt
+                                            starts:@[@(kh), @(kw), @0, @(i0), @0]
+                                              ends:@[@(kh + 1), @(kw + 1), @(G), @(i1), @(Og)]
+                                           strides:@[@1, @1, @1, @1, @1]
+                                              name:nil];
+                w = [g reshapeTensor:w withShape:@[@1, @(G), @(cnt), @(Og)] name:nil];
+                MPSGraphTensor* prod = [g multiplicationWithPrimaryTensor:xt secondaryTensor:w name:nil];
+                MPSGraphTensor* part = [g reductionSumWithTensor:prod axis:2 name:nil];
+                part = [g reshapeTensor:part withShape:@[@(M), @(O)] name:nil];
+                acc = acc ? [g additionWithPrimaryTensor:acc secondaryTensor:part name:nil] : part;
+            }
+        }
+    }
+    return [g reshapeTensor:acc withShape:@[@(N), @(Ho), @(Wo), @(O)] name:nil];
 }
 
 static ProcessResult HandleConvolution(HandlerContext& ctx) {
@@ -262,6 +462,29 @@ static ProcessResult HandleConvolution(HandlerContext& ctx) {
     if (batchGroupCount != 1 && p.isTransposed) {
         return ProcessResult::Error(
             "convolution: batch_group_count > 1 for transposed convolution is not supported");
+    }
+
+    const bool intConv = IsIntegerConvDtype(input.dataType) || IsIntegerConvDtype(kernel.dataType);
+    if (intConv) {
+        if (!IsIntegerConvDtype(input.dataType) || !IsIntegerConvDtype(kernel.dataType)) {
+            return ProcessResult::Error("convolution: mixed integer/non-integer operands are not supported");
+        }
+        if (is3D) {
+            return ProcessResult::Error("convolution: 3D integer convolution is not supported");
+        }
+        if (batchGroupCount != 1) {
+            return ProcessResult::Error("convolution: integer convolution with batch_group_count > 1 is not "
+                                        "supported");
+        }
+    } else if (GetResultMpsType(op) == MPSDataTypeFloat32) {
+        // f16/bf16 operands with preferred_element_type=f32: widening is exact and
+        // accumulates in f32 like XLA:CPU.
+        if (input.dataType != MPSDataTypeFloat32 && IsFloatConvDtype(input.dataType)) {
+            input = [g castTensor:input toType:MPSDataTypeFloat32 name:nil];
+        }
+        if (kernel.dataType != MPSDataTypeFloat32 && IsFloatConvDtype(kernel.dataType)) {
+            kernel = [g castTensor:kernel toType:MPSDataTypeFloat32 name:nil];
+        }
     }
 
     if (is3D) {
@@ -314,7 +537,8 @@ static ProcessResult HandleConvolution(HandlerContext& ctx) {
                 int64_t kH = [mpsKernel.shape[3] longLongValue];
                 int64_t kW = [mpsKernel.shape[4] longLongValue];
 
-                MPSGraphTensor* preparedKernel = prepareKernelForDataGradient(g, mpsKernel, @[@2, @3, @4]);
+                MPSGraphTensor* preparedKernel =
+                    prepareKernelForDataGradient(g, mpsKernel, @[@2, @3, @4], p.featureGroupCount);
 
                 MPSGraphConvolution3DOpDescriptor* desc = [MPSGraphConvolution3DOpDescriptor
                     descriptorWithStrideInX:(NSUInteger)p.inputDilationW
@@ -463,7 +687,7 @@ static ProcessResult HandleConvolution(HandlerContext& ctx) {
             if (outputPerm) {
                 result = [g transposeTensor:result permutation:outputPerm name:nil];
             }
-            return Result(ctx, result, "convolution");
+            return Result(ctx, CastConvResult(g, result, op), "convolution");
         }
 
         return ProcessResult::Error(
@@ -518,7 +742,13 @@ static ProcessResult HandleConvolution(HandlerContext& ctx) {
     }
 
     MPSGraphTensor* result;
-    if (p.isTransposed) {
+    if (intConv) {
+        std::string err;
+        result = IntegerConv2DNHWC(g, convInput, mpsKernel, p, err);
+        if (!result) {
+            return ProcessResult::Error("convolution: " + err);
+        }
+    } else if (p.isTransposed) {
 
         auto resultType = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
         if (!resultType) {
@@ -535,7 +765,8 @@ static ProcessResult HandleConvolution(HandlerContext& ctx) {
         int64_t kH = [mpsKernel.shape[2] longLongValue];
         int64_t kW = [mpsKernel.shape[3] longLongValue];
 
-        MPSGraphTensor* preparedKernel = prepareKernelForDataGradient(g, mpsKernel, @[@2, @3]);
+        MPSGraphTensor* preparedKernel =
+            prepareKernelForDataGradient(g, mpsKernel, @[@2, @3], p.featureGroupCount);
 
         MPSGraphConvolution2DOpDescriptor* desc =
             [MPSGraphConvolution2DOpDescriptor descriptorWithStrideInX:(NSUInteger)p.inputDilationW
@@ -670,7 +901,7 @@ static ProcessResult HandleConvolution(HandlerContext& ctx) {
         }
     }
 
-    return Result(ctx, result, "convolution");
+    return Result(ctx, CastConvResult(g, result, op), "convolution");
 }
 REGISTER_MPS_OP("stablehlo.convolution", HandleConvolution);
 

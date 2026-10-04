@@ -18,6 +18,11 @@ set -e
 PREFIX="${PREFIX:-$HOME/.local/jax-metallib-deps}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 BUILD_DIR="${BUILD_DIR:-/tmp/jax-metallib-deps-build}"
+# CMake reads this as the default CMAKE_OSX_DEPLOYMENT_TARGET for every dep build
+# below. Without it the static deps target the host OS (ld warned "built for newer
+# macOS version (26.0) than being linked (15.0)" when linking the 15.0 plugin).
+# Keep in sync with CMAKE_OSX_DEPLOYMENT_TARGET in CMakeLists.txt.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
 # Pin to versions matching jaxlib 0.11.1 for bytecode compatibility
 # These are extracted from:
@@ -299,16 +304,27 @@ else
     echo "=== StableHLO already installed ==="
 fi
 
-# Install XLA PJRT headers (only the C API header is needed)
-if [ ! -f "$PREFIX/include/xla/pjrt/c/pjrt_c_api.h" ]; then
-    XLA_DIR="$BUILD_DIR/xla"
+# Install the exact pinned PJRT blob, even when a different header is already
+# installed. Reading the blob also keeps edits in the dependency checkout out
+# of the installation, without checking out or overwriting those edits.
+XLA_DIR="$BUILD_DIR/xla"
+XLA_HEADER="xla/pjrt/c/pjrt_c_api.h"
+if ! git -C "$XLA_DIR" cat-file -e "$XLA_COMMIT:$XLA_HEADER" 2>/dev/null; then
     ensure_git_checkout "$XLA_DIR" "https://github.com/openxla/xla.git" "$XLA_COMMIT" "XLA"
-
-    mkdir -p "$PREFIX/include/xla/pjrt/c"
-    cp "$XLA_DIR/xla/pjrt/c/pjrt_c_api.h" "$PREFIX/include/xla/pjrt/c/"
-    echo "XLA PJRT headers installed to $PREFIX"
+fi
+mkdir -p "$PREFIX/include/xla/pjrt/c"
+PJRT_HEADER_TMP=$(mktemp "$PREFIX/include/xla/pjrt/c/pjrt_c_api.h.XXXXXX")
+if ! git -C "$XLA_DIR" show "$XLA_COMMIT:$XLA_HEADER" > "$PJRT_HEADER_TMP"; then
+    rm -f "$PJRT_HEADER_TMP"
+    exit 1
+fi
+if cmp -s "$PJRT_HEADER_TMP" "$PREFIX/include/$XLA_HEADER"; then
+    rm -f "$PJRT_HEADER_TMP"
+    echo "=== XLA PJRT header already matches $XLA_COMMIT ==="
 else
-    echo "=== XLA PJRT headers already installed ==="
+    chmod 644 "$PJRT_HEADER_TMP"
+    mv "$PJRT_HEADER_TMP" "$PREFIX/include/$XLA_HEADER"
+    echo "XLA PJRT header installed from $XLA_COMMIT to $PREFIX"
 fi
 
 echo ""

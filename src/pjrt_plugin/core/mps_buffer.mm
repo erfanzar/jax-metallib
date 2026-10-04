@@ -19,6 +19,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <algorithm>
 #include <utility>
 #include <xla/pjrt/c/pjrt_c_api.h>
 
@@ -154,6 +155,18 @@ int64_t MpsBuffer::element_count() const {
     return count;
 }
 
+size_t ZeroElementPlaceholderBytes(int dtype, const std::vector<int64_t>& dims) {
+    constexpr size_t kMaxPlaceholderBytes = size_t{64} << 20;
+    size_t bytes = std::max<size_t>(DtypeByteSize(dtype), 1);
+    for (int64_t dim : dims) {
+        bytes *= static_cast<size_t>(std::max<int64_t>(dim, 1));
+        if (bytes > kMaxPlaceholderBytes) {
+            return 4;
+        }
+    }
+    return std::max<size_t>(bytes, 4);
+}
+
 size_t MpsBuffer::byte_size() const {
     return element_count() * DtypeByteSize(dtype_);
 }
@@ -177,7 +190,13 @@ const std::vector<int64_t>& MpsBuffer::byte_strides() const {
 }
 
 bool MpsBuffer::WaitForProducer(std::string* error) const {
-    AwaitCompletionEvent(producer_completion_);
+    std::string wait_error;
+    if (!AwaitCompletionEventWithTimeout(producer_completion_, &wait_error)) {
+        if (error) {
+            *error = wait_error;
+        }
+        return false;
+    }
     const std::string producer_error = CompletionEventError(producer_completion_);
     if (error) {
         *error = producer_error;
@@ -501,14 +520,16 @@ std::unique_ptr<MpsBuffer> MpsBuffer::Clone(std::string* error) const {
     }
 
     size_t nbytes = byte_size();
-    // Zero-element tensors — allocate a minimum 4-byte placeholder for Metal.
-    size_t alloc_nbytes = (nbytes == 0) ? 4 : nbytes;
+    // Zero-element tensors: zeroed placeholder sized for MPSNDArray binding, nothing copied.
+    size_t alloc_nbytes = (nbytes == 0) ? ZeroElementPlaceholderBytes(dtype_, dims_) : nbytes;
     id<MTLBuffer> src = (__bridge id<MTLBuffer>)metal_buffer_;
 
     void* src_contents = [src contents];
     id<MTLBuffer> dst_buffer = nil;
 
-    if (src_contents) {
+    if (nbytes == 0) {
+        dst_buffer = [mtl_device newBufferWithLength:alloc_nbytes options:MTLResourceStorageModeShared];
+    } else if (src_contents) {
 
         dst_buffer = [mtl_device newBufferWithBytes:src_contents
                                              length:alloc_nbytes
@@ -593,7 +614,7 @@ std::unique_ptr<MpsBuffer> MpsBuffer::MaterializeContiguous(std::string* error) 
     }
 
     size_t nbytes = byte_size();
-    size_t alloc_nbytes = (nbytes == 0) ? 4 : nbytes;
+    size_t alloc_nbytes = (nbytes == 0) ? ZeroElementPlaceholderBytes(dtype_, dims_) : nbytes;
 
     // Allocate contiguous output buffer.
     id<MTLBuffer> dst_buffer = [mtl_device newBufferWithLength:alloc_nbytes
@@ -634,7 +655,9 @@ std::unique_ptr<MpsBuffer> MpsBuffer::MaterializeContiguous(std::string* error) 
 
 void MpsBuffer::Delete() {
     if (!is_deleted_ && metal_buffer_) {
-        (void)WaitForProducer(nullptr);
+        // No deadline: the buffer may go back to the output pool, so the GPU must
+        // be done with it even if a caller-facing wait already timed out.
+        AwaitCompletionEvent(producer_completion_);
         if (releaser_) {
             releaser_(metal_buffer_);
         } else {

@@ -47,7 +47,10 @@ PJRT_Error* MPS_Event_Await(PJRT_Event_Await_Args* args) {
     if (!args->event || !args->event->completion) {
         return nullptr;
     }
-    args->event->completion->Await();
+    std::string wait_error;
+    if (!args->event->completion->AwaitWithTimeout(&wait_error)) {
+        return MakeError(wait_error, PJRT_Error_Code_DEADLINE_EXCEEDED);
+    }
     const std::string error = args->event->completion->Error();
     if (!error.empty()) {
         return MakeError(error);

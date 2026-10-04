@@ -29,9 +29,11 @@ static MPSGraphTensor* NarrowFromF32(MPSGraph* g, MPSGraphTensor* t, MPSDataType
 }
 
 // MPSGraph tanh returned 1 for NaN, +0 for -0 and 0 for tiny inputs (1e-8).
-// tanh(x) == x to within half an f32 ulp for |x| < 2e-4 (next term x^3/3), so
-// pass those through (keeps -0 and tiny values) and propagate NaN. Narrow
-// floats are computed in float32.
+// tanh(x) == x to within half an f32 ulp for |x| < 4e-4 (next term x^3/3,
+// relative x^2/3 <= 5.3e-8 < 2^-24), so pass those through (keeps -0 and tiny
+// values) and propagate NaN. 4e-4 is XLA's passthrough cutoff: with 2e-4,
+// [2e-4, 4e-4) went through MPS tanh, which cancels there (0.1% bitwise vs
+// XLA:CPU, up to 3441 ulp; now exact). Narrow floats are computed in float32.
 static ProcessResult HandleTanh(HandlerContext& ctx) {
     MPSGraphTensor* input = GetInputTensor(ctx, 0);
     if (!input)
@@ -42,16 +44,17 @@ static ProcessResult HandleTanh(HandlerContext& ctx) {
         return Result(ctx, [g tanhWithTensor:input name:nil], "tanh");
     }
     MPSGraphTensor* x = WidenToF32(g, input);
-    MPSGraphTensor* t = [g tanhWithTensor:x name:nil];
-    MPSGraphTensor* small = [g lessThanWithPrimaryTensor:[g absoluteWithTensor:x name:nil]
-                                         secondaryTensor:[g constantWithScalar:2e-4
-                                                                      dataType:MPSDataTypeFloat32]
-                                                    name:nil];
-    t = [g selectWithPredicateTensor:small truePredicateTensor:x falsePredicateTensor:t name:nil];
-    t = [g selectWithPredicateTensor:[g isNaNWithTensor:x name:nil]
-                 truePredicateTensor:x
-                falsePredicateTensor:t
-                                name:nil];
+    // One select instead of small-select + isNaN-select: |NaN| >= 4e-4 is false,
+    // so NaN takes x like tiny values and -0 (same bits as before). The extra
+    // reads of x pushed tanh chains past MPSGraph's stitching limit.
+    MPSGraphTensor* big = [g greaterThanOrEqualToWithPrimaryTensor:[g absoluteWithTensor:x name:nil]
+                                                   secondaryTensor:[g constantWithScalar:4e-4
+                                                                                dataType:MPSDataTypeFloat32]
+                                                              name:nil];
+    MPSGraphTensor* t = [g selectWithPredicateTensor:big
+                                 truePredicateTensor:[g tanhWithTensor:x name:nil]
+                                falsePredicateTensor:x
+                                                name:nil];
     return Result(ctx, NarrowFromF32(g, t, dt), "tanh");
 }
 REGISTER_MPS_OP("stablehlo.tanh", HandleTanh);
@@ -72,6 +75,14 @@ static ProcessResult HandleNegate(HandlerContext& ctx) {
         wide = [ctx.graph subtractionWithPrimaryTensor:zero secondaryTensor:wide name:nil];
         return Result(ctx, [ctx.graph castTensor:wide toType:dtype name:nil], "negate");
     }
+    // f16/bf16: flip the sign bit (see HalfToBits in registry.h).
+    if (IsF16OrBf16(dtype) && HalfBitSignOpsEnabled()) {
+        if (MPSGraphTensor* bits = HalfToBits(ctx.graph, input)) {
+            MPSGraphTensor* sign = [ctx.graph constantWithScalar:-32768.0 dataType:MPSDataTypeInt16];
+            bits = [ctx.graph bitwiseXORWithPrimaryTensor:bits secondaryTensor:sign name:nil];
+            return Result(ctx, HalfFromBits(ctx.graph, bits, dtype, input.shape), "negate");
+        }
+    }
     return Result(ctx, [ctx.graph negativeWithTensor:input name:nil], "negate");
 }
 REGISTER_MPS_OP("stablehlo.negate", HandleNegate);
@@ -85,6 +96,14 @@ static ProcessResult HandleAbs(HandlerContext& ctx) {
         MPSGraphTensor* wide = [ctx.graph castTensor:input toType:MPSDataTypeInt32 name:nil];
         wide = [ctx.graph absoluteWithTensor:wide name:nil];
         return Result(ctx, [ctx.graph castTensor:wide toType:MPSDataTypeInt8 name:nil], "abs");
+    }
+    // f16/bf16: clear the sign bit (see HalfToBits in registry.h).
+    if (IsF16OrBf16(input.dataType) && HalfBitSignOpsEnabled()) {
+        if (MPSGraphTensor* bits = HalfToBits(ctx.graph, input)) {
+            MPSGraphTensor* mag = [ctx.graph constantWithScalar:32767.0 dataType:MPSDataTypeInt16];
+            bits = [ctx.graph bitwiseANDWithPrimaryTensor:bits secondaryTensor:mag name:nil];
+            return Result(ctx, HalfFromBits(ctx.graph, bits, input.dataType, input.shape), "abs");
+        }
     }
     MPSGraphTensor* result = [ctx.graph absoluteWithTensor:input name:nil];
     if (input.dataType == MPSDataTypeComplexFloat32 || input.dataType == MPSDataTypeComplexFloat16)
@@ -247,6 +266,157 @@ static ProcessResult HandleExpm1(HandlerContext& ctx) {
 }
 REGISTER_MPS_OP("stablehlo.exponential_minus_one", HandleExpm1);
 
+// MPSGraph stitches an elementwise segment into one kernel only up to an
+// internal budget; log1p below reads its input ~8 times and exhausts it, so
+// past it one segment costs far more than a pass per op (f32 [4096,4096]
+// log1p(log1p(x)) 15.5 ms, 4 deep 60.4 ms, 8 deep 149.8 ms). A reinterpret
+// round trip on log1p's result forces it to materialise, so the log1p ops
+// stitch as separate kernels (2.5 / 4.3 / 8.4 ms, bitwise identical in f32).
+// It costs ~1 ms when nothing heavy follows, so the cut is only placed when
+// the result reaches another log1p through elementwise ops. Not applied to
+// f16/bf16 (materialising rounds the intermediate to the half type, which
+// changed values) or before tanh (one log1p feeding one tanh still fits the
+// budget: 1.23 -> 2.24 ms with a cut). JAX_METALLIB_DISABLE_LOG1P_CHAIN_CUT=1
+// turns it off.
+static bool Log1pChainCutDisabled() {
+    static const bool disabled = Bf16BarrierEnvFlag("JAX_METALLIB_DISABLE_LOG1P_CHAIN_CUT");
+    return disabled;
+}
+
+static bool IsStitchHeavyOp(mlir::Operation* op) {
+    llvm::StringRef n = op->getName().getStringRef();
+    return n == "stablehlo.log_plus_one";
+}
+
+static bool IsStitchTransparentOp(mlir::Operation* op) {
+    static const char* const kNames[] = {
+        "stablehlo.add",         "stablehlo.subtract", "stablehlo.multiply", "stablehlo.divide",
+        "stablehlo.maximum",     "stablehlo.minimum",  "stablehlo.negate",   "stablehlo.abs",
+        "stablehlo.exponential", "stablehlo.select",   "stablehlo.convert",  "stablehlo.broadcast_in_dim",
+        "stablehlo.reshape",     "stablehlo.clamp",    "stablehlo.logistic"};
+    llvm::StringRef n = op->getName().getStringRef();
+    for (const char* k : kNames) {
+        if (n == k) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ReachesStitchHeavyOp(mlir::Operation* op, int depth = 0) {
+    if (depth > 6) {
+        return false;
+    }
+    for (mlir::Value r : op->getResults()) {
+        for (mlir::Operation* user : r.getUsers()) {
+            if (IsStitchHeavyOp(user)) {
+                return true;
+            }
+            if (IsStitchTransparentOp(user) && ReachesStitchHeavyOp(user, depth + 1)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// jnp.logaddexp / jax.nn.softplus lower to
+// select(d != d, a + b, max(a, b) + log1p(exp(-|d|))) with d = a - b. With log1p's
+// fan-out that segment exceeds the stitching budget as soon as more work joins it
+// (f32 [4096,4096]: logaddexp 8.9 ms, log_sigmoid 7.0, mish 13.0, softplus(x) *
+// softplus(-x) 42.3); materialising the log1p result splits it (2.8 / 2.8 / 2.8 /
+// 4.4 ms, bitwise identical). Not applied below 2^21 elements (small or negative
+// gain) or to a bare softplus (b == 0) whose select only reaches a return or reduce,
+// which still fits the budget (2.35 -> 2.76 ms with a cut).
+// JAX_METALLIB_DISABLE_LOGADDEXP_CUT=1 turns it off.
+static bool LogAddExpCutDisabled() {
+    static const bool disabled = Bf16BarrierEnvFlag("JAX_METALLIB_DISABLE_LOGADDEXP_CUT");
+    return disabled;
+}
+
+static mlir::Operation* DefOpNamed(mlir::Value v, llvm::StringRef name) {
+    mlir::Operation* def = v ? v.getDefiningOp() : nullptr;
+    return (def != nullptr && def->getName().getStringRef() == name) ? def : nullptr;
+}
+
+static bool IsSplatFloatZero(mlir::Value v) {
+    mlir::Operation* def = v ? v.getDefiningOp() : nullptr;
+    while (def != nullptr && def->getName().getStringRef() == "stablehlo.broadcast_in_dim") {
+        def = def->getOperand(0).getDefiningOp();
+    }
+    auto constOp = mlir::dyn_cast_or_null<mlir::stablehlo::ConstantOp>(def);
+    if (!constOp) {
+        return false;
+    }
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constOp.getValue());
+    if (!dense || !dense.isSplat() || !mlir::isa<mlir::FloatType>(dense.getElementType())) {
+        return false;
+    }
+    return dense.getSplatValue<llvm::APFloat>().isZero();
+}
+
+static bool OnlyReturnOrReduceUsers(mlir::Operation* op) {
+    for (mlir::Value r : op->getResults()) {
+        for (mlir::Operation* user : r.getUsers()) {
+            llvm::StringRef n = user->getName().getStringRef();
+            if (n != "func.return" && n != "stablehlo.return" && n != "stablehlo.reduce") {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ShouldCutLogAddExp(mlir::Operation* op) {
+    if (op == nullptr || op->getNumOperands() != 1 || op->getNumResults() != 1) {
+        return false;
+    }
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+    if (!type || !type.hasStaticShape() || type.getNumElements() < (int64_t{1} << 21)) {
+        return false;
+    }
+    mlir::Operation* ex = DefOpNamed(op->getOperand(0), "stablehlo.exponential");
+    mlir::Operation* neg = ex ? DefOpNamed(ex->getOperand(0), "stablehlo.negate") : nullptr;
+    mlir::Operation* ab = neg ? DefOpNamed(neg->getOperand(0), "stablehlo.abs") : nullptr;
+    mlir::Operation* sub = ab ? DefOpNamed(ab->getOperand(0), "stablehlo.subtract") : nullptr;
+    if (sub == nullptr) {
+        return false;
+    }
+    if (!IsSplatFloatZero(sub->getOperand(1))) {
+        return true;
+    }
+    // Bare softplus: cut only when something besides a return/reduce consumes the
+    // pattern's result (log1p -> add -> select).
+    for (mlir::Operation* add : op->getResult(0).getUsers()) {
+        if (add->getName().getStringRef() != "stablehlo.add") {
+            return true;
+        }
+        for (mlir::Operation* sel : add->getResult(0).getUsers()) {
+            if (sel->getName().getStringRef() != "stablehlo.select" || !OnlyReturnOrReduceUsers(sel)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static MPSGraphTensor* MaterializeCut(MPSGraph* g, MPSGraphTensor* t) {
+    if (t.dataType != MPSDataTypeFloat32) {
+        return t;
+    }
+    NSArray<NSNumber*>* shape = t.shape;
+    if (shape == nil || shape.count == 0) {
+        return t;
+    }
+    for (NSNumber* d : shape) {
+        if ([d longLongValue] <= 0) {
+            return t;
+        }
+    }
+    MPSGraphTensor* bits = [g reinterpretCastTensor:t toType:MPSDataTypeInt32 name:nil];
+    return [g reinterpretCastTensor:bits toType:t.dataType name:nil];
+}
+
 static ProcessResult HandleLogPlusOne(HandlerContext& ctx) {
     MPSGraphTensor* input = GetInputTensor(ctx, 0);
     if (!input)
@@ -304,6 +474,10 @@ static ProcessResult HandleLogPlusOne(HandlerContext& ctx) {
                                               truePredicateTensor:series
                                              falsePredicateTensor:logPath
                                                              name:nil];
+    if ((!Log1pChainCutDisabled() && ctx.op && ReachesStitchHeavyOp(ctx.op)) ||
+        (!LogAddExpCutDisabled() && ShouldCutLogAddExp(ctx.op))) {
+        result = MaterializeCut(ctx.graph, result);
+    }
     return Result(ctx, result, "log_plus_one");
 }
 REGISTER_MPS_OP("stablehlo.log_plus_one", HandleLogPlusOne);
