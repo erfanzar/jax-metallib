@@ -21,43 +21,8 @@ const char* const kPlatformVersion = "0.1.0";
 static PJRT_Client* g_default_client = nullptr;
 
 PJRT_Client* GetOrCreateDefaultClient() {
-    if (g_default_client)
-        return g_default_client;
-
-    MPS_LOG_INFO("Creating default client\n");
-    auto mps_client = jax_metallib::MpsClient::Create();
-    if (!mps_client) {
-        MPS_LOG_ERROR("Failed to create MPS client\n");
-        return nullptr;
-    }
-
-    g_default_client = new PJRT_Client();
-    g_default_client->client = std::move(mps_client);
-
-    for (int i = 0; i < g_default_client->client->device_count(); i++) {
-        auto* dev = new PJRT_Device();
-        dev->device = g_default_client->client->device(i);
-        dev->client = g_default_client;
-
-        auto* desc = new PJRT_DeviceDescription();
-        desc->device = dev;
-        dev->description = desc;
-
-        auto* mem = new PJRT_Memory();
-        mem->device = dev;
-        mem->client = g_default_client;
-        mem->id = i;
-        dev->default_memory = mem;
-        g_default_client->memories.push_back(mem);
-
-        g_default_client->devices.push_back(dev);
-    }
-
-    g_default_client->topology = new PJRT_TopologyDescription();
-    g_default_client->topology->client = g_default_client;
-
-    MPS_LOG_INFO("Created client with %zu devices\n", g_default_client->devices.size());
-
+    if (!g_default_client)
+        g_default_client = CreatePjrtClient();
     return g_default_client;
 }
 
@@ -65,16 +30,12 @@ PJRT_Client* GetClient(PJRT_Client* client) {
     return client ? client : GetOrCreateDefaultClient();
 }
 
-PJRT_Error* MakeError(const std::string& msg, PJRT_Error_Code code) {
-    auto* error = new PJRT_Error();
-    error->message = msg;
-    error->code = code;
-    return error;
-}
-
 void MPS_Error_Destroy(PJRT_Error_Destroy_Args* args);
 void MPS_Error_Message(PJRT_Error_Message_Args* args);
 PJRT_Error* MPS_Error_GetCode(PJRT_Error_GetCode_Args* args);
+#if PJRT_API_MINOR >= 99
+PJRT_Error* MPS_Error_ForEachPayload(PJRT_Error_ForEachPayload_Args* args);
+#endif
 
 PJRT_Error* MPS_Plugin_Initialize(PJRT_Plugin_Initialize_Args* args);
 PJRT_Error* MPS_Plugin_Attributes(PJRT_Plugin_Attributes_Args* args);
@@ -187,6 +148,12 @@ PJRT_Error*
 MPS_TopologyDescription_GetDeviceDescriptions(PJRT_TopologyDescription_GetDeviceDescriptions_Args* args);
 PJRT_Error* MPS_TopologyDescription_Serialize(PJRT_TopologyDescription_Serialize_Args* args);
 PJRT_Error* MPS_TopologyDescription_Attributes(PJRT_TopologyDescription_Attributes_Args* args);
+#if PJRT_API_MINOR >= 101
+PJRT_Error* MPS_TopologyDescription_Fingerprint(PJRT_TopologyDescription_Fingerprint_Args* args);
+#endif
+#if PJRT_API_MINOR >= 102
+PJRT_Error* MPS_Executable_ParameterMemoryKinds(PJRT_Executable_ParameterMemoryKinds_Args* args);
+#endif
 
 PJRT_Error* MPS_Compile(PJRT_Compile_Args* args);
 
@@ -343,6 +310,15 @@ static const PJRT_Api pjrt_api = {
     .PJRT_Buffer_DonateWithControlDependency = nullptr,
     .PJRT_Event_Create = MPS_Event_Create,
     .PJRT_Event_Set = MPS_Event_Set,
+#if PJRT_API_MINOR >= 99
+    .PJRT_Error_ForEachPayload = MPS_Error_ForEachPayload,
+#endif
+#if PJRT_API_MINOR >= 101
+    .PJRT_TopologyDescription_Fingerprint = MPS_TopologyDescription_Fingerprint,
+#endif
+#if PJRT_API_MINOR >= 102
+    .PJRT_Executable_ParameterMemoryKinds = MPS_Executable_ParameterMemoryKinds,
+#endif
 };
 
 extern "C" {

@@ -19,20 +19,41 @@
 
 #include <cstring>
 
-void MPS_Error_Destroy(PJRT_Error_Destroy_Args* args) {
-    delete args->error;
-}
-
-void MPS_Error_Message(PJRT_Error_Message_Args* args) {
-    if (args->error) {
-        args->message = args->error->message.c_str();
-        args->message_size = args->error->message.size();
+PJRT_Client::~PJRT_Client() {
+    // Caller userdata destructors run while their device/client are still alive.
+    for (PJRT_Memory* memory : memories) {
+        delete static_cast<MpsPjrtMemory*>(memory);
     }
+    for (PJRT_Device* device : devices) {
+        delete device->description;
+        delete device;
+    }
+    delete topology;
 }
 
-PJRT_Error* MPS_Error_GetCode(PJRT_Error_GetCode_Args* args) {
-    args->code = args->error ? args->error->code : PJRT_Error_Code_OK;
-    return nullptr;
+PJRT_Client* CreatePjrtClient() {
+    auto mps_client = jax_metallib::MpsClient::Create();
+    if (!mps_client) {
+        return nullptr;
+    }
+
+    auto client = std::make_unique<PJRT_Client>();
+    client->client = std::move(mps_client);
+    const int device_count = client->client->device_count();
+    client->devices.reserve(device_count);
+    client->memories.reserve(device_count);
+    for (int i = 0; i < device_count; ++i) {
+        auto* device = new PJRT_Device();
+        client->devices.push_back(device);
+        device->device = client->client->device(i);
+        device->client = client.get();
+        device->description = new PJRT_DeviceDescription{device};
+        auto* memory = new MpsPjrtMemory(device, client.get(), i);
+        client->memories.push_back(memory);
+        device->default_memory = memory;
+    }
+    client->topology = new PJRT_TopologyDescription{client.get()};
+    return client.release();
 }
 
 PJRT_Error* MPS_Plugin_Initialize(PJRT_Plugin_Initialize_Args* args) {
@@ -49,7 +70,7 @@ PJRT_Error* MPS_Plugin_Attributes(PJRT_Plugin_Attributes_Args* args) {
 PJRT_Error* MPS_Client_Create(PJRT_Client_Create_Args* args) {
     MPS_LOG_DEBUG(" PJRT_Client_Create called, args=%p\n", (void*)args);
 
-    PJRT_Client* client = GetOrCreateDefaultClient();
+    PJRT_Client* client = CreatePjrtClient();
     if (!client) {
         return MakeError("Failed to create MPS client");
     }
@@ -61,7 +82,7 @@ PJRT_Error* MPS_Client_Create(PJRT_Client_Create_Args* args) {
 }
 
 PJRT_Error* MPS_Client_Destroy(PJRT_Client_Destroy_Args* args) {
-
+    delete args->client;
     return nullptr;
 }
 

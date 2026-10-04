@@ -339,13 +339,14 @@ enum class InitZeroKind { kUnknown, kNonZero, kPosZero, kNegZero };
 
 // Kind of a scalar float constant init (kUnknown when not a constant). A
 // subnormal f32 init is the signed zero XLA:CPU flushes it to; the f32 window
-// entry feeds that zero in its place (HandleReduceWindowFloat).
-static InitZeroKind GetInitZeroKind(mlir::Value v) {
+// entry feeds that zero in its place (HandleReduceWindowFloat). A reduce can
+// normalize its init independently of the window-only flush switch.
+static InitZeroKind GetInitZeroKind(mlir::Value v, bool flushF32Subnormal = false) {
     if (!v) {
         return InitZeroKind::kUnknown;
     }
     bool subNeg = false;
-    if (WindowSubnormalFlushEnabled() && IsF32SubnormalScalar(v, &subNeg)) {
+    if ((flushF32Subnormal || WindowSubnormalFlushEnabled()) && IsF32SubnormalScalar(v, &subNeg)) {
         return subNeg ? InitZeroKind::kNegZero : InitZeroKind::kPosZero;
     }
     if (IsNonZeroFloatScalar(v)) {
@@ -364,14 +365,14 @@ static InitZeroKind GetInitZeroKind(mlir::Value v) {
 // must not use the sum rule, because MPSGraph folds x + (+-0 constant) to x
 // (build/probe_r20c_padlow.py: max(x, +0 init) gave -0 for x == -0).
 static MPSGraphTensor* WindowMaxMin(MPSGraph* g, MPSGraphTensor* a, MPSGraphTensor* b, bool isMax,
-                                    mlir::Value bv = mlir::Value()) {
+                                    mlir::Value bv = mlir::Value(), bool flushF32Subnormal = false) {
     if (!IsFloatForNaN(a.dataType)) {
         return isMax ? [g maximumWithPrimaryTensor:a secondaryTensor:b name:nil]
                      : [g minimumWithPrimaryTensor:a secondaryTensor:b name:nil];
     }
     MPSGraphTensor* m = isMax ? [g maximumWithNaNPropagationWithPrimaryTensor:a secondaryTensor:b name:nil]
                               : [g minimumWithNaNPropagationWithPrimaryTensor:a secondaryTensor:b name:nil];
-    const InitZeroKind kind = GetInitZeroKind(bv);
+    const InitZeroKind kind = GetInitZeroKind(bv, flushF32Subnormal);
     if (kind == InitZeroKind::kNonZero || !WindowZeroTieEnabled() || b.dataType != a.dataType) {
         return m;
     }
@@ -1052,6 +1053,166 @@ static ProcessResult ReduceBitwiseFold(HandlerContext& ctx, MPSGraphTensor* inpu
     return Result(ctx, result, "reduce_bitwise_fold");
 }
 
+// JAX_METALLIB_DISABLE_REDUCE_INIT_COMBINE=1 drops a non-identity reduce init
+// again (the pre-fix behaviour: lax.reduce(x, 5., add) returned the plain sum).
+static bool ReduceInitCombineDisabled() {
+    static const bool disabled = [] {
+        const char* v = std::getenv("JAX_METALLIB_DISABLE_REDUCE_INIT_COMBINE");
+        return v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+    }();
+    return disabled;
+}
+
+// Scalar constant init that cannot change an add/mul/max/min reduction, so the
+// combine step is skipped and jnp reductions keep their lowering bit for bit.
+// add: any zero (as in reduce_window), mul: one, max: -inf / type minimum,
+// min: +inf / type maximum.
+static bool IsReduceIdentityInit(mlir::Value init, const std::string& type) {
+    mlir::DenseElementsAttr dense;
+    if (!GetScalarConstantAttr(init, dense)) {
+        return false;
+    }
+    if (type == "stablehlo.add") {
+        return IsScalarZero(init);
+    }
+    const bool isMax = type == "stablehlo.maximum";
+    const bool isMin = type == "stablehlo.minimum";
+    auto elemType = dense.getElementType();
+    if (mlir::isa<mlir::FloatType>(elemType)) {
+        llvm::APFloat ap = *dense.getValues<llvm::APFloat>().begin();
+        if (type == "stablehlo.multiply") {
+            return ap.isExactlyValue(1.0);
+        }
+        return (isMax || isMin) && ap.isInfinity() && ap.isNegative() == isMax;
+    }
+    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elemType)) {
+        llvm::APInt ap = *dense.getValues<llvm::APInt>().begin();
+        if (type == "stablehlo.multiply") {
+            return ap.isOne();
+        }
+        const bool isUnsigned = intType.isUnsigned() || ap.getBitWidth() == 1;
+        if (isMax) {
+            return isUnsigned ? ap.isZero() : ap.isMinSignedValue();
+        }
+        if (isMin) {
+            return isUnsigned ? ap.isMaxValue() : ap.isMaxSignedValue();
+        }
+    }
+    return false;
+}
+
+// The window helper's integer path also normalizes reduce init bits without
+// changing the float-select default used by existing window lowerings.
+static MPSGraphTensor* FlushF32SubnormalSigned(MPSGraph* g, MPSGraphTensor* t, bool forceBits = false);
+
+// IEEE add of exclusively -0 leaves stays -0 for every reduction tree. The
+// graph sum can start at +0 instead; correct only this exact value invariant,
+// not cancellation, subnormals or a CPU compiler's shape-dependent YNN path.
+static bool CorrectF32AddNegativeZero(HandlerContext& ctx, MPSGraphTensor*& result, MPSGraphTensor* init) {
+    MPSGraphTensor* input = GetInputTensor(ctx, 0);
+    if (!input) {
+        return false;
+    }
+    auto dimensions = mlir::cast<mlir::stablehlo::ReduceOp>(ctx.op).getDimensions();
+    if (input.shape == nil || result.shape == nil) {
+        return true;
+    }
+    // Empty reduced axes already return the init directly; empty output tensors
+    // need no correction and must not enter an MPSGraph reduction encode.
+    for (NSNumber* dim in input.shape) {
+        if (dim.longLongValue == 0) {
+            return true;
+        }
+    }
+    MPSGraph* g = ctx.graph;
+    NSArray<NSNumber*>* shape = result.shape;
+    auto bits = [&](MPSGraphTensor* t) {
+        if (t.shape.count == 0) {
+            t = [g reshapeTensor:t withShape:@[@1] name:nil];
+        }
+        return [g reinterpretCastTensor:t toType:MPSDataTypeInt32 name:nil];
+    };
+    MPSGraphTensor* negZero = OrderKeyConst(g, MPSDataTypeInt32, INT32_MIN);
+    MPSGraphTensor* other = [g notEqualWithPrimaryTensor:bits(input) secondaryTensor:negZero name:nil];
+    other = [g castTensor:other toType:MPSDataTypeUInt8 name:nil];
+    NSMutableArray<NSNumber*>* axes = [NSMutableArray array];
+    for (int64_t dim : dimensions) {
+        [axes addObject:@(dim)];
+    }
+    // Bool/bitwise reductions are not reliable here; native uint8 max over a
+    // 0/1 mask says whether any input is not exactly -0. With no axes, keep
+    // the per-element mask and do not encode an empty-axis reduction.
+    MPSGraphTensor* anyOther =
+        dimensions.empty() ? other : [g reductionMaximumWithTensor:other axes:axes name:nil];
+    NSArray<NSNumber*>* bitShape = shape.count == 0 ? @[@1] : shape;
+    if (![bitShape isEqualToArray:anyOther.shape]) {
+        anyOther = [g reshapeTensor:anyOther withShape:bitShape name:nil];
+    }
+    MPSGraphTensor* zero = [g constantWithScalar:0.0 dataType:MPSDataTypeUInt8];
+    MPSGraphTensor* allNegZero = [g equalWithPrimaryTensor:anyOther secondaryTensor:zero name:nil];
+    MPSGraphTensor* initNegZero = [g equalWithPrimaryTensor:bits(init) secondaryTensor:negZero name:nil];
+    MPSGraphTensor* predicate = [g logicalANDWithPrimaryTensor:allNegZero
+                                               secondaryTensor:initNegZero
+                                                          name:nil];
+    MPSGraphTensor* selected = [g selectWithPredicateTensor:predicate
+                                        truePredicateTensor:negZero
+                                       falsePredicateTensor:bits(result)
+                                                       name:nil];
+    result = [g reinterpretCastTensor:selected toType:MPSDataTypeFloat32 name:nil];
+    if (![shape isEqualToArray:result.shape]) {
+        result = [g reshapeTensor:result withShape:shape name:nil];
+    }
+    return true;
+}
+
+// XLA folds the init into every reduced slice; MPSGraph reductions have no init,
+// so a non-identity init (lax.reduce(x, 5., add), a traced init, a max init that
+// beats the data) was silently dropped (build/probe_r20k_reduce_init*.log: every
+// such add/mul/max/min case returned the init-free result). Combine it after the
+// reduction; max/min go through WindowMaxMin for NaN propagation and -0 < +0.
+static bool CombineReduceInit(HandlerContext& ctx, MPSGraphTensor*& result, const std::string& type) {
+    mlir::Value initValue = ctx.op->getOperand(1);
+    if (!result || ReduceInitCombineDisabled()) {
+        return true;
+    }
+    bool correctAddZero = type == "stablehlo.add" && result.dataType == MPSDataTypeFloat32 &&
+                          mlir::cast<mlir::ShapedType>(initValue.getType()).getElementType().isF32();
+    mlir::DenseElementsAttr dense;
+    if (correctAddZero && GetScalarConstantAttr(initValue, dense)) {
+        llvm::APFloat ap = *dense.getValues<llvm::APFloat>().begin();
+        correctAddZero = ap.isZero() && ap.isNegative();
+    }
+    const bool identity = IsReduceIdentityInit(initValue, type);
+    if (identity && !correctAddZero) {
+        return true;
+    }
+    MPSGraphTensor* init = GetInputTensor(ctx, 1);
+    if (!init) {
+        return false;
+    }
+    if (init.dataType != result.dataType) {
+        init = [ctx.graph castTensor:init toType:result.dataType name:nil];
+    }
+    if (type == "stablehlo.add") {
+        if (!identity) {
+            result = [ctx.graph additionWithPrimaryTensor:result secondaryTensor:init name:nil];
+        }
+        if (correctAddZero && !CorrectF32AddNegativeZero(ctx, result, init)) {
+            return false;
+        }
+    } else if (type == "stablehlo.multiply") {
+        result = [ctx.graph multiplicationWithPrimaryTensor:result secondaryTensor:init name:nil];
+    } else if (type == "stablehlo.maximum" || type == "stablehlo.minimum") {
+        const bool flushF32Subnormal = init.dataType == MPSDataTypeFloat32;
+        if (flushF32Subnormal) {
+            init = FlushF32SubnormalSigned(ctx.graph, init, /*forceBits=*/true);
+        }
+        result =
+            WindowMaxMin(ctx.graph, result, init, type == "stablehlo.maximum", initValue, flushF32Subnormal);
+    }
+    return true;
+}
+
 static ProcessResult HandleSingleResultReduce(HandlerContext& ctx) {
     auto reduceOp = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(ctx.op);
     if (!reduceOp) {
@@ -1118,6 +1279,9 @@ static ProcessResult HandleSingleResultReduce(HandlerContext& ctx) {
         MPSGraphTensor* keyed =
             cls == MaxMinOperandClass::kUnknown ? ReduceMaxMinViaKey(ctx, input, axes, reductionType) : nil;
         if (keyed) {
+            if (!CombineReduceInit(ctx, keyed, reductionType)) {
+                return ProcessResult::Error("reduce: init value tensor not found");
+            }
             NSArray<NSNumber*>* outShape = GetOutputShape(ctx.op);
             if (outShape && keyed.shape && ![outShape isEqualToArray:keyed.shape]) {
                 keyed = [ctx.graph reshapeTensor:keyed withShape:outShape name:nil];
@@ -1161,6 +1325,10 @@ static ProcessResult HandleSingleResultReduce(HandlerContext& ctx) {
                                                  name:nil];
     }
 
+    if (!CombineReduceInit(ctx, result, reductionType)) {
+        return ProcessResult::Error("reduce: init value tensor not found");
+    }
+
     NSArray<NSNumber*>* outputShape = GetOutputShape(ctx.op);
     if (outputShape && result && result.shape && ![outputShape isEqualToArray:result.shape]) {
         result = [ctx.graph reshapeTensor:result withShape:outputShape name:nil];
@@ -1169,12 +1337,79 @@ static ProcessResult HandleSingleResultReduce(HandlerContext& ctx) {
     return Result(ctx, result, "reduce");
 }
 
+// The arg-reduction finds the best input pair, but MPSGraph has no init operands.
+// Fold the init pair through the actual StableHLO body so its independent value
+// and index selects (including ties and NaNs) are preserved. JAX's constant
+// extremum sentinel + index zero cannot win, so its common lowering stays intact.
+static ProcessResult CombineArgReduceInit(HandlerContext& ctx, mlir::stablehlo::ReduceOp reduceOp,
+                                          ArgReduceKind kind, MPSGraphTensor*& valueOut,
+                                          MPSGraphTensor*& indexOut) {
+    auto inits = reduceOp.getInitValues();
+    const std::string type = kind == ArgReduceKind::kMax ? "stablehlo.maximum" : "stablehlo.minimum";
+    if (ReduceInitCombineDisabled() || (IsReduceIdentityInit(inits[0], type) && IsScalarZero(inits[1]))) {
+        return ProcessResult{};
+    }
+    if (!ctx.processBlock) {
+        return ProcessResult::Error("reduce: missing block processor for arg-reduce init");
+    }
+    MPSGraphTensor* valueInit = GetInputTensor(ctx, 2);
+    MPSGraphTensor* indexInit = GetInputTensor(ctx, 3);
+    if (!valueInit || !indexInit) {
+        return ProcessResult::Error("reduce: arg-reduce init tensor not found");
+    }
+    mlir::Block& body = reduceOp.getBody().front();
+    if (body.getNumArguments() != 4) {
+        return ProcessResult::Error("reduce: arg-reduce body argument arity mismatch");
+    }
+    ValueMap bodyValues = ctx.values;
+    bodyValues[body.getArgument(0).getAsOpaquePointer()] = valueInit;
+    bodyValues[body.getArgument(1).getAsOpaquePointer()] = indexInit;
+    bodyValues[body.getArgument(2).getAsOpaquePointer()] = valueOut;
+    bodyValues[body.getArgument(3).getAsOpaquePointer()] = indexOut;
+    HandlerContext bodyCtx(ctx.graph, nullptr, bodyValues, ctx.module, ctx.depth + 1, ctx.processBlock);
+    bodyCtx.variables = ctx.variables;
+    bodyCtx.in_control_flow = ctx.isInControlFlow();
+    ProcessResult combined = ctx.processBlock(bodyCtx, body);
+    if (!combined.ok()) {
+        return combined;
+    }
+    if (combined.return_values.size() != 2) {
+        return ProcessResult::Error("reduce: arg-reduce body must return two values");
+    }
+    valueOut = GetTensor(bodyValues, combined.return_values[0]);
+    indexOut = GetTensor(bodyValues, combined.return_values[1]);
+    if (!valueOut || !indexOut) {
+        return ProcessResult::Error("reduce: combined arg-reduce result tensor not found");
+    }
+    // MPSGraph rewrote a +0 gathered value to a constant -0 on this float
+    // select, even though the predicate chose the gathered value (traced
+    // inits and integer-bits selects were exact). Preserve the selected bits.
+    // Only the constant-zero f32 case needs this extra graph barrier.
+    auto selectOp = combined.return_values[0].getDefiningOp<mlir::stablehlo::SelectOp>();
+    if (valueInit.dataType == MPSDataTypeFloat32 && IsScalarZero(inits[0]) && selectOp) {
+        MPSGraphTensor* pred = GetTensor(bodyValues, selectOp->getOperand(0));
+        auto bits = [&](mlir::Value v) {
+            MPSGraphTensor* t = GetTensor(bodyValues, v);
+            if (t.shape.count == 0) {
+                t = [ctx.graph reshapeTensor:t withShape:@[@1] name:nil];
+            }
+            return [ctx.graph reinterpretCastTensor:t toType:MPSDataTypeInt32 name:nil];
+        };
+        MPSGraphTensor* selected = [ctx.graph selectWithPredicateTensor:pred
+                                                    truePredicateTensor:bits(selectOp->getOperand(1))
+                                                   falsePredicateTensor:bits(selectOp->getOperand(2))
+                                                                   name:nil];
+        valueOut = [ctx.graph reinterpretCastTensor:selected toType:MPSDataTypeFloat32 name:nil];
+    }
+    return ProcessResult{};
+}
+
 static ProcessResult HandleMultiResultReduce(HandlerContext& ctx) {
     auto reduceOp = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(ctx.op);
     if (!reduceOp) {
         return ProcessResult::Error("reduce: expected ReduceOp");
     }
-    if (ctx.op->getNumResults() != 2 || ctx.op->getNumOperands() < 2) {
+    if (ctx.op->getNumResults() != 2 || ctx.op->getNumOperands() != 4) {
         return ProcessResult::Error("reduce: unsupported multi-result shape");
     }
 
@@ -1411,6 +1646,11 @@ static ProcessResult HandleMultiResultReduce(HandlerContext& ctx) {
     MPSDataType indexType = GetResultMpsType(ctx.op, 1);
     if (indexType != MPSDataTypeInvalid && indexOut.dataType != indexType) {
         indexOut = [ctx.graph castTensor:indexOut toType:indexType name:nil];
+    }
+
+    ProcessResult combined = CombineArgReduceInit(ctx, reduceOp, kind, valueOut, indexOut);
+    if (!combined.ok()) {
+        return combined;
     }
 
     NSArray<NSNumber*>* valueShape = GetOutputShape(ctx.op, 0);
@@ -1723,8 +1963,8 @@ static bool WindowSubnormalFlushBits() {
     return bits;
 }
 
-static MPSGraphTensor* FlushF32SubnormalSigned(MPSGraph* g, MPSGraphTensor* t) {
-    if (!WindowSubnormalFlushBits()) {
+static MPSGraphTensor* FlushF32SubnormalSigned(MPSGraph* g, MPSGraphTensor* t, bool forceBits) {
+    if (!forceBits && !WindowSubnormalFlushBits()) {
         // |x| < 2^-126 holds for a subnormal whether or not the compare flushes
         // it, and x * 0 keeps the sign of every finite x.
         MPSGraphTensor* tiny = [g lessThanWithPrimaryTensor:[g absoluteWithTensor:t name:nil]
@@ -1740,7 +1980,8 @@ static MPSGraphTensor* FlushF32SubnormalSigned(MPSGraph* g, MPSGraphTensor* t) {
     // reinterpret_cast rejects rank-0 operands (a runtime init aborted the
     // process: build/probe_r20e_runtime_init.log), so flush those as [1].
     if (t.shape && t.shape.count == 0) {
-        MPSGraphTensor* flat = FlushF32SubnormalSigned(g, [g reshapeTensor:t withShape:@[@1] name:nil]);
+        MPSGraphTensor* flat =
+            FlushF32SubnormalSigned(g, [g reshapeTensor:t withShape:@[@1] name:nil], forceBits);
         return [g reshapeTensor:flat withShape:@[] name:nil];
     }
     MPSGraphTensor* bits = [g reinterpretCastTensor:t toType:MPSDataTypeInt32 name:nil];

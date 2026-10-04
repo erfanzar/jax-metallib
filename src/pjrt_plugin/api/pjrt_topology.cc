@@ -15,6 +15,9 @@
 #include "pjrt_plugin/core/logging.h"
 #include "pjrt_plugin/core/pjrt_types.h"
 
+#include <cstdint>
+#include <string>
+
 PJRT_Error* MPS_Client_TopologyDescription(PJRT_Client_TopologyDescription_Args* args) {
     MPS_LOG_DEBUG(" PJRT_Client_TopologyDescription called\n");
     if (args->client && args->client->topology) {
@@ -62,3 +65,42 @@ PJRT_Error* MPS_TopologyDescription_Attributes(PJRT_TopologyDescription_Attribut
     args->num_attributes = 0;
     return nullptr;
 }
+
+#if PJRT_API_MINOR >= 101
+PJRT_Error* MPS_TopologyDescription_Fingerprint(PJRT_TopologyDescription_Fingerprint_Args* args) {
+    if (!args || args->struct_size < PJRT_TopologyDescription_Fingerprint_Args_STRUCT_SIZE ||
+        !args->topology || !args->topology->client) {
+        return MakeError("Fingerprint: invalid topology arguments", PJRT_Error_Code_INVALID_ARGUMENT);
+    }
+
+    // Stable FNV-1a over length-delimited platform/device metadata, never handle
+    // addresses or std::hash (whose stability across processes is unspecified).
+    uint64_t fingerprint = UINT64_C(14695981039346656037);
+    auto appendByte = [&](uint8_t byte) { fingerprint = (fingerprint ^ byte) * UINT64_C(1099511628211); };
+    auto appendNumber = [&](uint64_t number) {
+        for (int i = 0; i < 8; ++i) {
+            appendByte(static_cast<uint8_t>(number));
+            number >>= 8;
+        }
+    };
+    auto appendString = [&](const std::string& value) {
+        appendNumber(value.size());
+        for (unsigned char byte : value) {
+            appendByte(byte);
+        }
+    };
+    appendString(kPlatformName);
+    appendString(kPlatformVersion);
+    const auto& devices = args->topology->client->devices;
+    appendNumber(devices.size());
+    for (const PJRT_Device* device : devices) {
+        if (!device || !device->device) {
+            return MakeError("Fingerprint: invalid topology device", PJRT_Error_Code_INVALID_ARGUMENT);
+        }
+        appendNumber(device->device->id());
+        appendString(device->device->device_kind());
+    }
+    args->fingerprint = fingerprint;
+    return nullptr;
+}
+#endif

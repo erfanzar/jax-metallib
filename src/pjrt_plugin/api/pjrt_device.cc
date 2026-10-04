@@ -87,9 +87,7 @@ PJRT_Error* MPS_Device_LocalHardwareId(PJRT_Device_LocalHardwareId_Args* args) {
 PJRT_Error* MPS_Device_AddressableMemories(PJRT_Device_AddressableMemories_Args* args) {
     MPS_LOG_DEBUG(" PJRT_Device_AddressableMemories called\n");
     if (args->device && args->device->default_memory) {
-        static PJRT_Memory* mem_array[1];
-        mem_array[0] = args->device->default_memory;
-        args->memories = mem_array;
+        args->memories = &args->device->default_memory;
         args->num_memories = 1;
     } else {
         args->memories = nullptr;
@@ -131,6 +129,12 @@ PJRT_Error* MPS_Device_MemoryStats(PJRT_Device_MemoryStats_Args* args) {
     args->largest_free_block_bytes_is_set = false;
     args->pool_bytes_is_set = false;
     args->peak_pool_bytes_is_set = false;
+#if PJRT_API_MINOR >= 114
+    // Older callers advertise only the prefix through peak_pool_bytes_is_set.
+    if (args->struct_size >= PJRT_STRUCT_SIZE(PJRT_Device_MemoryStats_Args, peak_allocated_bytes_is_set)) {
+        args->peak_allocated_bytes_is_set = false;
+    }
+#endif
 
     return nullptr;
 }

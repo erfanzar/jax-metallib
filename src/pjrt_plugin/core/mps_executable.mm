@@ -910,7 +910,7 @@ static bool IsNeutralReduceInit(mlir::Value init, IntrinsicNativeKind kind) {
     if (kind == IntrinsicNativeKind::kReduceSumLastAxis || kind == IntrinsicNativeKind::kReduceMeanLastAxis ||
         kind == IntrinsicNativeKind::kReduceSumAxis0 || kind == IntrinsicNativeKind::kReduceMeanAxis0 ||
         kind == IntrinsicNativeKind::kLayerNormLastAxis) {
-        return v == 0.0;
+        return v == 0.0 && !std::signbit(v);
     }
     if (kind == IntrinsicNativeKind::kReduceMaxLastAxis || kind == IntrinsicNativeKind::kReduceMaxAxis0 ||
         kind == IntrinsicNativeKind::kSoftmaxLastAxis ||

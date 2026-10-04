@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "pjrt_plugin/api/pjrt_handles.h"
 #include "pjrt_plugin/core/completion_event.h"
 #include "pjrt_plugin/core/mps_buffer.h"
 #include "pjrt_plugin/core/mps_client.h"
@@ -30,10 +31,12 @@ struct PJRT_DeviceDescription;
 struct PJRT_Memory;
 
 struct PJRT_Client {
+    ~PJRT_Client();
+
     std::unique_ptr<jax_metallib::MpsClient> client;
     std::vector<PJRT_Device*> devices;
     std::vector<PJRT_Memory*> memories;
-    PJRT_TopologyDescription* topology;
+    PJRT_TopologyDescription* topology = nullptr;
 };
 
 struct PJRT_Device {
@@ -45,12 +48,6 @@ struct PJRT_Device {
 
 struct PJRT_DeviceDescription {
     PJRT_Device* device;
-};
-
-struct PJRT_Memory {
-    PJRT_Device* device;
-    PJRT_Client* client;
-    int id;
 };
 
 struct PJRT_TopologyDescription {
@@ -97,13 +94,6 @@ struct PJRT_LoadedExecutable {
 struct PJRT_Event {
     jax_metallib::CompletionEvent completion;
 };
-
-struct PJRT_Error {
-    std::string message;
-    PJRT_Error_Code code;
-};
-
-PJRT_Error* MakeError(const std::string& msg, PJRT_Error_Code code = PJRT_Error_Code_INTERNAL);
 
 // Thread-local single-element pools for PJRT_Buffer and PJRT_Event.
 // Avoids heap allocation per Execute() call in steady-state benchmarks.
@@ -174,6 +164,7 @@ inline void ReleasePjrtEvent(PJRT_Event* ev) {
     }
 }
 
+PJRT_Client* CreatePjrtClient();
 PJRT_Client* GetOrCreateDefaultClient();
 PJRT_Client* GetClient(PJRT_Client* client);
 
