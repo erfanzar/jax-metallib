@@ -6247,6 +6247,25 @@ static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
             IsEligibleReduceNativeOp(op, IntrinsicNativeKind::kSoftmaxLastAxis)) {
             return NativeIntrinsicReduceHandler;
         }
+        // A scalar constant whose every user takes one of the native routes
+        // above (the init of a large reduce, sort or fused softmax) is baked
+        // into a buffer at plan time. Left in the graph it forms a
+        // constant-only MPSGraph segment and costs one graph dispatch per call.
+        // JAX_METALLIB_DISABLE_NATIVE_SCALAR_INIT=1 keeps it in the graph.
+        if (IsEligibleConstantScalarOp(op) && !op->use_empty() &&
+            !EnvFlagEnabled("JAX_METALLIB_DISABLE_NATIVE_SCALAR_INIT")) {
+            bool all_users_native = true;
+            for (mlir::Operation* user : op->getUsers()) {
+                if (user->getBlock() != op->getBlock() || IsEligibleConstantScalarOp(user) ||
+                    !TrySelectIntrinsicNativeHandler(user)) {
+                    all_users_native = false;
+                    break;
+                }
+            }
+            if (all_users_native) {
+                return NativeIntrinsicConstantHandler;
+            }
+        }
         return nullptr;
     }
     if (!ShouldRouteToIntrinsicNative(op)) {
@@ -7174,14 +7193,7 @@ bool MpsExecutable::BuildExecutionPlan() {
             SegmentInfo current_segment{false, {}, nullptr};
             returnOp = nullptr;
 
-            for (mlir::Operation& operation : block) {
-                mlir::Operation* op = &operation;
-
-                if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
-                    returnOp = ret;
-                    continue;
-                }
-
+            auto select_native = [&](mlir::Operation* op) -> NativeOpHandler {
                 std::string op_name = op->getName().getStringRef().str();
                 const OpHandler* handler = OpRegistry::Find(op_name);
                 NativeOpHandler native_handler = nullptr;
@@ -7200,8 +7212,80 @@ bool MpsExecutable::BuildExecutionPlan() {
                 if (has_custom_metal && mlir::isa<mlir::stablehlo::TransposeOp>(op)) {
                     native_handler = nullptr;
                 }
+                return native_handler;
+            };
+
+            std::unordered_map<mlir::Operation*, NativeOpHandler> routed;
+            std::unordered_set<mlir::Operation*> native_ops;
+            for (mlir::Operation& operation : block) {
+                mlir::Operation* op = &operation;
+                if (mlir::isa<mlir::func::ReturnOp>(op)) {
+                    continue;
+                }
+                NativeOpHandler h = select_native(op);
+                routed[op] = h;
+                if (h || IsCustomMetalCall(op)) {
+                    native_ops.insert(op);
+                }
+            }
+
+            // A graph-routed constant whose users are all graph ops is emitted
+            // with its first user instead of at its block position. At its
+            // original position it can sit alone between native ops (mean's
+            // divisor ahead of the native reduce) and cost a graph dispatch.
+            // JAX_METALLIB_DISABLE_CONSTANT_SINK=1 keeps block order.
+            std::unordered_map<mlir::Operation*, std::vector<mlir::Operation*>> sunk_before;
+            std::unordered_set<mlir::Operation*> sunk;
+            if (!EnvFlagEnabled("JAX_METALLIB_DISABLE_CONSTANT_SINK")) {
+                for (mlir::Operation& operation : block) {
+                    mlir::Operation* op = &operation;
+                    if (!mlir::isa<mlir::stablehlo::ConstantOp>(op) || native_ops.count(op) ||
+                        op->use_empty()) {
+                        continue;
+                    }
+                    mlir::Operation* first_user = nullptr;
+                    bool movable = true;
+                    for (mlir::Operation* user : op->getUsers()) {
+                        mlir::Operation* anc = block.findAncestorOpInBlock(*user);
+                        if (!anc || mlir::isa<mlir::func::ReturnOp>(anc) || native_ops.count(anc)) {
+                            movable = false;
+                            break;
+                        }
+                        if (!first_user || anc->isBeforeInBlock(first_user)) {
+                            first_user = anc;
+                        }
+                    }
+                    if (movable && first_user) {
+                        sunk_before[first_user].push_back(op);
+                        sunk.insert(op);
+                    }
+                }
+            }
+
+            for (mlir::Operation& operation : block) {
+                mlir::Operation* op = &operation;
+
+                if (auto ret = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
+                    returnOp = ret;
+                    continue;
+                }
+                if (sunk.count(op)) {
+                    continue;
+                }
+
+                std::string op_name = op->getName().getStringRef().str();
+                NativeOpHandler native_handler = routed[op];
                 const bool custom_metal = IsCustomMetalCall(op);
                 bool is_native = (native_handler != nullptr) || custom_metal;
+
+                if (!is_native) {
+                    auto pending = sunk_before.find(op);
+                    if (pending != sunk_before.end()) {
+                        for (mlir::Operation* c : pending->second) {
+                            current_segment.ops.push_back(c);
+                        }
+                    }
+                }
 
                 if (is_native) {
 
