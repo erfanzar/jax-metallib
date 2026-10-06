@@ -345,7 +345,7 @@ stable specification of every internal tuning flag.
 | --- | --- | --- |
 | `JAX_PLATFORMS` | JAX backend selection | `mps` requires MPS; `cpu,mps` makes both available with CPU first |
 | `JAX_METALLIB_LIBRARY_PATH` | Automatic discovery | Path to `libpjrt_plugin_silicon.dylib` |
-| `JAX_METALLIB_GEMM_TRUE_F32` | `0` | `1` disables graph-path float32 input narrowing for eligible GEMMs |
+| `JAX_METALLIB_GEMM_FAST_F32` | `0` | `1` opts into float16 input narrowing for large float32 GEMMs at `DEFAULT` precision |
 | `JAX_METALLIB_COMPLETION_TIMEOUT_MS` | `30000` | Positive timeout for caller-facing GPU waits; timeout does not cancel GPU work |
 | `JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS` | Off | Opt into the experimental intrinsic-kernel family |
 | `JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS` | Off | Disable that family; overrides its enable flag, not every native route |
@@ -355,11 +355,14 @@ stable specification of every internal tuning flag.
 | `JAX_METALLIB_AUTOTUNE_CACHE_DIR` | `~/.cache/jax-silicon` | Directory for autotune choices, not compiled custom Metal pipelines |
 | `JAX_METALLIB_TRACE_PLAN` | Off | Print the execution plan to stderr |
 
-**Float32 GEMM precision:** the graph dot handler can cast both inputs to
+**Float32 GEMM precision:** float32 matmuls keep float32 inputs by default.
+With `JAX_METALLIB_GEMM_FAST_F32=1`, the graph dot handler casts both inputs to
 float16 when each contains at least 500,000 elements and
-`batch * M * N * K >= 100,000,000`, then cast the output to float32. This changes
-input rounding and representable range. Set `JAX_METALLIB_GEMM_TRUE_F32=1` when
-you need to retain float32 inputs. It is not a promise of CPU-identical results.
+`batch * M * N * K >= 100,000,000`, then casts the output to float32. That mode
+has about 3e-4 relative error on a 1024×1024 matmul and returns inf when an
+operand exceeds the float16 range (65504). It never applies to a dot whose
+`precision` is above `DEFAULT` (for example `precision=HIGHEST`).
+`JAX_METALLIB_GEMM_TRUE_F32` is no longer read.
 
 `MPS_LOG_LEVEL` is a **build-time** setting: `0` error, `1` warning, `2` info,
 `3` debug. For example, rebuild with `MPS_LOG_LEVEL=3 uv pip install -e .`;

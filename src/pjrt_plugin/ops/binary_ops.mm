@@ -652,16 +652,30 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
     if (!lhsInput || !rhsInput)
         return ProcessResult::Error("dot_general: missing input tensor");
 
-    // Mixed precision: cast fp32 inputs to fp16 for 2x MMA throughput.
-    // Only for large matmuls where the speedup outweighs precision loss and graph overhead.
-    // Disabled by JAX_METALLIB_GEMM_TRUE_F32=1.
+    // Optional mixed precision: cast fp32 inputs to fp16 for MMA throughput.
+    // Opt-in only (JAX_METALLIB_GEMM_FAST_F32=1). It used to be the default,
+    // which gave ~3e-4 relative error on 1024^2 matmuls and inf whenever an
+    // operand exceeded the fp16 range (65504), with precision=HIGHEST ignored.
+    // Even when opted in, any precision_config entry above DEFAULT keeps fp32.
+    // JAX_METALLIB_GEMM_TRUE_F32 is no longer read: fp32 is the default.
     bool mixedFp32 = false;
     {
         static const bool useMixed = []() {
-            const char* v = std::getenv("JAX_METALLIB_GEMM_TRUE_F32");
-            return !(v && v[0] == '1' && v[1] == '\0');
+            const char* v = std::getenv("JAX_METALLIB_GEMM_FAST_F32");
+            return v && v[0] == '1' && v[1] == '\0';
         }();
-        if (useMixed && lhsInput.dataType == MPSDataTypeFloat32) {
+        auto allowsReducedPrecision = [&]() {
+            auto cfg = dotOp.getPrecisionConfig();
+            if (!cfg)
+                return true;
+            for (mlir::Attribute attr : *cfg) {
+                auto p = mlir::dyn_cast<mlir::stablehlo::PrecisionAttr>(attr);
+                if (!p || p.getValue() != mlir::stablehlo::Precision::DEFAULT)
+                    return false;
+            }
+            return true;
+        };
+        if (useMixed && lhsInput.dataType == MPSDataTypeFloat32 && allowsReducedPrecision()) {
             // Require both inputs to have >= 500K elements to avoid
             // precision loss and overhead on small/special-shape matmuls.
             // Also require sufficient FLOPs (M*N*K*batch >= 100M) to amortize cast overhead.

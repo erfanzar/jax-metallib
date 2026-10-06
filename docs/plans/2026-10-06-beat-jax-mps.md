@@ -195,7 +195,7 @@ Run `JAX_PLATFORMS=cpu,mps uv run pytest tests/test_f32_gemm_precision.py -v`. E
 
 **Files:** Modify `src/pjrt_plugin/ops/binary_ops.mm:656-708`.
 
-1. Replace the default-on `JAX_METALLIB_GEMM_TRUE_F32` check with an opt-in `JAX_METALLIB_GEMM_FAST_F32=1`. Keep `GEMM_TRUE_F32=1` accepted as a no-op for old scripts.
+1. Replace the default-on `JAX_METALLIB_GEMM_TRUE_F32` check with an opt-in `JAX_METALLIB_GEMM_FAST_F32=1`. `GEMM_TRUE_F32` is no longer read (true f32 is the default, so old scripts that set it behave the same). **Done 2026-10-06.**
 2. Even with the opt-in, narrow only when every `precision_config` entry is `DEFAULT`:
    ```cpp
    static bool AllowsReducedPrecision(mlir::stablehlo::DotGeneralOp op) {
