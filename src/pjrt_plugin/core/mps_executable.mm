@@ -6264,13 +6264,17 @@ static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
         // above (the init of a large reduce, sort or fused softmax) is baked
         // into a buffer at plan time. Left in the graph it forms a
         // constant-only MPSGraph segment and costs one graph dispatch per call.
+        // Users are judged by their ancestor op in this block: folding hoists
+        // sort-comparator constants (0.0, NaN) to the function entry block,
+        // where their only users sit inside the native sort's region.
         // JAX_METALLIB_DISABLE_NATIVE_SCALAR_INIT=1 keeps it in the graph.
-        if (IsEligibleConstantScalarOp(op) && !op->use_empty() &&
+        if (IsEligibleConstantScalarOp(op) && !op->use_empty() && op->getBlock() &&
             !EnvFlagEnabled("JAX_METALLIB_DISABLE_NATIVE_SCALAR_INIT")) {
             bool all_users_native = true;
             for (mlir::Operation* user : op->getUsers()) {
-                if (user->getBlock() != op->getBlock() || IsEligibleConstantScalarOp(user) ||
-                    !TrySelectIntrinsicNativeHandler(user)) {
+                mlir::Operation* anc = op->getBlock()->findAncestorOpInBlock(*user);
+                if (!anc || anc == op || IsEligibleConstantScalarOp(anc) ||
+                    !TrySelectIntrinsicNativeHandler(anc)) {
                     all_users_native = false;
                     break;
                 }
