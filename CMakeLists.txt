@@ -188,6 +188,7 @@ set(PJRT_SOURCES
     src/pjrt_plugin/core/type_utils.mm
     # Runtime (Metal kernels & native execution)
     src/pjrt_plugin/runtime/metal_kernels.mm
+    src/pjrt_plugin/runtime/custom_metal_kernel.mm
     # Operations
     src/pjrt_plugin/ops/binary_ops.mm
     src/pjrt_plugin/ops/unary_ops.mm

@@ -22,6 +22,7 @@
 #import "pjrt_plugin/core/mps_device.h"
 #import "pjrt_plugin/core/stablehlo_parser.h"
 #import "pjrt_plugin/ops/registry.h"
+#import "pjrt_plugin/runtime/custom_metal_kernel.h"
 #import "pjrt_plugin/runtime/metal_kernels.h"
 #include "stablehlo/dialect/Serialization.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -31,6 +32,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -129,7 +131,13 @@ struct NativeStep {
         kCpuSort,
         kCpuCholesky,
         kReduceSplit,
+        kCustomMetal,
     };
+
+    // Custom calls have one buffer for every declared result, including dead
+    // results. Metal cannot safely bind only the results that JAX consumes.
+    std::shared_ptr<CustomMetalKernel> custom_kernel;
+    std::vector<SlotId> custom_output_slots;
 
     NativeOpHandler handler;
     mlir::Operation* op;
@@ -7018,6 +7026,28 @@ static ProcessResult processOperations(HandlerContext& ctx, mlir::Block& block) 
     return result;
 }
 
+static bool IsCustomMetalCall(mlir::Operation* op) {
+    if (op->getName().getStringRef() != "stablehlo.custom_call") {
+        return false;
+    }
+    auto target = op->getAttrOfType<mlir::StringAttr>("call_target_name");
+    return target && target.getValue() == "jax_metallib.metal_kernel";
+}
+
+static bool IsCustomMetalTensorType(mlir::Type type) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
+    if (!tensor || !tensor.hasStaticShape()) {
+        return false;
+    }
+    auto element = tensor.getElementType();
+    if (element.isF16() || element.isF32()) {
+        return true;
+    }
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(element);
+    return integer && (integer.getWidth() == 1 || integer.getWidth() == 8 || integer.getWidth() == 16 ||
+                       integer.getWidth() == 32);
+}
+
 bool MpsExecutable::BuildExecutionPlan() {
     MPS_LOG_DEBUG("BuildExecutionPlan: start, plan_built_=%d\n", plan_built_);
 
@@ -7066,7 +7096,8 @@ bool MpsExecutable::BuildExecutionPlan() {
                             return;
                         std::string inner_name = inner->getName().getStringRef().str();
                         const OpHandler* h = OpRegistry::Find(inner_name);
-                        if ((h && h->is_native()) || ShouldInlineForIntrinsicNative(inner))
+                        if ((h && h->is_native()) || ShouldInlineForIntrinsicNative(inner) ||
+                            IsCustomMetalCall(inner))
                             has_native = true;
                     });
                     if (!has_native)
@@ -7096,6 +7127,21 @@ bool MpsExecutable::BuildExecutionPlan() {
             }
         }
         MPS_LOG_DEBUG("BuildExecutionPlan: inline pass complete\n");
+
+        // Region bodies are lowered into MPSGraph, not native plan steps. Do
+        // not accidentally route a nested kernel through the graph registry.
+        bool has_custom_metal = false;
+        bool nested_custom_metal = false;
+        entry_func_.walk([&](mlir::Operation* op) {
+            if (IsCustomMetalCall(op)) {
+                has_custom_metal = true;
+                nested_custom_metal |= op->getBlock() != &entry_func_.front();
+            }
+        });
+        if (nested_custom_metal) {
+            error_ = "Native Metal custom kernels in nested control-flow regions are not supported";
+            return false;
+        }
 
         {
             mlir::Block& preBlock = entry_func_.front();
@@ -7148,11 +7194,18 @@ bool MpsExecutable::BuildExecutionPlan() {
                         native_handler = nullptr;
                     }
                 }
-                bool is_native = (native_handler != nullptr);
+                // Native transpose aliases describe a strided logical view.
+                // In custom-kernel plans use a device graph transpose instead
+                // so a shader sees the declared contiguous row-major layout.
+                if (has_custom_metal && mlir::isa<mlir::stablehlo::TransposeOp>(op)) {
+                    native_handler = nullptr;
+                }
+                const bool custom_metal = IsCustomMetalCall(op);
+                bool is_native = (native_handler != nullptr) || custom_metal;
 
                 if (is_native) {
 
-                    if (op->getNumResults() != 1) {
+                    if (!custom_metal && op->getNumResults() != 1) {
                         error_ = "Native op '" + op_name + "' must have exactly one result";
                         return false;
                     }
@@ -7207,7 +7260,7 @@ bool MpsExecutable::BuildExecutionPlan() {
                 if (!seg.ops.empty()) {
                     const std::string native_op_name = seg.ops[0]->getName().getStringRef().str();
                     const OpHandler* native_handler = OpRegistry::Find(native_op_name);
-                    if (native_handler && native_handler->is_native()) {
+                    if ((native_handler && native_handler->is_native()) || IsCustomMetalCall(seg.ops[0])) {
                         has_explicit_native_segment = true;
                     }
                     if (seg.ops[0]->hasAttr("__softmax_fused") || seg.ops[0]->hasAttr("__mean_fused") ||
@@ -7388,6 +7441,51 @@ bool MpsExecutable::BuildExecutionPlan() {
                 if (seg.is_native) {
 
                     mlir::Operation* op = seg.ops[0];
+                    if (IsCustomMetalCall(op)) {
+                        if (op->getNumResults() == 0 || op->getNumOperands() + op->getNumResults() > 31) {
+                            error_ =
+                                "Native Metal custom call requires outputs and at most 31 array bindings";
+                            return false;
+                        }
+                        for (mlir::Type type : op->getOperandTypes()) {
+                            if (!IsCustomMetalTensorType(type)) {
+                                error_ = "Native Metal input requires a supported static tensor dtype";
+                                return false;
+                            }
+                        }
+                        for (mlir::Type type : op->getResultTypes()) {
+                            if (!IsCustomMetalTensorType(type)) {
+                                error_ = "Native Metal output requires a supported static tensor dtype";
+                                return false;
+                            }
+                        }
+                        auto config = op->getAttrOfType<mlir::StringAttr>("backend_config");
+                        if (!config) {
+                            error_ = "Native Metal custom call requires a JSON backend_config";
+                            return false;
+                        }
+                        NativeStep ns;
+                        ns.handler = nullptr;
+                        ns.op = op;
+                        ns.baked_kind = NativeStep::BakedKind::kCustomMetal;
+                        ns.custom_kernel =
+                            CustomMetalKernel::Compile(mtl_device, config.getValue().str(),
+                                                       op->getNumOperands(), op->getNumResults(), &error_);
+                        if (!ns.custom_kernel) {
+                            return false;
+                        }
+                        for (mlir::Value operand : op->getOperands()) {
+                            ns.input_slots.push_back(getOrCreateSlot(operand));
+                        }
+                        for (mlir::Value result : op->getResults()) {
+                            ns.custom_output_slots.push_back(getOrCreateSlot(result));
+                        }
+                        ns.output_slot = ns.custom_output_slots.front();
+                        plan->needs_retained_cmd_bufs = true;
+                        plan->native_steps.push_back(std::move(ns));
+                        plan->steps.push_back({Step::NATIVE, plan->native_steps.size() - 1});
+                        continue;
+                    }
                     NativeOpHandler native_handler = seg.native_handler;
                     if (!native_handler) {
                         std::string op_name = op->getName().getStringRef().str();
@@ -8839,6 +8937,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
 
         // Materialized copies of non-contiguous inputs (lazy — only allocated if needed).
         std::vector<std::unique_ptr<MpsBuffer>> materialized_inputs;
+        const bool has_custom_kernel =
+            std::any_of(plan_->native_steps.begin(), plan_->native_steps.end(),
+                        [](const NativeStep& ns) { return ns.custom_kernel != nullptr; });
 
         for (size_t i = 0; i < num_args; i++) {
             MpsBuffer* input = inputs[i];
@@ -8846,6 +8947,11 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                 return ExecutionResult::Error("Null input buffer at index " + std::to_string(i));
             }
             if (__builtin_expect(!input->is_contiguous(), 0)) {
+                if (has_custom_kernel) {
+                    return ExecutionResult::Error(
+                        "Native Metal custom kernels require contiguous row-major inputs; "
+                        "strided input materialization through the host is not supported");
+                }
                 std::string mat_err;
                 auto contig = input->MaterializeContiguous(&mat_err);
                 if (!contig) {
@@ -8864,6 +8970,58 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
             slot_bufs[slot] = mtl_buf;
             slot_producer_events[slot] = input->producer_completion();
         }
+
+        // Normal output/cleanup paths clear these slot pointers when taking
+        // ownership. On any earlier return release remaining custom allocations
+        // without pooling: retained command buffers protect already-encoded GPU
+        // accesses, including work submitted before a later kernel failed.
+        struct CustomOutputOwnership {
+            std::vector<id<MTLBuffer>>& slots;
+            std::vector<SlotId> allocated;
+            ~CustomOutputOwnership() {
+                for (SlotId slot : allocated) {
+                    if (slots[slot]) {
+                        CFRelease((__bridge CFTypeRef)slots[slot]);
+                        slots[slot] = nil;
+                    }
+                }
+            }
+        } custom_outputs{slot_bufs, {}};
+        if (has_custom_kernel) {
+            custom_outputs.allocated.reserve(num_slots);
+        }
+
+        auto encode_custom_kernel = [&](const NativeStep& ns, id<MTLComputeCommandEncoder> encoder,
+                                        const CompletionEvent& completion, std::string* error) -> bool {
+            std::vector<id<MTLBuffer>> buffers;
+            buffers.reserve(ns.input_slots.size() + ns.custom_output_slots.size());
+            for (SlotId slot : ns.input_slots) {
+                if (slot < 0 || (size_t)slot >= slot_bufs.size() || !slot_bufs[slot]) {
+                    *error = "Native Metal custom kernel input buffer is missing";
+                    return false;
+                }
+                buffers.push_back(slot_bufs[slot]);
+            }
+            for (SlotId slot : ns.custom_output_slots) {
+                if (!slot_bufs[slot]) {
+                    const size_t bytes = std::max<size_t>(plan_->slots[slot].byte_size, 4);
+                    slot_bufs[slot] = AcquireReusableOutputBuffer(mtl_device, bytes);
+                    if (!slot_bufs[slot]) {
+                        *error = "Failed to allocate native Metal custom kernel output buffer";
+                        return false;
+                    }
+                    custom_outputs.allocated.push_back(slot);
+                }
+                buffers.push_back(slot_bufs[slot]);
+            }
+            if (!ns.custom_kernel->Encode(encoder, buffers, error)) {
+                return false;
+            }
+            for (SlotId slot : ns.custom_output_slots) {
+                slot_producer_events[(size_t)slot] = completion;
+            }
+            return true;
+        };
 
         static const bool cache_intermediates = !EnvFlagEnabled("JAX_METALLIB_DISABLE_INTERMEDIATE_CACHE");
         static const bool enable_output_pool = OutputBufferPoolEnabled();
@@ -9156,6 +9314,38 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                 input_bufs.clear();
                 for (auto slot : ns.input_slots) {
                     input_bufs.push_back(slot_bufs[slot]);
+                }
+
+                if (ns.custom_kernel) {
+                    if (!ensure_cmd_buf()) {
+                        return ExecutionResult::Error("Failed to create custom Metal command buffer");
+                    }
+                    if (!nativeComputeEncoder) {
+                        nativeComputeEncoder = [cmdBuf computeCommandEncoder];
+                    }
+                    if (!nativeComputeEncoder) {
+                        return ExecutionResult::Error("Failed to create custom Metal compute encoder");
+                    }
+                    [nativeComputeEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    std::string custom_error;
+                    if (!encode_custom_kernel(ns, nativeComputeEncoder, current_cmd_completion,
+                                              &custom_error)) {
+                        [nativeComputeEncoder endEncoding];
+                        return ExecutionResult::Error(custom_error);
+                    }
+                    [nativeComputeEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    ops_in_cmd += 1;
+                    for (SlotId slot : ns.custom_output_slots) {
+                        bytes_in_cmd += plan_->slots[slot].byte_size;
+                    }
+                    if ((step_idx + 1) < plan_->steps.size() &&
+                        ((max_ops_per_cmd > 0 && ops_in_cmd >= max_ops_per_cmd) ||
+                         (max_mb_per_cmd > 0 && (bytes_in_cmd >> 20) >= (size_t)max_mb_per_cmd))) {
+                        if (!flush_native_cmd()) {
+                            return ExecutionResult::Error("Failed to rotate custom Metal command buffer");
+                        }
+                    }
+                    continue;
                 }
 
                 if (ns.baked_kind == NativeStep::BakedKind::kReshapeAlias ||
@@ -10104,6 +10294,24 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                 } else {
 
                     auto& ns = plan_->native_steps[step.index];
+
+                    if (ns.custom_kernel) {
+                        id<MTLComputeCommandEncoder> encoder = ensureMixedNativeEncoder();
+                        if (!encoder) {
+                            return ExecutionResult::Error("Failed to create mixed custom Metal encoder");
+                        }
+                        if (mixedNativeEncoderHasWork) {
+                            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        }
+                        std::string custom_error;
+                        if (!encode_custom_kernel(ns, encoder, cmd_completion, &custom_error)) {
+                            endMixedNativeEncoder();
+                            return ExecutionResult::Error(custom_error);
+                        }
+                        mixedNativeEncoderHasWork = true;
+                        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        continue;
+                    }
 
                     if (ns.baked_kind == NativeStep::BakedKind::kReshapeAlias ||
                         ns.baked_kind == NativeStep::BakedKind::kTransposeAlias) {

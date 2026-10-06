@@ -14,9 +14,12 @@
 
 """Custom Metal kernel API for jax-metallib.
 
-Write Metal compute kernels and execute them on JAX arrays directly on GPU.
+``metal.compile(source, entry_point=...)`` provides device-resident eager/jit
+calls on JAX arrays with explicit output specs and thread counts. The legacy
+interfaces below synchronously copy array data through the host; their grid
+counts threadgroups, not threads.
 
-Usage:
+Legacy usage (1024-element arrays):
     from jax_plugins.silicon import metal
 
     # Simple functional API
@@ -34,7 +37,7 @@ Usage:
                            inputs=[a, b],
                            output_shapes=[(1024,)],
                            output_dtypes=[jnp.float32],
-                           grid=(1024, 1, 1),
+                           grid=(4, 1, 1),
                            threadgroup=(256, 1, 1))
 
     # Object-oriented API with caching
@@ -42,13 +45,15 @@ Usage:
     result = kernel(inputs=[a, b],
                     output_shapes=[(1024,)],
                     output_dtypes=[jnp.float32],
-                    grid=(1024, 1, 1),
+                    grid=(4, 1, 1),
                     threadgroup=(256, 1, 1))
 
     # Decorator API
-    @metal.kernel("my_relu", grid=lambda n: (n, 1, 1), threadgroup=(256, 1, 1))
+    @metal.kernel("my_relu", grid=(4, 1, 1), threadgroup=(256, 1, 1))
     def relu_source():
         return '''
+        #include <metal_stdlib>
+        using namespace metal;
         kernel void my_relu(device const float* x [[buffer(0)]],
                             device float* y [[buffer(1)]],
                             uint gid [[thread_position_in_grid]]) {
@@ -67,6 +72,9 @@ from collections.abc import Callable, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from ._native_metal import CompiledMetalKernel as CompiledMetalKernel
+from ._native_metal import compile_kernel as compile  # noqa: A004, F401 -- public API re-export
 
 try:
     import Metal
@@ -248,7 +256,7 @@ def execute(
         >>> out = metal.execute(source, "scale",
         ...     inputs=[x], output_shapes=[(1024,)], output_dtypes=[jnp.float32],
         ...     constants={2: 3.14},
-        ...     grid=(1024, 1, 1), threadgroup=(256, 1, 1))
+        ...     grid=(4, 1, 1), threadgroup=(256, 1, 1))
     """
     if len(output_shapes) != len(output_dtypes):
         raise ValueError("output_shapes and output_dtypes must have same length")
