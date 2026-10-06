@@ -840,6 +840,22 @@ inline uint rd_nan(half v) { return (uint(as_type<ushort>(v)) & 0x7fffu) > 0x7c0
 inline float rd_qnan_like(float) { return as_type<float>(0x7fc00000u); }
 inline half rd_qnan_like(half) { return as_type<half>((ushort)0x7e00u); }
 
+// Order keys for exact max/min. f32 subnormals flush to a zero of the same sign
+// (XLA:CPU does this), and -0 orders below +0. Comparing the keys as signed
+// integers gives the XLA order; NaN is tracked separately by the callers.
+// Half inputs widen to normal floats, so their subnormals are kept.
+inline int rd_key(float f) {
+  int b = as_type<int>(f);
+  if ((b & 0x7f800000) == 0) b &= int(0x80000000u);
+  return b < 0 ? (b ^ 0x7fffffff) : b;
+}
+inline int4 rd_key4(float4 f) {
+  int4 b = as_type<int4>(f);
+  b = select(b, b & int4(int(0x80000000u)), (b & int4(0x7f800000)) == int4(0));
+  return select(b, b ^ int4(0x7fffffff), b < int4(0));
+}
+inline float rd_unkey(int k) { return as_type<float>(k < 0 ? (k ^ 0x7fffffff) : k); }
+
 #define REDUCE_MINMAX_LAST_TG(NAME, T, V4, OP, INIT) \
 kernel void NAME(device const T* x [[buffer(0)]], device T* y [[buffer(1)]], \
                  constant uint& rows [[buffer(2)]], constant uint& cols [[buffer(3)]], \
@@ -850,25 +866,25 @@ kernel void NAME(device const T* x [[buffer(0)]], device T* y [[buffer(1)]], \
                  uint tg_size [[threads_per_threadgroup]]) { \
   if (row >= rows) return; \
   uint base = row * cols; \
-  float acc = INIT; \
+  int acc = rd_key(INIT); \
   uint nan_seen = 0u; \
   uint vec8_cols = cols & ~7u; \
   for (uint i = tid * 8; i < vec8_cols; i += tg_size * 8) { \
     V4 v0 = *reinterpret_cast<device const V4*>(x + base + i); \
     V4 v1 = *reinterpret_cast<device const V4*>(x + base + i + 4); \
     nan_seen |= rd_nan4(v0) | rd_nan4(v1); \
-    float4 f0 = float4(v0), f1 = float4(v1); \
-    acc = OP(acc, OP(OP(OP(f0[0], f0[1]), OP(f0[2], f0[3])), OP(OP(f1[0], f1[1]), OP(f1[2], f1[3])))); \
+    int4 k = OP(rd_key4(float4(v0)), rd_key4(float4(v1))); \
+    acc = OP(acc, OP(OP(k[0], k[1]), OP(k[2], k[3]))); \
   } \
   for (uint i = vec8_cols + tid; i < cols; i += tg_size) { \
     T v = x[base + i]; \
     nan_seen |= rd_nan(v); \
-    acc = OP(acc, float(v)); \
+    acc = OP(acc, rd_key(float(v))); \
   } \
-  float simd_acc = simd_##OP(acc); \
+  int simd_acc = simd_##OP(acc); \
   uint simd_nan = simd_max(nan_seen); \
   constexpr uint kMaxSimdGroups = 32; \
-  threadgroup float partial[kMaxSimdGroups]; \
+  threadgroup int partial[kMaxSimdGroups]; \
   threadgroup uint partial_nan[kMaxSimdGroups]; \
   if (lane == 0) { \
     partial[simd_group] = simd_acc; \
@@ -877,11 +893,11 @@ kernel void NAME(device const T* x [[buffer(0)]], device T* y [[buffer(1)]], \
   threadgroup_barrier(mem_flags::mem_threadgroup); \
   if (simd_group == 0) { \
     uint num_simd = (tg_size + 31) >> 5; \
-    float block = (lane < num_simd) ? partial[lane] : INIT; \
+    int block = (lane < num_simd) ? partial[lane] : rd_key(INIT); \
     uint block_nan = (lane < num_simd) ? partial_nan[lane] : 0u; \
-    float total = simd_##OP(block); \
+    int total = simd_##OP(block); \
     uint any_nan = simd_max(block_nan); \
-    if (lane == 0) y[row] = any_nan ? rd_qnan_like(T(0)) : T(total); \
+    if (lane == 0) y[row] = any_nan ? rd_qnan_like(T(0)) : T(rd_unkey(total)); \
   } \
 }
 REDUCE_MINMAX_LAST_TG(reduce_max_last_f16_tg, half, half4, max, -INFINITY)
@@ -930,22 +946,22 @@ kernel void NAME(device const T* x [[buffer(0)]], device T* y [[buffer(1)]], \
                  uint gid [[thread_position_in_grid]]) { \
   if (gid < rows) { \
     uint base = gid * cols; \
-    float acc = INIT; \
+    int acc = rd_key(INIT); \
     uint nan_seen = 0u; \
     uint vec8_cols = cols & ~7u; \
     for (uint i = 0; i < vec8_cols; i += 8) { \
       V4 v0 = *reinterpret_cast<device const V4*>(x + base + i); \
       V4 v1 = *reinterpret_cast<device const V4*>(x + base + i + 4); \
       nan_seen |= rd_nan4(v0) | rd_nan4(v1); \
-      float4 f0 = float4(v0), f1 = float4(v1); \
-      acc = OP(acc, OP(OP(OP(f0[0], f0[1]), OP(f0[2], f0[3])), OP(OP(f1[0], f1[1]), OP(f1[2], f1[3])))); \
+      int4 k = OP(rd_key4(float4(v0)), rd_key4(float4(v1))); \
+      acc = OP(acc, OP(OP(k[0], k[1]), OP(k[2], k[3]))); \
     } \
     for (uint i = vec8_cols; i < cols; ++i) { \
       T v = x[base + i]; \
       nan_seen |= rd_nan(v); \
-      acc = OP(acc, float(v)); \
+      acc = OP(acc, rd_key(float(v))); \
     } \
-    y[gid] = nan_seen ? rd_qnan_like(T(0)) : T(acc); \
+    y[gid] = nan_seen ? rd_qnan_like(T(0)) : T(rd_unkey(acc)); \
   } \
 }
 REDUCE_MINMAX_LAST_LIN(reduce_max_last_f16_lin, half, half4, max, -INFINITY)

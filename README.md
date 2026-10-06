@@ -352,6 +352,7 @@ stable specification of every internal tuning flag.
 | `JAX_METALLIB_DISABLE_ELEMENTWISE_FUSION` | Off | Disable native elementwise-chain fusion |
 | `JAX_METALLIB_DISABLE_NATIVE_SCALAR_INIT` | Off | Keep scalar init constants of native reduce, sort and softmax steps in MPSGraph instead of baking them at plan time |
 | `JAX_METALLIB_DISABLE_CONSTANT_SINK` | Off | Keep graph constants at their block position instead of moving them next to their first user |
+| `JAX_METALLIB_DISABLE_NATIVE_ROW_MINMAX` | Off | Keep per-row last-axis max/min on MPSGraph instead of the native row kernel |
 | `JAX_METALLIB_JACOBI_EARLY_EXIT` | `1` | `0` runs the eigh/SVD Jacobi paths for a fixed 12 sweeps |
 | `JAX_METALLIB_LOOP_UNROLL` | `8` | Counted-loop unroll limit, clamped to 1–32; `1` disables it |
 | `JAX_METALLIB_AUTOTUNE_CACHE_DIR` | `~/.cache/jax-silicon` | Directory for autotune choices, not compiled custom Metal pipelines |

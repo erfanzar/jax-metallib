@@ -330,6 +330,14 @@ static MPSGraphExecutionDescriptor* GraphExecutionDescriptor() {
 // abort and the broadcast-ordering wrong-results are fixed (0.11.1.0). Opt in
 // with JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS=1 for experiments;
 // JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS=1 always wins.
+// Multi-row (per-row) last-axis max/min take the native row kernel, which
+// propagates NaN through a separate flag like XLA does.
+// JAX_METALLIB_DISABLE_NATIVE_ROW_MINMAX=1 keeps them in MPSGraph.
+static bool NativeRowMinMaxEnabled() {
+    static const bool enabled = !EnvFlagEnabled("JAX_METALLIB_DISABLE_NATIVE_ROW_MINMAX");
+    return enabled;
+}
+
 static bool IntrinsicNativeKernelsEnabled() {
     if (EnvFlagEnabled("JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS")) {
         return false;
@@ -2254,7 +2262,9 @@ static IntrinsicNativeKind ClassifyReduceKind(mlir::Operation* op) {
             }
             // Full reduce to a scalar: max/min also win big natively (the
             // MPSGraph full-reduce path is effectively serial, ~45ns/elem).
-            if (static_cast<int64_t>(dims2.size()) == rank2) {
+            // Per-row max/min follow NativeRowMinMaxEnabled() so this agrees
+            // with the default-mode routing gate.
+            if (static_cast<int64_t>(dims2.size()) == rank2 || NativeRowMinMaxEnabled()) {
                 if (body2 == "stablehlo.maximum") {
                     return IntrinsicNativeKind::kReduceMaxLastAxis;
                 }
@@ -6203,13 +6213,16 @@ static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
             auto dims = reduceOp.getDimensions();
             if (inType && inType.hasStaticShape() &&
                 IsSuffixReduceDimensions(dims, static_cast<int64_t>(inType.getRank()))) {
+                const bool row_minmax = NativeRowMinMaxEnabled();
                 IntrinsicNativeKind bypassKind = IntrinsicNativeKind::kNone;
                 if (bodyName == "stablehlo.add") {
                     bypassKind = IntrinsicNativeKind::kReduceSumLastAxis;
-                } else if (static_cast<int64_t>(dims.size()) == static_cast<int64_t>(inType.getRank()) &&
+                } else if ((row_minmax || static_cast<int64_t>(dims.size()) ==
+                                              static_cast<int64_t>(inType.getRank())) &&
                            bodyName == "stablehlo.maximum") {
                     bypassKind = IntrinsicNativeKind::kReduceMaxLastAxis;
-                } else if (static_cast<int64_t>(dims.size()) == static_cast<int64_t>(inType.getRank()) &&
+                } else if ((row_minmax || static_cast<int64_t>(dims.size()) ==
+                                              static_cast<int64_t>(inType.getRank())) &&
                            bodyName == "stablehlo.minimum") {
                     bypassKind = IntrinsicNativeKind::kReduceMinLastAxis;
                 }
