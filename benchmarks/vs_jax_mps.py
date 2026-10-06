@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
 import subprocess
 import sys
 import textwrap
@@ -881,6 +882,46 @@ def run_one_benchmark(
         return None
 
 
+# Prints JAX's version and the installed plugin distributions, so a run records
+# which jax-mps release it compared against, not only the JAX version.
+VERSION_SNIPPET = (
+    "import importlib.metadata as m, jax; "
+    "names = {d.metadata['Name'] for d in m.distributions()}; "
+    "print('JAX', jax.__version__, [n + ' ' + m.version(n) for n in ('jax-metallib', 'jax-mps') if n in names])"
+)
+
+
+def _aggregate(runs: list[dict | None]) -> dict | None:
+    """Median of per-process medians; None when every run failed."""
+    ok = [r for r in runs if r]
+    if not ok:
+        return None
+    medians = [r["median_ms"] for r in ok]
+    return {
+        "median_ms": statistics.median(medians),
+        "run_medians_ms": medians,
+        "failed_runs": len(runs) - len(ok),
+    }
+
+
+def measure_pair(args, name: str, source: str) -> tuple[dict | None, dict | None, str]:
+    """Run both backends in fresh processes, alternating order to cancel order effects.
+
+    ``ab`` runs jax-metallib then jax-mps once per cycle. ``abba`` runs A B B A per
+    cycle, so each backend goes first equally often. Returns the aggregated result
+    per backend and pairwise jax-metallib wins (run i of A against run i of B).
+    """
+    order = ("silicon", "jax-mps") if args.order == "ab" else ("silicon", "jax-mps", "jax-mps", "silicon")
+    pythons = {"silicon": args.jax_metallib_python, "jax-mps": args.jax_mps_python}
+    runs: dict[str, list[dict | None]] = {"silicon": [], "jax-mps": []}
+    for _ in range(args.cycles):
+        for label in order:
+            runs[label].append(run_one_benchmark(pythons[label], name, source, label, args.timeout))
+    pairs = [(s["median_ms"], m["median_ms"]) for s, m in zip(runs["silicon"], runs["jax-mps"], strict=True) if s and m]
+    wins = sum(1 for s, m in pairs if s <= m)
+    return _aggregate(runs["silicon"]), _aggregate(runs["jax-mps"]), f"{wins}/{len(pairs)}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="jax-metallib vs jax-mps benchmark")
     parser.add_argument(
@@ -904,7 +945,21 @@ def main():
         default=120,
         help="Timeout per benchmark in seconds",
     )
+    parser.add_argument(
+        "--order",
+        choices=("ab", "abba"),
+        default="abba",
+        help="ab: jax-metallib first every time (biased); abba: alternate which backend runs first",
+    )
+    parser.add_argument(
+        "--cycles",
+        type=int,
+        default=1,
+        help="Repetitions of the order pattern; use 3 before calling a workload a win or loss",
+    )
     args = parser.parse_args()
+    if args.cycles < 1:
+        parser.error("--cycles must be >= 1")
 
     # Verify interpreters exist
     for label, path in [("jax-metallib", args.jax_metallib_python), ("jax-mps", args.jax_mps_python)]:
@@ -917,12 +972,12 @@ def main():
     for label, pybin in [("jax-metallib", args.jax_metallib_python), ("jax-mps", args.jax_mps_python)]:
         try:
             out = subprocess.check_output(
-                [pybin, "-c", "import jax; print(jax.__version__)"],
+                [pybin, "-c", VERSION_SNIPPET],
                 text=True,
                 timeout=10,
                 env=_benchmark_env(),
             ).strip()
-            print(f"{label}: JAX {out}")
+            print(f"{label}: {out}")
         except Exception as e:
             print(f"{label}: version check failed: {e}")
 
@@ -930,7 +985,7 @@ def main():
     if args.filter:
         benchmarks = [(n, d, s) for n, d, s in benchmarks if args.filter in n]
 
-    print(f"\nRunning {len(benchmarks)} benchmarks...\n")
+    print(f"\nRunning {len(benchmarks)} benchmarks (order={args.order}, cycles={args.cycles})...\n")
     print(f"{'Benchmark':<40} {'jax-metallib (ms)':>18} {'jax-mps (ms)':>18} {'Speedup':>10}")
     print("-" * 90)
 
@@ -939,8 +994,7 @@ def main():
         sys.stdout.write(f"{name:<40} ")
         sys.stdout.flush()
 
-        silicon_result = run_one_benchmark(args.jax_metallib_python, name, source, "silicon", args.timeout)
-        mps_result = run_one_benchmark(args.jax_mps_python, name, source, "jax-mps", args.timeout)
+        silicon_result, mps_result, pairwise = measure_pair(args, name, source)
 
         silicon_ms = silicon_result["median_ms"] if silicon_result else None
         mps_ms = mps_result["median_ms"] if mps_result else None
@@ -961,7 +1015,7 @@ def main():
         else:
             speedup_str = "  both FAIL"
 
-        print(f"{silicon_str} {mps_str} {speedup_str}")
+        print(f"{silicon_str} {mps_str} {speedup_str}  pairs {pairwise}")
 
         results.append(
             {
@@ -970,6 +1024,9 @@ def main():
                 "silicon": silicon_result,
                 "jax_mps": mps_result,
                 "speedup": (mps_ms / silicon_ms) if (silicon_ms and mps_ms) else None,
+                "pairwise_silicon_wins": pairwise,
+                "order": args.order,
+                "cycles": args.cycles,
             }
         )
 
