@@ -1,511 +1,475 @@
-<!-- markdownlint-disable MD033 MD045 MD041 -->
+# jax-metallib
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/jax-ml/jax/main/images/jax_logo_250px.png">
-    <img alt="JAX" src="https://raw.githubusercontent.com/jax-ml/jax/main/images/jax_logo_250px.png" width="120">
-  </picture>
-  <br>
-  <strong>jax-metallib</strong>
-  <br>
-  <em>Run JAX on Apple Metal GPUs</em>
-</p>
+A [PJRT](https://openxla.org/xla/pjrt_integration) plugin for running
+[JAX](https://github.com/jax-ml/jax) on Apple Silicon GPUs. The backend name is
+`mps`. It accepts StableHLO from JAX and executes it through MPSGraph, Metal
+compute kernels, and selected CPU fallbacks.
 
-<p align="center">
-  <a href="https://github.com/erfanzar/jax-metallib/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"></a>
-  <a href="https://pypi.org/project/jax-metallib/"><img alt="PyPI" src="https://img.shields.io/pypi/v/jax-metallib.svg"></a>
-  <a href="https://pypi.org/project/jax-metallib/"><img alt="Python" src="https://img.shields.io/pypi/pyversions/jax-metallib.svg"></a>
-  <a href="https://github.com/erfanzar/jax-metallib"><img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-lightgrey.svg"></a>
-</p>
+The package is experimental. Support depends on the operation, dtype, shape,
+and JAX lowering; it is not a complete replacement for the CPU backend.
+This README describes the current source tree.
 
----
+## Requirements
 
-**jax-metallib** is a [PJRT](https://openxla.org/xla/pjrt_integration) plugin that enables [JAX](https://github.com/jax-ml/jax) to run on Apple Metal GPUs. It compiles [StableHLO](https://github.com/openxla/stablehlo) IR to Metal compute kernels via [MPSGraph](https://developer.apple.com/documentation/metalperformanceshadersgraph), giving JAX programs native GPU acceleration on M-series Macs — no code changes required.
+| Requirement | Supported configuration |
+| --- | --- |
+| Hardware | Apple Silicon Mac |
+| Runtime OS | macOS 15.0 or later |
+| Python | 3.12 or later; configured wheel builds target CPython 3.12 and 3.13 |
+| JAX and jaxlib | `>=0.11.0,<0.12` |
+| Source-build tools | Xcode 26 or later with the macOS SDK, CMake 3.20+, Ninja, and a C++17 compiler |
 
-## Highlights
+The runtime minimum and build SDK are different requirements. CMake sets a
+macOS 15.0 deployment target, but the source also references Metal declarations
+that require the newer SDK. macOS 13 and 14 are not supported.
 
-- **120 StableHLO ops** — from basic arithmetic through convolutions, FFTs, linear algebra (Cholesky, QR, SVD), sorting, and control flow
-- **Drop-in acceleration** — set `JAX_PLATFORMS=mps` and existing JAX code runs on the Metal GPU
-- **Full gradient support** — `jax.grad`, `jax.value_and_grad`, and higher-order derivatives work out of the box
-- **JIT kernel fusion** — consecutive elementwise ops are fused into single Metal Shading Language kernels at runtime
-- **Native MPS kernels** — performance-critical operations (Cholesky decomposition, triangular solve, softmax, LayerNorm) use native kernels directly, bypassing the graph compiler
-- **Mixed-precision GEMM** — large fp32 matmuls automatically run at fp16 speed via graph-level cast (optional, controlled by env var)
-- **Single-pass softmax** — transformer-scale softmax (≤ 8192 features) uses a fused single-kernel path, eliminating an extra dispatch
-- **Custom Metal kernel API** — write and execute raw Metal Shading Language kernels directly on JAX arrays
-- **Quantization support** — MX microscaling formats (MXFP4, MXFP8, NVFP4) and affine quantization for inference optimization
-- **Executable serialization** — compiled programs can be serialized and deserialized for AOT compilation and `jax.jit` caching
-- **Framework integration** — tested with [Flax](https://github.com/google/flax) (NNX) and [NumPyro](https://github.com/pyro-ppl/numpyro)
-
-## Quick Start
-
-### Install
+## Install and select the backend
 
 ```bash
-pip install jax-metallib
+python -m pip install jax-metallib
+JAX_PLATFORMS=mps python -c 'import jax; print(jax.devices())'
 ```
 
-### Verify
+When initialization succeeds and `JAX_PLATFORMS` is unset, the plugin's
+registration priority normally makes MPS the default backend. Set
+`JAX_PLATFORMS=mps` explicitly to require it rather than silently using CPU if
+initialization fails. Set the variable before importing JAX.
+
+For programs that need both backends:
 
 ```bash
-JAX_PLATFORMS=mps python -c "import jax; print(jax.devices())"
+JAX_PLATFORMS=cpu,mps python your_program.py
 ```
 
-### Run
+The first platform in that list is the default. Select MPS for particular work
+with `jax.default_device(jax.devices("mps")[0])` or move arrays explicitly with
+`jax.device_put`.
+
+### Example
+
+Run this with `JAX_PLATFORMS=mps`:
 
 ```python
 import jax
 import jax.numpy as jnp
 
-x = jnp.ones((1024, 1024))
-y = x @ x
-
-f = jax.jit(jax.grad(lambda x: jnp.sum(jnp.tanh(x))))
-grads = f(x)
+print(jax.devices())
+x = jnp.ones((128, 128), dtype=jnp.float32)
+y = jax.jit(lambda a: a @ a)(x)
+grad = jax.jit(jax.grad(lambda a: jnp.sum(jnp.tanh(a))))(x)
+y.block_until_ready()
+grad.block_until_ready()
 ```
 
-## Requirements
+JAX differentiation works by lowering derivative computations to supported
+operations. That does not give arbitrary Metal source an automatic derivative
+or batching rule.
 
-| Requirement | Version                                |
-| ----------- | -------------------------------------- |
-| macOS       | 15.0+ (Sequoia)                        |
-| Hardware    | Apple Silicon (M1 / M2 / M3 / M4 / M5) |
-| Python      | 3.12 or 3.13                           |
-| JAX         | 0.11.x                                 |
-| jaxlib      | 0.11.x                                 |
+## Build from source
 
-> **Note:** The plugin is built with a macOS 15.0 deployment target. It calls MPSGraph and Accelerate APIs introduced in macOS 13.1–15.0 (for example `reinterpretCastTensor`, bfloat16, the FFT and complex-part ops, and `sliceUpdateDataTensor`) without runtime fallbacks, so it does not support macOS 13 or 14.
-
-## Build from Source
-
-Building from source compiles the native Metal plugin (~6 MB shared library). The first build automatically bootstraps LLVM/MLIR and StableHLO dependencies, which takes about 30 minutes.
+Install [uv](https://docs.astral.sh/uv/) and Xcode, select the Xcode toolchain,
+then run:
 
 ```bash
 brew install cmake ninja
-
 git clone https://github.com/erfanzar/jax-metallib.git
 cd jax-metallib
+./scripts/setup_deps.sh
 uv sync --all-groups
 uv pip install -e .
 ```
 
-To skip the automatic dependency bootstrap (if you manage LLVM/MLIR yourself):
+The setup script builds static LLVM/MLIR, StableHLO, Abseil, and Protobuf
+dependencies under `~/.local/jax-metallib-deps` and installs the PJRT C API
+header. Its default source pins are:
+
+| Dependency | Revision or version |
+| --- | --- |
+| XLA / PJRT header | `dcf304bc5dca1932b99f740b911dbd73631a1a69` |
+| LLVM / MLIR | `6d1ace547c9f9ecf7df9ab87e2db74b5bd3f199d` |
+| StableHLO | `7b1b15781ccbd770f50c7eef4b0c3e03834649fd` |
+| Abseil | `20250127.0` |
+| Protobuf | `29.3` |
+
+These pins are selected for jaxlib 0.11.1. The PJRT header must match the ABI
+expected by jaxlib; the package's dependency range alone is not a compatibility
+test for every permitted version.
+
+CMake can invoke the setup script automatically when the PJRT header is
+missing and `JAX_METALLIB_AUTO_SETUP_DEPS` is enabled. It does not check whether
+all installed dependencies are current. The script skips existing MLIR and
+StableHLO installations based on file presence. After changing dependency
+pins, use a fresh prefix or `./scripts/setup_deps.sh --force`; `--force` removes
+installed dependency markers and build directories before rebuilding.
+
+To use dependencies you have installed yourself:
 
 ```bash
 CMAKE_ARGS="-DJAX_METALLIB_AUTO_SETUP_DEPS=OFF" uv pip install -e .
 ```
 
-### Native Dependencies
+Use `JAX_METALLIB_DEPS_PREFIX` as a CMake setting, or the setup script's
+`--prefix` option, to change the dependency location.
 
-The bootstrap script (`scripts/setup_deps.sh`) fetches and builds the following into `~/.local/jax-metallib-deps`:
+## Operation support and limits
 
-| Dependency  | Version | Purpose                                          |
-| ----------- | ------- | ------------------------------------------------ |
-| LLVM + MLIR | `6d1ace5` (override) | MLIR infrastructure, StableHLO dialect support. The build uses the LLVM commit integrated by the pinned StableHLO revision so MLIR's C++ API matches what StableHLO expects. |
-| StableHLO   | `7b1b157` | IR parsing, serialization, dialect definitions   |
-| Abseil      | 20250127.0 | C++ utilities (strings, status, synchronization) |
-| Protobuf    | 29.3 | Device assignment protocol buffer serialization  |
+Handlers cover the following families. A registered name is not a guarantee
+that every dtype, shape, or custom computation is supported.
 
-> **Note:** The build script auto-resolves the correct commits. The table above reflects the actual pins in `scripts/setup_deps.sh`.
+| Family | Examples |
+| --- | --- |
+| Elementwise | Arithmetic, comparisons, trigonometric functions, exponentials, logs, rounding, special functions, bitwise operations |
+| Shape and indexing | Broadcast, reshape, transpose, slice, dynamic slice/update, gather, scatter, padding, conversion, bitcast |
+| Reductions | Sum, product, extrema, integer/bool and/or/xor, argmin/argmax, window reductions, batch normalization |
+| Convolution | Floating-point 1D/2D/3D convolution; integer 1D/2D convolution |
+| Linear algebra | Dot products, Cholesky, triangular solve, QR, eig/eigh, SVD, Schur, Hessenberg and tridiagonal reduction |
+| FFT | FFT, IFFT, RFFT, IRFFT |
+| Sorting | Sort, top-k, and an exact selection lowering for the `ApproxTopK` custom call |
+| Random | Python ThreeFry/Philox lowerings and direct StableHLO random handlers with separate restrictions |
+| Control flow | While/counting loops, case, function calls, elementwise map, optimization barriers |
+| Collectives | Single-replica identity behavior; no inter-device communication |
 
-## Supported Operations
+Important restrictions:
 
-120 operations are registered across StableHLO, CHLO, and MHLO dialects:
+- **One device, one process.** The client exposes the system-default Metal
+  device. Multi-replica and multi-partition execution are not implemented.
+- **Static shapes.** Runtime slice indices are supported, but general runtime
+  shape polymorphism is not. Dynamic reshape and broadcast require constant
+  output dimensions. `set_dimension_size` does not resize storage.
+- **Dtypes vary by operation.** Do not assume `jax_enable_x64` enables full
+  float64 or complex128 execution. Some integer operations support only
+  8/16/32-bit values, even though buffers and constants can represent int64.
+- **Scatter and reducers have recognized bodies.** Ordinary scatter supports
+  selected set/arithmetic/bool update forms, not arbitrary `x.at[i].apply(f)`.
+  General user-defined sort comparators and reduction regions are not fully
+  interpreted.
+- **Convolution grouping is limited.** Floating forward batch grouping is
+  emulated with at most four convolution calls. Integer batch grouping,
+  integer 3D convolution, and transposed batch grouping are rejected.
+- **Linear algebra has size and algorithm limits.** Real QR is float32-only
+  with at most 128 Householder steps. Real Cholesky/triangular-solve graph
+  fallbacks inside control flow are limited to matrix order 256. The Python
+  eig/eigh/SVD lowerings use float32 internal arithmetic and bounded iterative
+  algorithms. Partial `eigh` subsets and Schur eigenvalue sorting are not
+  supported.
+- **Random lowerings are not interchangeable.** Eligible public
+  `lax.rng_bit_generator` calls use Python ThreeFry/Philox expansion, including
+  `uint32` output and state updates. This requires a `uint32[4]` key, static
+  output shape, and fewer than `2**32` output elements. Direct/unexpanded
+  StableHLO `rng_bit_generator` still rejects `uint32`, ignores the input
+  state, and returns a fixed zero state; it is not a stateful algorithm
+  replacement. Disabling the Python lowering exposes those restrictions.
+- **Numerical differences remain.** Tests use per-operation tolerances and
+  targeted bitwise checks, not a blanket guarantee of equality with CPU.
+  Some special functions use approximations. Eligible float32 matmuls narrow
+  inputs by default; see the precision setting below.
 
-<details>
-<summary><strong>Unary operations</strong> (50 ops)</summary>
+Unsupported operations and custom-call targets report diagnostics with the
+operation name and, where available, shape/type information. Native custom
+Metal kernels have additional restrictions listed below.
 
-`abs` `cbrt` `ceil` `cosine` `count_leading_zeros` `exponential` `exponential_minus_one` `erf` `floor` `imag` `is_finite` `log` `log_plus_one` `logistic` `negate` `real` `round_nearest_even` `rsqrt` `sign` `sine` `sqrt` `tan` `tanh` `complex`
+## Execution paths
 
-CHLO: `acos` `acosh` `asin` `asinh` `atanh` `bessel_i1e` `conj` `cosh` `digamma` `erf_inv` `erfc` `is_inf` `is_neg_inf` `is_pos_inf` `lgamma` `sinh` `square`
+JAX lowers a program to StableHLO. The PJRT layer passes it to the parser,
+which deserializes the module and inlines functions. The execution planner
+then creates an ordered sequence of:
 
-MHLO: `tan` `atan2` `cbrt` `is_finite` `round_nearest_even` `rsqrt` `sign` `exponential_minus_one` `log_plus_one` (aliases)
+1. **MPSGraph segments:** operation handlers build graphs that are compiled
+   and encoded through MPSGraph.
+2. **Native steps:** Metal or MPS kernels operate on `MTLBuffer` objects.
+   Eligible reductions, sorts, and softmax patterns have native routes;
+   `metal.compile` calls use a separate native custom-call path.
+3. **CPU steps:** selected small GEMMs, sorts, and Cholesky decompositions use
+   Accelerate BLAS/vDSP/LAPACK routines.
 
-</details>
+Eligible native elementwise chains can be combined into generated MSL kernels.
+This does not fuse arbitrary user-written Metal kernels.
 
-<details>
-<summary><strong>Binary operations</strong> (15 ops)</summary>
+The optional intrinsic-kernel family, including LayerNorm fusion and additional
+GEMM/elementwise routing, is disabled by default. Enabling it is experimental.
+That switch does not disable every native route: standalone reductions,
+sorting, softmax, registered native handlers, and custom Metal calls have
+separate eligibility rules.
 
-`add` `atan2` `clamp` `compare` `divide` `dot` `dot_general` `maximum` `minimum` `multiply` `power` `remainder` `select` `subtract`
+Outputs carry completion events. Use `block_until_ready()` when measuring
+execution time or when the host needs completion; host readback also waits.
+Buffer release waits for GPU completion before storage can be reused.
 
-CHLO: `next_after`
+Executable serialization saves a StableHLO portable artifact. Loading it
+parses and recompiles the program; it does not restore compiled Metal pipelines
+or MPSGraph executable state.
 
-</details>
+## Custom Metal kernels
 
-<details>
-<summary><strong>Shape & indexing</strong> (19 ops)</strong></summary>
+### Native JAX-array API
 
-`bitcast_convert` `broadcast` `broadcast_in_dim` `concatenate` `convert` `dynamic_broadcast_in_dim` `dynamic_reshape` `dynamic_slice` `dynamic_update_slice` `gather` `get_dimension_size` `pad` `reshape` `reverse` `scatter` `set_dimension_size` `slice` `transpose` `custom_call` (Sharding)
+`metal.compile` returns a callable whose outputs are JAX arrays and whose calls
+can appear inside `jax.jit`. Source compilation happens when the backend
+compiles the program, not when the Python callable is created. Inputs and
+outputs use the plugin's Metal buffers without the legacy NumPy/PyObjC bridge.
+This API is independent of the optional intrinsic-kernel flag.
 
-</details>
+```python
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax_plugins.silicon import metal
 
-<details>
-<summary><strong>Reductions</strong> (6 ops)</summary>
+source = """
+#include <metal_stdlib>
+using namespace metal;
+kernel void scale_add(device const float* a [[buffer(0)]],
+                      device const float* b [[buffer(1)]],
+                      device float* out [[buffer(2)]],
+                      constant float& scale [[buffer(3)]],
+                      constant uint& n [[buffer(4)]],
+                      uint gid [[thread_position_in_grid]]) {
+    if (gid < n) out[gid] = a[gid] * scale + b[gid];
+}
+"""
+scale_add = metal.compile(source, entry_point="scale_add")
 
-`reduce` (sum, product, max, min, and, or, argmax, argmin) `reduce_window` `select_and_scatter` `batch_norm_inference` `batch_norm_training` `batch_norm_grad`
+@jax.jit
+def compute(a, b):
+    return scale_add(
+        a, b,
+        out=jax.ShapeDtypeStruct(a.shape, a.dtype),
+        threads=a.size,
+        threadgroup=256,
+        constants={3: np.float32(2), 4: np.uint32(a.size)},
+    ) + 1
 
-</details>
-
-<details>
-<summary><strong>Convolution</strong></summary>
-
-`convolution` — full `conv_general_dilated` with arbitrary padding, dilation, strides, feature grouping, and batch grouping
-
-</details>
-
-<details>
-<summary><strong>Linear algebra</strong></summary>
-
-`cholesky` (native MPS kernel + LAPACK fallback for small batches) `triangular_solve` (native MPS kernel)
-
-</details>
-
-<details>
-<summary><strong>Other categories</strong></summary>
-
-| Category        | Operations                                                                                  |
-| --------------- | ------------------------------------------------------------------------------------------- |
-| Bitwise         | `and` `or` `xor` `not` `shift_left` `shift_right_logical` `shift_right_arithmetic` `popcnt` |
-| FFT             | `fft` (FFT, RFFT, IFFT, IRFFT)                                                              |
-| Sort            | `sort` `top_k` (MHLO: `topk`)                                                               |
-| Random          | `rng` `rng_bit_generator` (Threefry / Philox)                                               |
-| Tensor creation | `constant` `iota`                                                                           |
-| Control flow    | `while` `case` (if/else) `custom_call` `return`                                               |
-| Collective      | `all_reduce` `all_gather` `reduce_scatter` `collective_permute`                             |
-| Higher-order    | `map`                                                                                       |
-
-</details>
-
-Encountering an unsupported op prints a diagnostic with a direct link to [file a feature request](https://github.com/erfanzar/jax-metallib/issues/new?template=missing-op.yml).
-
-## Architecture
-
-```md
-JAX Python program
-        │
-        ▼
-  StableHLO IR (MLIR bytecode)          ← jax.jit compiles Python to StableHLO
-        │
-        ▼
-  PJRT C API layer                      ← pjrt_api.cc exposes client/device/buffer/exec
-        │
-        ▼
-  StableHLO Parser                      ← deserializes + inlines MLIR modules
-        │
-        ▼
-  Execution Plan Builder                ← walks ops, groups into MPSGraph segments
-        │                                  + native MPS kernel steps + fused MSL kernels
-        ├──► MPSGraph segments           ← op handlers build compute graphs
-        │         │
-        │         ▼
-        │    Metal command buffer        ← compiled & dispatched to GPU
-        │
-        ├──► Native MPS kernels          ← direct kernel dispatch (Cholesky, Softmax, etc.)
-        │         │
-        │         ▼
-        │    Device memory (MTLBuffer)   ← results flow back to JAX as DeviceArrays
-        │
-        └──► Fused MSL kernels           ← JIT-fused elementwise chains
-                  │
-                  ▼
-         Device memory (MTLBuffer)
+with jax.default_device(jax.devices("mps")[0]):
+    a = jnp.ones(1024, dtype=jnp.float32)
+    result = compute(a, a)
+    result.block_until_ready()
+    print(result[0])  # 4.0
 ```
 
-The plugin implements three execution models that are interleaved within a single program:
+Binding and launch rules:
 
-1. **Graph execution** — Consecutive ops are batched into an `MPSGraph`, compiled to a Metal compute pipeline, and dispatched as a single GPU command. This is the primary path for most operations.
+- Inputs occupy buffer indices `0..n-1`; outputs follow them. Constants use
+  explicitly chosen free indices below 31.
+- `out` is one `jax.ShapeDtypeStruct` or a nonempty sequence of output specs.
+  A single spec returns an array; a sequence returns a tuple.
+- `threads` and `threadgroup` accept an integer or a three-integer tuple.
+  `threads` counts individual threads, not threadgroups. Threadgroup dimensions
+  must be positive; a zero thread dimension skips dispatch.
+- Output shapes, dtypes, launch geometry, and constants are static compilation
+  parameters. Python integers/floats are packed as uint32/float32. Use NumPy
+  scalars for explicit supported types, or bytes for a custom layout. Each
+  constant must contain 1–4096 bytes.
+- Array bindings must be contiguous row-major and on MPS. Supported dtypes are
+  float32, float16, bool, and signed/unsigned 8/16/32-bit integers. Bfloat16,
+  float64, complex, and 64-bit integers are not supported by this API.
+- There are no automatic differentiation or batching rules for arbitrary MSL.
+  `grad`/`vmap` reject it unless you supply appropriate rules. Native custom
+  calls nested inside while/scan/conditional regions are not supported.
 
-2. **Native execution** — Performance-critical operations (e.g., Cholesky decomposition via `MPSMatrixDecompositionCholesky`, softmax via custom Metal kernels, LayerNorm via fused reductions) bypass the graph compiler and dispatch MPS native kernels or hand-tuned MSL directly on `MTLBuffer` objects. Small-batch Cholesky automatically falls back to CPU LAPACK for inputs below a configurable threshold.
+A 128-entry Python preparation cache reuses validated metadata and eager JIT
+wrappers, not arrays or results. Eager calls revalidate constants by their
+current value; an enclosing JIT captures static values when tracing. Native
+pipeline caching is in-process, keyed by device/source/entry point, with at
+most 64 weak entries. It is not a persistent compiled-program cache and does
+not remove first-use JAX/PJRT compilation or per-launch overhead.
 
-3. **JIT fusion** — Chains of elementwise operations are detected and fused into custom Metal Shading Language (MSL) kernels at runtime, reducing kernel launch overhead and improving memory bandwidth utilization.
+**Metal source is trusted, unsandboxed GPU code.** Bounds-check accesses, keep
+inputs read-only, and write every output element. Reflection validates binding
+interfaces, not every indexed access or complete output initialization. Do not
+extract or mutate raw JAX buffer pointers.
+
+### Legacy host-copy API
+
+`metal.execute`, `MetalKernel`, and `@metal.kernel` use PyObjC. They copy inputs
+through NumPy, wait for the Metal command buffer, and copy outputs back into JAX
+arrays. They are eager interfaces, not a path for dynamic inputs inside
+`jax.jit`. Their `grid` counts **threadgroups**, unlike native `threads`.
+
+The native API does not use PyObjC, but package metadata still includes PyObjC
+for these legacy interfaces and quantized GEMM wrappers. See
+[`metal.py`](src/jax_plugins/silicon/metal.py) and
+[`_native_metal.py`](src/jax_plugins/silicon/_native_metal.py) for the interfaces.
+
+## Quantization
+
+[`quantized.py`](src/jax_plugins/silicon/quantized.py) provides host-side
+quantization/dequantization helpers and quantized matrix multiplication.
+Weights are stored as `W[N, K]`; multiplication computes `x @ W.T`.
+
+| Format | Weight encoding | Scale encoding | Group size |
+| --- | --- | --- | --- |
+| MXFP4 | Packed E2M1, two values per byte | E8M0 | 32 |
+| MXFP8 | E4M3, one value per byte | E8M0 | 32 |
+| NVFP4 | Packed E2M1, two values per byte | E4M3 | 16 |
+| Affine | 2/3/4/8-bit integers | Per-group scale and bias (`scale * q + bias`) | Configurable; default 64 |
+
+`K` must be divisible by the group size. For affine GPU GEMM, use group sizes
+divisible by 32, such as 32 or 64. The host helpers accept other sizes, but the
+GPU dispatcher does not check them and the kernel can cross group boundaries,
+producing incorrect results (for example, with multiple groups of size 16).
+FP4 dequantization needs the original shape because packed bytes contain two
+values each.
+
+```python
+import numpy as np
+from jax_plugins.silicon.quantized import (
+    mx_dequantize,
+    mx_quantize,
+    quantized_matmul,
+)
+
+rng = np.random.default_rng(0)
+w = rng.standard_normal((128, 256)).astype(np.float32)
+x = rng.standard_normal((8, 256)).astype(np.float32)
+packed, scales = mx_quantize(w, mode="mxfp4")
+restored = mx_dequantize(packed, scales, mode="mxfp4", shape=w.shape)
+y = quantized_matmul(x, packed, scales, mode="mxfp4", K=w.shape[-1])
+```
+
+Quantization and dequantization convert through host NumPy; they are not
+operations for differentiating or JIT-tracing dynamic weights. Quantized GPU
+GEMM requires PyObjC Metal and float32/float16 activations. Affine GPU kernels
+cover 4/8-bit weights; 2/3-bit weights use host dequantization followed by JAX
+matmul. That fallback matmul follows JAX placement rather than being pinned to
+CPU. GPU wrappers use the synchronous host-copy `metal.execute` interface,
+not `metal.compile`. GPU output is first stored in the activation dtype;
+requesting a wider `out_dtype` casts afterward.
 
 ## Configuration
 
-### Environment Variables (User-facing)
+Set runtime flags before JAX initializes or compiles the relevant program;
+some values are cached for the process. This is a selection of controls, not a
+stable specification of every internal tuning flag.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `JAX_PLATFORMS` | — | Set to `mps` to select the Metal backend |
-| `JAX_METALLIB_LIBRARY_PATH` | auto | Override path to `libpjrt_plugin_silicon.dylib` |
-| `MPS_LOG_LEVEL` | `1` | Logging verbosity: `0` error, `1` warn, `2` info, `3` debug |
-| `JAX_TEST_MODE` | `compare` | Test mode: `compare` (CPU vs MPS), `mps`, or `cpu` |
-| `JAX_METALLIB_GEMM_TRUE_F32` | `0` | Set to `1` to disable mixed-precision fp32→fp16 GEMM and force true fp32 (precision-critical workloads) |
-| `JAX_METALLIB_CHOLESKY_LAPACK_MAX_N` | `256` | Maximum total elements (`n × batchCount`) for CPU LAPACK Cholesky fallback. Set to `0` to disable |
-| `JAX_METALLIB_COMPLETION_TIMEOUT_MS` | `30000` | Timeout in milliseconds for waiting on GPU results (host copies, `block_until_ready`). On timeout JAX raises an error and the process keeps running; raise it for GPU programs that legitimately run longer |
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `JAX_PLATFORMS` | JAX backend selection | `mps` requires MPS; `cpu,mps` makes both available with CPU first |
+| `JAX_METALLIB_LIBRARY_PATH` | Automatic discovery | Path to `libpjrt_plugin_silicon.dylib` |
+| `JAX_METALLIB_GEMM_TRUE_F32` | `0` | `1` disables graph-path float32 input narrowing for eligible GEMMs |
+| `JAX_METALLIB_COMPLETION_TIMEOUT_MS` | `30000` | Positive timeout for caller-facing GPU waits; timeout does not cancel GPU work |
+| `JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS` | Off | Opt into the experimental intrinsic-kernel family |
+| `JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS` | Off | Disable that family; overrides its enable flag, not every native route |
+| `JAX_METALLIB_DISABLE_ELEMENTWISE_FUSION` | Off | Disable native elementwise-chain fusion |
+| `JAX_METALLIB_JACOBI_EARLY_EXIT` | `1` | `0` runs the eigh/SVD Jacobi paths for a fixed 12 sweeps |
+| `JAX_METALLIB_LOOP_UNROLL` | `8` | Counted-loop unroll limit, clamped to 1–32; `1` disables it |
+| `JAX_METALLIB_AUTOTUNE_CACHE_DIR` | `~/.cache/jax-silicon` | Directory for autotune choices, not compiled custom Metal pipelines |
+| `JAX_METALLIB_TRACE_PLAN` | Off | Print the execution plan to stderr |
 
-> **Precision note:** The mixed-precision fp32 GEMM path (enabled by default) casts inputs to `float16` when both have ≥ 1,000,000 elements. This yields near-2× speedup on large matmuls with a small precision loss. Set `JAX_METALLIB_GEMM_TRUE_F32=1` for exact fp32.
+**Float32 GEMM precision:** the graph dot handler can cast both inputs to
+float16 when each contains at least 500,000 elements and
+`batch * M * N * K >= 100,000,000`, then cast the output to float32. This changes
+input rounding and representable range. Set `JAX_METALLIB_GEMM_TRUE_F32=1` when
+you need to retain float32 inputs. It is not a promise of CPU-identical results.
 
-### Environment Variables (Advanced / Tuning)
+`MPS_LOG_LEVEL` is a **build-time** setting: `0` error, `1` warning, `2` info,
+`3` debug. For example, rebuild with `MPS_LOG_LEVEL=3 uv pip install -e .`;
+setting it only when launching Python does not change compiled logging.
 
-The plugin exposes many tuning flags for power users and debugging. These are stable but change runtime behavior:
+Library discovery uses the first set override in this order:
+`JAX_METALLIB_LIBRARY_PATH`, `JAX_SILICON_LIBRARY_PATH`, `JAX_MPS_LIBRARY_PATH`.
+If that value is invalid, it warns and proceeds to filesystem discovery rather
+than trying the remaining aliases. Without a usable override, it searches the
+package directory, its `lib/` subdirectory, `build/*/lib/`, `/usr/local/lib/`, and
+`/opt/homebrew/lib/`.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `JAX_METALLIB_GEMM_NO_MPP` | — | Disable MPP fallback for GEMM operations |
-| `JAX_METALLIB_GEMM_AUTOTUNE` | — | Enable GEMM autotuning |
-| `JAX_METALLIB_GEMM_VARIANT` | — | Select GEMM implementation variant |
-| `JAX_METALLIB_GEMM_F16_THRESHOLD` | `5120` | Threshold for f16 MPP fallback |
-| `JAX_METALLIB_GEMM_AUTOTUNE_WARMUP` | — | GEMM autotune warmup iterations |
-| `JAX_METALLIB_GEMM_AUTOTUNE_ITERS` | — | GEMM autotune benchmark iterations |
-| `JAX_METALLIB_AUTOTUNE_CACHE_DIR` | `~/.cache/jax-metallib` | Directory for autotuning cache |
-| `JAX_METALLIB_ELEMWISE_AUTOTUNE` | — | Enable elementwise operation autotuning |
-| `JAX_METALLIB_ELEMWISE_AUTOTUNE_WARMUP` | — | Elementwise autotune warmup iterations |
-| `JAX_METALLIB_ELEMWISE_AUTOTUNE_ITERS` | — | Elementwise autotune benchmark iterations |
-| `JAX_METALLIB_MAX_WHILE_DEPTH` | `100` | Max recursion depth for `stablehlo.while` |
-| `JAX_METALLIB_LAYERNORM_FUSION_MIN_ELEMENTS` | `131072` | Min elements for LayerNorm fusion |
-| `JAX_METALLIB_SOFTMAX_FUSION_MIN_ELEMENTS` | `1024` | Min elements for Softmax fusion |
-| `JAX_METALLIB_STRIDE_MIN_NUMEL` | `1048576` | Min elements for strided kernels |
-| `JAX_METALLIB_REDUCE_NATIVE_MIN_ELEMENTS` | `32768` | Min elements before last-axis sum/max/min reduces run on the native kernel (13× faster than MPSGraph at 64K+) |
-| `JAX_METALLIB_DISABLE_MIXED_INTRINSIC_NATIVE` | — | Force mixed graph+native plans back to all-graph (mixed plans are default-on; large reduces run natively) |
-| `JAX_METALLIB_MAX_OPS_PER_CMDBUF` | `48` | Max ops per command buffer |
-| `JAX_METALLIB_MAX_MB_PER_CMDBUF` | `48` | Max MB per command buffer |
-| `JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS` | — | Opt into native intrinsic kernels (disabled by default — known ordering bug under JAX 0.11, see known limitations) |
-| `JAX_METALLIB_DISABLE_INTRINSIC_NATIVE_KERNELS` | — | Disable all native intrinsic kernels (LayerNorm, Softmax, GEMM, etc.); wins over the enable flag |
-| `JAX_METALLIB_DISABLE_NATIVE_GEMM` | — | Disable native GEMM interception |
-| `JAX_METALLIB_ENABLE_NATIVE_GEMM` | — | Force-enable native GEMM |
-| `JAX_METALLIB_DISABLE_LAYERNORM_FUSION` | — | Disable native LayerNorm fusion |
-| `JAX_METALLIB_DISABLE_SOFTMAX_FUSION` | — | Disable native Softmax fusion |
-| `JAX_METALLIB_DISABLE_ELEMENTWISE_FUSION` | — | Disable elementwise JIT fusion |
-| `JAX_METALLIB_DISABLE_ASYNC_COMPLETION` | — | Disable async completion events |
-| `JAX_METALLIB_DISABLE_MPSGRAPH_EXECUTABLE` | — | Disable MPSGraph executable caching |
-| `JAX_METALLIB_DISABLE_OUTPUT_BUFFER_POOL` | — | Disable output buffer pooling |
-| `JAX_METALLIB_DISABLE_INTERMEDIATE_CACHE` | — | Disable intermediate tensor caching |
-| `JAX_METALLIB_TRACE_PLAN` | — | Trace execution plan to stderr |
-| `JAX_METALLIB_FORCE_INTRINSIC_GRAPH` | — | Force all intrinsics through graph path |
-| `JAX_METALLIB_FORCE_INTRINSIC_NATIVE` | — | Force all intrinsics through native path |
-| `JAX_SILICON_LIBRARY_PATH` | — | **Legacy alias** for `JAX_METALLIB_LIBRARY_PATH` |
-| `JAX_MPS_LIBRARY_PATH` | — | **Legacy alias** for `JAX_METALLIB_LIBRARY_PATH` |
-
-### Library Discovery
-
-The plugin searches for the native library in this order:
-
-1. `JAX_METALLIB_LIBRARY_PATH` environment variable
-2. Package directory (editable install)
-3. `<package>/lib/` (wheel install)
-4. `build/*/lib/` (CMake build directory)
-5. `/usr/local/lib/`, `/opt/homebrew/lib/`
-
-## Performance
-
-jax-metallib is benchmarked against both the JAX CPU backend and [jax-mps](https://github.com/tillahoffmann/jax-mps). The benchmark suite covers 43 competitive workloads, 109+ per-op micro-benchmarks, and scaling sweeps across tensor sizes.
-
-### Key results vs jax-mps 0.10.6 (MLX backend)
-
-- **Geo-mean speedup: 1.17×** (23 wins / 20 losses)
-- **Strong on**: Conv2D (up to **3.3×**), softmax/layernorm (up to **2.2×**), GPT-2 scan-heavy models (**1.6–3.8×**)
-- **Matmul**: fp32 1024² **5.00 TFLOPS** (94% of MLX), fp16 1024² **6.67 TFLOPS** (beats MLX's 6.20), fp32 2048² **9.68 TFLOPS** (beats MLX's 9.33)
-- **Compile latency**: ~3–8 ms (5–10× faster than CPU backend)
-
-### MPS vs CPU
-
-- **Large workloads**: up to **5×** faster (matmul, sort, conv), up to **22×** for sort at scale
-- **Small workloads**: per-op dispatch overhead (~250–550 µs) makes CPU faster below the ~4K×5K matmul crossover
-- **fp16 advantage**: transcendals (sin/cos/log/exp) show 10–30× better ratios in fp16 vs fp32 because CPU emulates fp16 via fp32 promotion, while MPS has native fp16 SIMD
-
-### Running benchmarks
+## Tests and local checks
 
 ```bash
-# vs jax-mps (subprocess A/B — both register as platform 'mps')
-uv run python benchmarks/vs_jax_mps.py
-
-# vs CPU
-uv run python benchmarks/vs_cpu.py
-
-# Per-op micro-benchmarks (all 109+ ops)
-uv run python benchmarks/bottlenecks.py
-
-# Scaling sweeps
-uv run python benchmarks/bench_ops.py
-
-# Representative anchor workloads
-uv run python -m benchmarks.bench run --case 'anchor\..*'
-```
-
-## Testing
-
-The test suite validates numerical correctness by comparing CPU and MPS results with configurable tolerances.
-
-```bash
+uv run pytest tests/test_ops.py
+uv run pytest tests/test_native_metal_kernel.py tests/test_native_metal_cache.py
+uv run pytest tests/test_quantized.py
 uv run pytest
-
-JAX_TEST_MODE=mps uv run pytest
-
-uv run pytest -k "unary"
-uv run pytest -k "linalg"
-uv run pytest -k "flax"
 ```
 
-### Test Coverage
+The parameterized operation suite checks selected values and gradients;
+dedicated regression files cover integer and half-precision behavior, NaNs,
+signed zeros, indexing, control flow, linear algebra, PJRT ownership, and
+completion handling. References include CPU, NumPy, and decomposition/property
+checks. Passing one category does not establish support for every JAX program.
 
-| Category          | What's tested                                             |
-| ----------------- | --------------------------------------------------------- |
-| Value correctness | CPU vs MPS output comparison for all 120 ops                |
-| Gradient accuracy | `jax.grad` / `jax.value_and_grad` for differentiable ops    |
-| Edge cases        | float16 precision, int64 large values, complex numbers    |
-| Regressions       | Catastrophic cancellation (log1p), erf_inv range accuracy |
-| Integration       | Flax NNX (Linear, Conv, LayerNorm, MultiHeadAttention)      |
-| Integration       | NumPyro probabilistic programming models (optional)         |
+`JAX_TEST_MODE=compare` is the default for `test_ops.py`; `mps` and `cpu` select
+its operation-test mode. It is **not a whole-suite backend switch**. Framework
+cases still select MPS, and many standalone regressions explicitly use both
+backends or subprocess settings. Flax cases cover NNX Linear, Conv, Embed, and
+BatchNorm. Optional NumPyro cases exercise distribution log-probabilities and
+gradients, not end-to-end probabilistic inference.
 
-### Quality Gate
+Some native ABI/ownership tests require an explicit candidate library and
+matching PJRT headers and otherwise skip; read their module setup before using
+them as release checks.
 
-Pre-commit hooks enforce the full quality gate on every commit (MPS is unavailable in GitHub Actions):
+```bash
+uv run ruff check src tests benchmarks
+uv run ruff format --check src tests benchmarks
+```
 
-1. **clang-format** — C/C++/ObjC++ formatting (LLVM style, 110 col)
-2. **ruff** — Python formatting and linting
-3. **build** — full native library rebuild
-4. **clang-tidy** — C++ static analysis (with caching via ctcache)
-5. **pytest** — full test suite with op coverage enforcement
+These are manual checks. The repository has no pre-commit configuration.
+Hosted CI runs changed-file/changed-line lint, arm64 wheel builds, and wheel
+packaging checks. Its Metal-device probe is allowed to fail; it is not a GPU
+numerical-test gate. The implementation of these checks is in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) and the
+[`scripts/`](scripts/) directory. Existing lint/format debt may fail a full-tree
+check even when the changed-file gate passes.
 
 ## Benchmarks
 
 ```bash
 uv run python -m benchmarks.bench list
-
-JAX_PLATFORMS=mps uv run python -m benchmarks.bench run --case 'anchor\..*' --platform mps
-
-uv run python -m benchmarks.bench run --case '.*' --json-out results.jsonl
+uv run python -m benchmarks.bench run --case 'anchor\..*' --platform mps --json-out results.jsonl
+uv run python -m benchmarks.bench run --case 'anchor\..*' --platform cpu
+uv run python benchmarks/vs_cpu.py
+uv run python benchmarks/bottlenecks.py
 ```
 
-The benchmark suite includes per-op micro-benchmarks, representative anchor workloads, and competitive benchmarks against other backends.
+The main harness reports lowering, compilation, first execution, and
+synchronized steady-state timing separately. Its defaults are 10 warmups,
+50 timed iterations, and 3 repeats; steady-state results use the median of
+repeat medians. JSONL output is appended. The bottleneck script generates
+microbenchmarks for a subset of registered operations and records skips/errors.
 
-## macOS Version Compatibility
-
-- **macOS 15+ (Sequoia):** Required. The dylib declares a minimum of macOS 15.0. A build targeting 13.0 produced 272 unguarded uses of newer APIs: `reinterpretCastTensor` (13.2), `cblas_sgemm`/`spotrf_` (13.3), bfloat16, FFT and complex real/imaginary parts (14.0), and `sliceUpdateDataTensor`/`reciprocalSquareRootWithTensor` (15.0). On macOS 13 or 14 those would fail at runtime with unrecognized selectors.
-- **macOS 13–14:** Not supported.
-
-## Known Limitations
-
-- **`rng_bit_generator` with `UInt32` output** is not supported by MPSGraph and will raise a clean error. Use `jax.random.bits` (which lowers to a function-form Threefry call) or a different dtype.
-- **Dispatch overhead floor:** ~250–550 µs per op launch means very small tensors (below ~10K elements) are often faster on CPU. This is a fundamental GPU driver characteristic, not a plugin bug.
-- **Cholesky LAPACK fallback** is only active for `float32` inputs and `n ≤ 2048`. For larger inputs or non-float32 dtypes, the native MPS GPU kernel is always used.
-- **Native intrinsic kernels are disabled by default on JAX 0.11.** JAX 0.11's eager dispatch exposed a `CFRelease(nil)` abort on eliminated output slots (fixed in 0.11.1.0 via placeholder buffers) and two fused-chain scheduling defects — a broadcast-ordering bug (fixed in 0.11.1.0 by splitting fused chains at externally-consumed intermediates) and a remaining slot-aliasing defect that yields wrong results for some MultivariateNormal log-prob gradients. All ops run through MPSGraph by default, which is correct. Opt into the native path with `JAX_METALLIB_ENABLE_INTRINSIC_NATIVE_KERNELS=1` only for experiments.
-
-## Python API
-
-### Custom Metal Kernels
-
-```python
-from jax_plugins.silicon import metal
-import jax.numpy as jnp
-
-source = """
-#include <metal_stdlib>
-using namespace metal;
-kernel void scale_add(device float* out [[buffer(0)]],
-                      device const float* a [[buffer(1)]],
-                      device const float* b [[buffer(2)]],
-                      constant float& scale [[buffer(3)]],
-                      uint gid [[thread_position_in_grid]]) {
-    out[gid] = a[gid] * scale + b[gid];
-}
-"""
-
-a = jnp.ones(1024)
-b = jnp.ones(1024)
-result = metal.execute(source, "scale_add", inputs=[a, b, 2.0], output_shapes=[(1024,)])
-```
-
-See `src/jax_plugins/silicon/metal.py` for the full functional, OOP, and decorator APIs.
-
-### Quantization
-
-```python
-from jax_plugins.silicon.quantized import mx_quantize, mx_dequantize, quantized_matmul
-import numpy as np
-
-w = np.random.randn(512, 512).astype(np.float32)
-w_q, scale = mx_quantize(w, mode="mxfp4")
-w_dq = mx_dequantize(w_q, scale, mode="mxfp4")
-```
-
-Supported formats: MXFP4, MXFP8, NVFP4, and affine (GPTQ/AWQ-style) quantization with fused Metal GEMM kernels.
-
-## Repository Layout
-
-```md
-src/
-  jax_plugins/silicon/          Python entrypoint — plugin registration & library discovery
-    __init__.py                   Plugin initialization & library discovery
-    metal.py                      Custom Metal kernel API (functional, OOP, decorator)
-    quantized.py                  MX / affine quantization with fused Metal GEMM
-  pjrt_plugin/
-    api/                        PJRT C API layer (8 implementation files)
-      pjrt_api.cc                 Function pointer table (main entry point)
-      pjrt_client.cc              Client: compile, buffer creation, platform info
-      pjrt_buffer.cc              Buffer: host↔device transfer, copy, clone
-      pjrt_executable.cc          Executable: execute, serialize, output metadata
-      pjrt_device.cc              Device: attributes, memory, description
-      pjrt_event.cc               Event: async completion, create, set
-      pjrt_memory.cc              Memory: kind, addressable devices
-      pjrt_topology.cc            Topology: device descriptions, platform
-    core/                       Backend core (Objective-C++ / Metal)
-      mps_client.h/.mm             Metal device & command queue management
-      mps_device.h/.mm             GPU device abstraction
-      mps_buffer.h/.mm             MTLBuffer wrapper — host copy, clone, blit
-      mps_executable.h/.mm         Execution plan builder & runner
-      stablehlo_parser.h/.mm       MLIR StableHLO deserializer
-      type_utils.h/.mm             MLIR ↔ MPS type conversions
-      completion_event.h           Thread-safe async completion primitives
-      pjrt_types.h                 PJRT opaque wrapper structs
-      logging.h                    Leveled logging macros
-    ops/                        StableHLO op handlers (120 registrations)
-      registry.h                  Op registry, handler types, macros
-      unary_ops.mm                50 unary operations
-      binary_ops.mm               15 binary operations
-      shape_ops.mm                19 shape & indexing operations
-      reduction_ops.mm            6 reduction operations
-      convolution_ops.mm          General dilated convolution
-      linalg_ops.mm               Cholesky, triangular solve (native MPS + LAPACK fallback)
-      bitwise_ops.mm              8 bitwise operations
-      sort_ops.mm                 Sort, top-k
-      fft_ops.mm                  FFT / RFFT / IFFT / IRFFT
-      control_flow_ops.mm         While, case, custom_call, return
-      random_ops.mm               Threefry / Philox RNG
-      tensor_creation_ops.mm      Constant, iota
-      collective_ops.mm           Single-device collective no-ops
-      higher_order_ops.mm         Map
-    runtime/                    JIT Metal kernel engine
-      metal_kernels.h/.mm          MSL kernel source cache & pipeline compilation
-    proto/
-      device_assignment.proto     XLA DeviceAssignmentProto definition
-tests/
-  test_ops.py                   Parametrized test suite (value + gradient)
-  test_int64_constant_splats.py Regression: int64 precision above 2^53
-  test_metal_kernel.py          Custom kernel API tests
-  test_quantized.py             MX quantization tests
-  configs/                      Per-category test configurations (15 modules)
-benchmarks/
-  bench.py                      Benchmark harness (list/run, JSONL output)
-  bottlenecks.py                Per-op micro-benchmarks
-  vs_jax_mps.py                 Competitive benchmarks vs jax-mps
-  vs_cpu.py                     Competitive benchmarks vs CPU
-  anchors.py                    Representative anchor workloads
-  bench_ops.py                  Scaling sweeps
-  linalg.py                     Linear algebra benchmarks
-scripts/
-  setup_deps.sh                 One-time native dependency bootstrap
-  memory_monitor.sh             RSS sampling utility
-```
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide. The short version:
+A jax-mps comparison needs a separate environment because both plugins register
+as `mps`:
 
 ```bash
-brew install cmake ninja
-./scripts/setup_deps.sh
-uv sync --all-groups
-uv pip install -e .
-pre-commit install
-
-uv pip install -e .
-uv run pytest
+uv run python benchmarks/vs_jax_mps.py --jax-mps-python /path/to/jax-mps-venv/bin/python
 ```
 
-## Acknowledgements
+These are synthetic workloads, not an application-level speedup guarantee.
+Report hardware, OS, JAX/jaxlib and plugin versions, comparator revision,
+dtypes, shapes, flags, and timing settings with results. This README does not
+quote benchmark numbers without a matching measurement artifact.
 
-This project draws significant inspiration from [MLX](https://github.com/ml-explore/mlx) by Apple Machine Learning Research. MLX's approach to leveraging Metal and unified memory on Apple Silicon was a major influence on the design and direction of jax-metallib.
+## Source layout
 
-## License
+```text
+src/jax_plugins/silicon/
+  __init__.py              Plugin registration and library discovery
+  _native_metal.py          Native custom-call lowering and launch preparation
+  metal.py                  Public custom-kernel and legacy host-copy APIs
+  quantized.py              MX/affine packing and quantized GEMM wrappers
+  linalg_lowerings.py       JAX implementations of extra linear-algebra lowerings
+  random_lowerings.py       ThreeFry/Philox expansion and ThreeFry round cuts
+  sort_lowerings.py         Sort-axis movement before lowering
+src/pjrt_plugin/
+  api/                      PJRT C API callbacks and handle ownership
+  core/                     Devices, buffers, parser, planner, execution, events
+  ops/                      StableHLO/CHLO handlers and registered custom calls
+  runtime/                  Built-in MSL sources and custom-kernel compilation
+  metal_shaders/            Steel GEMM shader
+  proto/                    Device-assignment protobuf
+scripts/                    Native dependency setup and CI checks
+benchmarks/                 Timing harnesses and comparison scripts
+tests/                      Operation configurations and regression tests
+```
 
-Copyright 2026 Erfan Zare Chavoshi (@erfanzar). Apache-2.0 — see [LICENSE](LICENSE).
+## Contributing and license
+
+Rebuild the native library after C++/Objective-C++ changes with
+`uv pip install -e .`, then run the relevant tests on a Metal-capable Mac.
+The development overview is in [CONTRIBUTING.md](CONTRIBUTING.md); its pre-commit
+instructions do not correspond to a configuration in this source tree.
+
+The GEMM shader uses the MLX Steel BlockLoader/BlockMMA design.
+
+Copyright 2026 Erfan Zare Chavoshi (@erfanzar).
+[Apache-2.0](LICENSE).
