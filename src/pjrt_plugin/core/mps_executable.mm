@@ -6681,7 +6681,10 @@ static MPSGraphTensorData* GetTensorDataForSlot(IntermediateCacheSet* cache, Slo
     if (cache && slot >= 0 && (size_t)slot < cache->tensor_datas.size() &&
         (size_t)slot < cache->tensor_data_bufs.size()) {
         size_t idx = (size_t)slot;
-        if (cache->tensor_datas[idx] && cache->tensor_data_bufs[idx] == buffer) {
+        // Shape and dtype must match too: one slot can be fed to a flattened
+        // (1-D) elementwise segment and to a segment using its declared shape.
+        if (cache->tensor_datas[idx] && cache->tensor_data_bufs[idx] == buffer &&
+            cache->tensor_datas[idx].dataType == dtype && [cache->tensor_datas[idx].shape isEqualToArray:shape]) {
             if (borrowed_from_cache) {
                 *borrowed_from_cache = true;
             }
@@ -7060,6 +7063,70 @@ static ProcessResult processOperations(HandlerContext& ctx, mlir::Block& block) 
     }
 
     return result;
+}
+
+// Elementwise ops whose graph handlers never reshape to the declared result
+// shape for float inputs (only scalar constants are added), so a segment of
+// them can run on 1-D placeholders.
+static bool IsFlattenableElementwiseOp(mlir::Operation* op) {
+    namespace shlo = mlir::stablehlo;
+    return mlir::isa<shlo::AddOp, shlo::SubtractOp, shlo::MulOp, shlo::DivOp, shlo::MaxOp, shlo::MinOp,
+                     shlo::NegOp, shlo::AbsOp, shlo::ExpOp, shlo::LogOp, shlo::SqrtOp, shlo::RsqrtOp,
+                     shlo::TanhOp, shlo::SineOp, shlo::CosineOp, shlo::LogisticOp>(op);
+}
+
+// MPSGraph elementwise ops on rank >= 2 tensors cost more than the same op on
+// the flat tensor: 16M-element f16 add 1.06-1.07 ms at [4096,4096] and
+// 1.11-1.14 ms at [16,256,4096] vs 1.00-1.01 ms 1-D (jax-mps 0.99-1.00 at every
+// rank); a reshape inside the graph does not help (2.5 ms, it materialises).
+// A segment made only of the ops above, where every operand and result has
+// the same static float shape, is built on [numel] placeholders over the same
+// contiguous buffers: identical bytes, identical per-element results.
+// Constants, broadcasts and regions disqualify the segment.
+// JAX_METALLIB_DISABLE_FLAT_ELEMENTWISE_GRAPH=1 keeps declared shapes.
+static bool IsFlattenableElementwiseSegment(const std::vector<mlir::Operation*>& ops, int64_t* numel_out) {
+    if (ops.empty() || EnvFlagEnabled("JAX_METALLIB_DISABLE_FLAT_ELEMENTWISE_GRAPH")) {
+        return false;
+    }
+    llvm::ArrayRef<int64_t> shape;
+    int64_t numel = 0;
+    bool have = false;
+    auto check = [&](mlir::Type t) -> bool {
+        auto rt = mlir::dyn_cast<mlir::RankedTensorType>(t);
+        if (!rt || !rt.hasStaticShape() || rt.getRank() < 2) {
+            return false;
+        }
+        mlir::Type et = rt.getElementType();
+        if (!et.isF32() && !et.isF16() && !et.isBF16()) {
+            return false;
+        }
+        if (!have) {
+            have = true;
+            shape = rt.getShape();
+            numel = rt.getNumElements();
+            return numel > 0 && numel <= std::numeric_limits<uint32_t>::max();
+        }
+        return rt.getShape() == shape;
+    };
+    for (mlir::Operation* op : ops) {
+        if (op->getNumRegions() != 0 || !IsFlattenableElementwiseOp(op)) {
+            return false;
+        }
+        for (mlir::Value v : op->getOperands()) {
+            if (!check(v.getType())) {
+                return false;
+            }
+        }
+        for (mlir::Value v : op->getResults()) {
+            if (!check(v.getType())) {
+                return false;
+            }
+        }
+    }
+    if (numel_out) {
+        *numel_out = numel;
+    }
+    return have;
 }
 
 static bool IsCustomMetalCall(mlir::Operation* op) {
@@ -7639,6 +7706,9 @@ bool MpsExecutable::BuildExecutionPlan() {
                     }
                     MPS_LOG_DEBUG("BuildExecutionPlan: collected %zu ops in segment\n", all_seg_ops.size());
 
+                    int64_t flat_numel = 0;
+                    const bool flat_segment = IsFlattenableElementwiseSegment(seg.ops, &flat_numel);
+
                     std::unordered_set<void*> created_ph;
 
                     auto maybeCreatePlaceholder = [&](mlir::Value operand) {
@@ -7659,7 +7729,8 @@ bool MpsExecutable::BuildExecutionPlan() {
                             return;
                         }
 
-                        NSArray<NSNumber*>* shape = GetShapeFromType(operand.getType());
+                        NSArray<NSNumber*>* shape =
+                            flat_segment ? @[@(flat_numel)] : GetShapeFromType(operand.getType());
                         auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(operand.getType());
                         MPSDataType mps_dtype =
                             tensorType ? MlirTypeToMps(tensorType.getElementType()) : MPSDataTypeFloat32;
