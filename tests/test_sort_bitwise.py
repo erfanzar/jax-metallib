@@ -36,7 +36,7 @@ def _ties(rows, cols, seed):
 def _alternating_zero(rows, cols):
     x = np.zeros((rows, cols), np.float32)
     x[:, ::2] = -0.0
-    x[0, 5] = np.nan
+    x[0, min(5, cols - 1)] = np.nan
     return x
 
 
@@ -71,6 +71,14 @@ def test_row_sort_bitwise_matches_cpu(case):
 @pytest.mark.parametrize("case", ["ties_512x300", "alt_zero_4096x256"])
 def test_descending_sort_bitwise_matches_cpu(case):
     _bitwise(*_run(lambda a: jnp.sort(a, axis=-1, descending=True), _CASES[case]()))
+
+
+@pytest.mark.parametrize("cols", [2, 3, 5, 17, 31, 32, 33, 64, 100, 129, 255, 256, 257])
+def test_short_row_sort_bitwise_matches_cpu(cols):
+    # Rows of <= 256 padded elements take the simdgroup register kernel;
+    # 257 is the first shared-memory control.
+    x = _ties(300, cols, 6) if cols >= 5 else _alternating_zero(300, cols)
+    _bitwise(*_run(lambda a: lax.sort(a, dimension=-1), x))
 
 
 @pytest.mark.parametrize("n", [1000, 5000, 20000, 100000])
