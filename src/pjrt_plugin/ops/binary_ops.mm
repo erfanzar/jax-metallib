@@ -1087,6 +1087,49 @@ static ProcessResult HandleDotGeneral(HandlerContext& ctx) {
         }
     }
 
+    // Rank>2 lhs times rank-2 rhs with no batch dims ([B,T,K] @ [K,N], every
+    // dense layer on a sequence): hand MPSGraph the rank-N lhs and let it
+    // broadcast the rhs. The generic path below reshapes lhs to [B*T,K] and the
+    // result back to [B,T,N], which measured ~0.65 ms slower than the same 2-D
+    // matmul at [16,256,512]@[512,2048] f32 (3.15-3.20 vs 2.45-2.58 ms here;
+    // jax-mps 2.48-2.58). Each output is still one K-length dot product.
+    // JAX_METALLIB_DISABLE_DOT_RANKN_BROADCAST=1 restores the flatten for the
+    // [..., K] @ [K, N] form only.
+    //
+    // The [..., K] x [N, K] form (contract last x last; the input gradient
+    // g @ W.T of every dense layer on a sequence) always takes this path: the
+    // flatten lowering (reshape lhs to [M,K], transpose rhs, matmul, reshape)
+    // trips an MPSGraph canonicalization bug whenever M = prod(lhs free dims)
+    // equals N. The compiled graph infers the last result dim from the lhs
+    // instead of N and the process aborts ("type of return operand 0
+    // ('tensor<2x16x16xf32>') doesn't match function result type
+    // ('tensor<2x16x32xf32>')" for [2,16,8] x [32,8]). Regressions:
+    // tests/test_dot_rankn_broadcast.py.
+    if (!integerDot && lhsBatchDims.empty() && rhsBatchDims.empty() && lhsContractingDims.size() == 1 &&
+        rhsContractingDims.size() == 1 && lhsRank >= 3 && rhsRank == 2 &&
+        lhsContractingDims[0] == static_cast<int64_t>(lhsRank) - 1 &&
+        (rhsContractingDims[0] == 0 || rhsContractingDims[0] == 1)) {
+        static const bool rankNBroadcast = []() {
+            const char* v = std::getenv("JAX_METALLIB_DISABLE_DOT_RANKN_BROADCAST");
+            return !(v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0'));
+        }();
+        const bool rhsTransposed = rhsContractingDims[0] == 1;
+        MPSGraphTensor* rankNResult = nil;
+        if (rankNBroadcast || rhsTransposed) {
+            MPSGraphTensor* rhsKN =
+                rhsTransposed ? [ctx.graph transposeTensor:rhsInput permutation:@[@1, @0] name:nil] : rhsInput;
+            rankNResult = [ctx.graph matrixMultiplicationWithPrimaryTensor:lhsInput
+                                                           secondaryTensor:rhsKN
+                                                                      name:nil];
+        }
+        if (rankNResult) {
+            if (outShape && ![outShape isEqualToArray:rankNResult.shape]) {
+                rankNResult = [ctx.graph reshapeTensor:rankNResult withShape:outShape name:nil];
+            }
+            return DotResult(rankNResult, "dot_general");
+        }
+    }
+
     std::vector<int64_t> lhsBatch(lhsBatchDims.begin(), lhsBatchDims.end());
     std::vector<int64_t> rhsBatch(rhsBatchDims.begin(), rhsBatchDims.end());
     std::vector<int64_t> lhsContract(lhsContractingDims.begin(), lhsContractingDims.end());
