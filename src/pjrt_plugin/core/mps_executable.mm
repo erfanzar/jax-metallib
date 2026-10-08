@@ -101,6 +101,11 @@ struct GraphStep {
     void* executable = nullptr;
     std::vector<SlotId> exec_feed_slots;
     std::vector<SlotId> exec_target_slots;
+    // Feeds bound as MPSNDArray views of an input buffer (placeholder -> byte
+    // offset; see SelectInputSliceViews), and the same offsets in executable
+    // feed order (-1 for an ordinary feed).
+    std::unordered_map<void*, int64_t> feed_view_offsets;
+    std::vector<int64_t> exec_feed_view_offsets;
 };
 
 struct FusedElementwiseInfo {
@@ -6718,6 +6723,39 @@ static MPSGraphTensorData* GetTensorDataForSlot(IntermediateCacheSet* cache, Slo
     return [[MPSGraphTensorData alloc] initWithMTLBuffer:buffer shape:shape dataType:dtype];
 }
 
+// Tensor data for one graph feed. view_offset >= 0 binds an MPSNDArray view of
+// `buffer` at that byte offset (SelectInputSliceViews). Views are never cached:
+// several views share one slot and buffer. Returned +1 (borrowed=false).
+static MPSGraphTensorData* GetFeedTensorData(IntermediateCacheSet* cache, SlotId slot, id<MTLBuffer> buffer,
+                                             NSArray<NSNumber*>* shape, MPSDataType dtype,
+                                             int64_t view_offset, bool* borrowed_from_cache) {
+    if (view_offset < 0) {
+        return GetTensorDataForSlot(cache, slot, buffer, shape, dtype, borrowed_from_cache);
+    }
+    if (borrowed_from_cache) {
+        *borrowed_from_cache = false;
+    }
+    if (!buffer || !shape || dtype == MPSDataTypeInvalid) {
+        return nil;
+    }
+    const size_t bytes = ByteSizeFromTensorShapeAndType(shape, dtype);
+    if ((uint64_t)view_offset + bytes > (uint64_t)[buffer length]) {
+        MPS_LOG_ERROR("Slot %d view out of range: offset=%lld need=%zu have=%zu\n", slot,
+                      (long long)view_offset, bytes, (size_t)[buffer length]);
+        return nil;
+    }
+    MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:dtype shape:shape];
+    MPSNDArray* nda = [[MPSNDArray alloc] initWithBuffer:buffer
+                                                  offset:(NSUInteger)view_offset
+                                              descriptor:desc];
+    if (!nda) {
+        return nil;
+    }
+    MPSGraphTensorData* td = [[MPSGraphTensorData alloc] initWithMPSNDArray:nda];
+    [nda release];
+    return td;
+}
+
 static std::string JsonEscape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 16);
@@ -7127,6 +7165,113 @@ static bool IsFlattenableElementwiseSegment(const std::vector<mlir::Operation*>&
         *numel_out = numel;
     }
     return have;
+}
+
+// A static slice of an entry argument that covers one contiguous row-major
+// range (leading dims of extent 1, then any range, then full trailing dims)
+// is fed to the graph as an MPSNDArray view of the argument's buffer at a
+// byte offset, instead of a full-size placeholder plus an in-graph slice that
+// MPSGraph materialises. A single reshape user is folded into the view shape.
+// After the parse-time loop unroll, lax.scan over stacked layer weights reads
+// every layer this way: 6 matmuls on [512,1536] slices of one [6,512,1536]
+// buffer took 1.28-1.35 ms sliced in-graph vs 0.95-0.96 ms as views,
+// bit-identical (build/r24_ndarray_view_probe.log). Only slices of at least
+// 64 KiB at a 16-byte-aligned offset whose results stay inside the segment
+// are viewed. JAX_METALLIB_DISABLE_INPUT_SLICE_VIEWS=1 disables this.
+struct InputSliceView {
+    mlir::Operation* slice = nullptr;
+    mlir::Operation* reshape = nullptr;
+    mlir::Value value;
+    mlir::BlockArgument arg;
+    int64_t byte_offset = 0;
+};
+
+template <typename SlotMap>
+static std::vector<InputSliceView>
+SelectInputSliceViews(const std::vector<mlir::Operation*>& ops, mlir::Block* entry,
+                      const std::unordered_set<mlir::Operation*>& seg_ops, const SlotMap& value_to_slot) {
+    std::vector<InputSliceView> views;
+    static const bool disabled = EnvFlagEnabled("JAX_METALLIB_DISABLE_INPUT_SLICE_VIEWS");
+    if (disabled) {
+        return views;
+    }
+    for (mlir::Operation* op : ops) {
+        auto slice = mlir::dyn_cast<mlir::stablehlo::SliceOp>(op);
+        if (!slice) {
+            continue;
+        }
+        auto arg = mlir::dyn_cast<mlir::BlockArgument>(slice.getOperand());
+        if (!arg || arg.getOwner() != entry) {
+            continue;
+        }
+        auto in = mlir::dyn_cast<mlir::RankedTensorType>(arg.getType());
+        auto out = mlir::dyn_cast<mlir::RankedTensorType>(slice.getType());
+        if (!in || !out || !in.hasStaticShape() || !out.hasStaticShape() || out.getRank() < 1) {
+            continue;
+        }
+        mlir::Type et = in.getElementType();
+        const int64_t esize = (et.isF32() || et.isInteger(32)) ? 4 : (et.isF16() || et.isBF16()) ? 2 : 0;
+        if (esize == 0) {
+            continue;
+        }
+        llvm::ArrayRef<int64_t> starts = slice.getStartIndices();
+        llvm::ArrayRef<int64_t> limits = slice.getLimitIndices();
+        llvm::ArrayRef<int64_t> strides = slice.getStrides();
+        const int64_t rank = in.getRank();
+        bool ok = (int64_t)starts.size() == rank && (int64_t)limits.size() == rank &&
+                  (int64_t)strides.size() == rank;
+        for (int64_t d = 0; ok && d < rank; ++d) {
+            ok = strides[d] == 1;
+        }
+        if (!ok) {
+            continue;
+        }
+        int64_t q = rank - 1;
+        while (q >= 0 && starts[q] == 0 && limits[q] == in.getDimSize(q)) {
+            --q;
+        }
+        for (int64_t d = 0; ok && d < q; ++d) {
+            ok = limits[d] - starts[d] == 1;
+        }
+        if (!ok) {
+            continue;
+        }
+        int64_t elems = 0;
+        int64_t stride = 1;
+        for (int64_t d = rank - 1; d >= 0; --d) {
+            elems += starts[d] * stride;
+            stride *= in.getDimSize(d);
+        }
+        const int64_t offset = elems * esize;
+        const int64_t bytes = out.getNumElements() * esize;
+        if (offset % 16 != 0 || bytes < 64 * 1024) {
+            continue;
+        }
+        mlir::Value value = slice.getResult();
+        mlir::Operation* reshape = nullptr;
+        if (value.hasOneUse()) {
+            mlir::Operation* user = *value.getUsers().begin();
+            auto rs = mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(user);
+            auto rt = rs ? mlir::dyn_cast<mlir::RankedTensorType>(rs.getType()) : nullptr;
+            if (rs && rt && rt.hasStaticShape() && rt.getRank() >= 1 && user->getBlock() == op->getBlock()) {
+                reshape = user;
+                value = rs.getResult();
+            }
+        }
+        if (value.use_empty() || value_to_slot.count(slice.getResult().getAsOpaquePointer()) ||
+            value_to_slot.count(value.getAsOpaquePointer())) {
+            continue;
+        }
+        bool inside = true;
+        for (mlir::Operation* user : value.getUsers()) {
+            inside = inside && seg_ops.count(user) != 0;
+        }
+        if (!inside) {
+            continue;
+        }
+        views.push_back({op, reshape, value, arg, offset});
+    }
+    return views;
 }
 
 static bool IsCustomMetalCall(mlir::Operation* op) {
@@ -7711,6 +7856,28 @@ bool MpsExecutable::BuildExecutionPlan() {
 
                     std::unordered_set<void*> created_ph;
 
+                    std::unordered_set<mlir::Operation*> view_skip;
+                    for (const InputSliceView& v :
+                         SelectInputSliceViews(seg.ops, &entry_func_.front(), all_seg_ops, value_to_slot)) {
+                        auto slot_it = value_to_slot.find(v.arg.getAsOpaquePointer());
+                        if (slot_it == value_to_slot.end()) {
+                            continue;
+                        }
+                        auto vt = mlir::cast<mlir::RankedTensorType>(v.value.getType());
+                        MPSGraphTensor* ph = [graph placeholderWithShape:GetShapeFromType(vt)
+                                                                dataType:MlirTypeToMps(vt.getElementType())
+                                                                    name:nil];
+                        void* key = v.value.getAsOpaquePointer();
+                        values[key] = ph;
+                        created_ph.insert(key);
+                        gs.feeds.emplace_back(slot_it->second, (__bridge void*)ph);
+                        gs.feed_view_offsets[(__bridge void*)ph] = v.byte_offset;
+                        view_skip.insert(v.slice);
+                        if (v.reshape) {
+                            view_skip.insert(v.reshape);
+                        }
+                    }
+
                     auto maybeCreatePlaceholder = [&](mlir::Value operand) {
                         if (auto blockArg = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
                             if (blockArg.getOwner() != &entry_func_.front()) {
@@ -7750,6 +7917,9 @@ bool MpsExecutable::BuildExecutionPlan() {
                     MPS_LOG_DEBUG("BuildExecutionPlan: creating placeholders\n");
                     for (auto* op : seg.ops) {
                         op->walk([&](mlir::Operation* nestedOp) {
+                            if (view_skip.count(nestedOp)) {
+                                return;
+                            }
                             for (mlir::Value operand : nestedOp->getOperands()) {
                                 maybeCreatePlaceholder(operand);
                             }
@@ -7760,6 +7930,9 @@ bool MpsExecutable::BuildExecutionPlan() {
                     MPS_LOG_DEBUG("BuildExecutionPlan: processing ops in segment\n");
                     @try {
                         for (auto* op : seg.ops) {
+                            if (view_skip.count(op)) {
+                                continue;
+                            }
                             std::string op_name = op->getName().getStringRef().str();
 
                             if (auto callOp = mlir::dyn_cast<mlir::func::CallOp>(op)) {
@@ -7872,6 +8045,8 @@ bool MpsExecutable::BuildExecutionPlan() {
                                 if (feedOrder) {
                                     gs.exec_feed_slots.clear();
                                     gs.exec_feed_slots.reserve(feedOrder.count);
+                                    gs.exec_feed_view_offsets.clear();
+                                    gs.exec_feed_view_offsets.reserve(feedOrder.count);
                                     bool ok = true;
                                     for (MPSGraphTensor* ft in feedOrder) {
                                         auto it = feedTensorToSlot.find((__bridge void*)ft);
@@ -7880,9 +8055,13 @@ bool MpsExecutable::BuildExecutionPlan() {
                                             break;
                                         }
                                         gs.exec_feed_slots.push_back(it->second);
+                                        auto vit = gs.feed_view_offsets.find((__bridge void*)ft);
+                                        gs.exec_feed_view_offsets.push_back(
+                                            vit != gs.feed_view_offsets.end() ? vit->second : -1);
                                     }
                                     if (!ok) {
                                         gs.exec_feed_slots.clear();
+                                        gs.exec_feed_view_offsets.clear();
                                     }
                                 }
 
@@ -7935,7 +8114,8 @@ bool MpsExecutable::BuildExecutionPlan() {
                         oss << ",";
                     }
                     const auto& gs = plan->graph_steps[i];
-                    oss << "{\"feeds\":" << gs.feeds.size() << ",\"targets\":" << gs.targets.size() << "}";
+                    oss << "{\"feeds\":" << gs.feeds.size() << ",\"targets\":" << gs.targets.size()
+                        << ",\"views\":" << gs.feed_view_offsets.size() << "}";
                 }
                 oss << "]}";
                 EmitPlanJsonLine(oss.str());
@@ -9297,8 +9477,10 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         }
                         MPSGraphTensor* t = feedOrder[i];
                         bool borrowed = false;
-                        MPSGraphTensorData* data = GetTensorDataForSlot(cache, slot, slot_bufs[slot], t.shape,
-                                                                        t.dataType, &borrowed);
+                        const int64_t view_offset =
+                            i < gs.exec_feed_view_offsets.size() ? gs.exec_feed_view_offsets[i] : -1;
+                        MPSGraphTensorData* data = GetFeedTensorData(cache, slot, slot_bufs[slot], t.shape,
+                                                                     t.dataType, view_offset, &borrowed);
                         if (!data) {
                             return ExecutionResult::Error("Failed to create tensor data for slot " +
                                                           std::to_string(slot));
@@ -10320,8 +10502,11 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                 }
                                 MPSGraphTensor* t = feedOrder[i];
                                 bool borrowed = false;
-                                MPSGraphTensorData* data = GetTensorDataForSlot(
-                                    cache, slot, slot_bufs[slot], t.shape, t.dataType, &borrowed);
+                                const int64_t view_offset =
+                                    i < gs.exec_feed_view_offsets.size() ? gs.exec_feed_view_offsets[i] : -1;
+                                MPSGraphTensorData* data =
+                                    GetFeedTensorData(cache, slot, slot_bufs[slot], t.shape, t.dataType,
+                                                      view_offset, &borrowed);
                                 if (!data) {
                                     return ExecutionResult::Error("Failed to create tensor data for slot " +
                                                                   std::to_string(slot));
@@ -10391,8 +10576,12 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         MPS_LOG_DEBUG("    Tensor shape: %s, dtype: %d\n",
                                       [[tensor.shape description] UTF8String], (int)tensor.dataType);
                         bool borrowed = false;
-                        MPSGraphTensorData* data = GetTensorDataForSlot(
-                            cache, slot, slot_bufs[slot], tensor.shape, tensor.dataType, &borrowed);
+                        auto view_it = gs.feed_view_offsets.find(tensor_ptr);
+                        const int64_t view_offset =
+                            view_it != gs.feed_view_offsets.end() ? view_it->second : -1;
+                        MPSGraphTensorData* data =
+                            GetFeedTensorData(cache, slot, slot_bufs[slot], tensor.shape, tensor.dataType,
+                                              view_offset, &borrowed);
                         if (!data) {
                             return ExecutionResult::Error("Failed to create feed tensor data for slot " +
                                                           std::to_string(slot));
