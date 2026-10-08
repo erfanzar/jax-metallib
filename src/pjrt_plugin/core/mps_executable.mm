@@ -16,6 +16,7 @@
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #import "pjrt_plugin/core/issue_url.h"
 #import "pjrt_plugin/core/mps_buffer.h"
 #import "pjrt_plugin/core/mps_client.h"
@@ -213,6 +214,7 @@ struct NativeStep {
     uint32_t baked_gather_num_indices = 0;
     uint32_t baked_gather_cols = 0;
     uint32_t baked_gather_table_rows = 0;
+    uint32_t baked_take_fill_bits = 0; // fused jnp.take only (take_rows_b32/b16, buffer 6)
 
     uint32_t baked_gemm_m = 0;
     uint32_t baked_gemm_n = 0;
@@ -882,6 +884,33 @@ static bool IsEligibleGatherRowsNativeOp(mlir::Operation* op) {
     return true;
 }
 
+// A gather rewritten by FuseTakePatterns: table [R,C] f32/f16, raw indices [N]
+// int32, result [N,C], fill bits attached.
+static bool IsFusedTakeOp(mlir::Operation* op) {
+    if (!mlir::isa_and_nonnull<mlir::stablehlo::GatherOp>(op) || !op->hasAttr("__take_fused") ||
+        !op->getAttrOfType<mlir::IntegerAttr>("__take_fill_bits") || op->getNumOperands() != 2 ||
+        op->getNumResults() != 1) {
+        return false;
+    }
+    std::vector<int64_t> tshape, ishape, oshape;
+    MPSDataType tdt = MPSDataTypeInvalid, idt = MPSDataTypeInvalid, odt = MPSDataTypeInvalid;
+    if (!GetStaticTensorInfo(op->getOperand(0).getType(), &tshape, nullptr, &tdt) ||
+        !GetStaticTensorInfo(op->getOperand(1).getType(), &ishape, nullptr, &idt) ||
+        !GetStaticTensorInfo(op->getResult(0).getType(), &oshape, nullptr, &odt)) {
+        return false;
+    }
+    if (tshape.size() != 2 || ishape.size() != 1 || oshape.size() != 2 || idt != MPSDataTypeInt32 ||
+        !IsFloat16Or32(tdt) || odt != tdt || oshape[0] != ishape[0] || oshape[1] != tshape[1]) {
+        return false;
+    }
+    if (tshape[0] <= 0 || tshape[0] > std::numeric_limits<int32_t>::max() || tshape[1] <= 0 ||
+        ishape[0] <= 0) {
+        return false;
+    }
+    const uint64_t total = static_cast<uint64_t>(ishape[0]) * static_cast<uint64_t>(tshape[1]);
+    return total <= std::numeric_limits<uint32_t>::max();
+}
+
 static std::string GetReduceBodyOpName(mlir::stablehlo::ReduceOp reduceOp) {
     if (reduceOp.getBody().empty()) {
         return "";
@@ -1115,6 +1144,185 @@ static bool IsReduceMeanPattern(mlir::Operation* reduceOp,
         return true;
     }
     return false;
+}
+
+// --- Fused jnp.take ---
+// jnp.take(table, i, axis=0) lowers to: w = i < 0 ? i + R : i; a [N,1]
+// broadcast of w; a mask 0 <= w <= R-1 (and-reduced over the size-1 axis); a
+// row gather on the [N,1] indices; and select(mask, rows, fill) with fill =
+// NaN for floats. In MPSGraph that is one 24-op graph (memory.gather_f32
+// [65536,512] x 8192 rows: 0.78-0.80 ms vs jax-mps 0.75); with the native
+// gather-rows kernel the wrap and fill stayed in the graph and the split
+// plan was no faster. FuseTakePatterns matches that exact structure, points
+// the gather at the raw [N] int32 indices (index_vector_dim == rank, the
+// implicit trailing 1) and tags it with the fill bits; the native
+// take_rows_b32/b16 kernel then wraps, bounds-checks and copies raw bits or
+// writes the fill bits in one step. Only f32/f16 tables with int32 indices.
+// JAX_METALLIB_DISABLE_NATIVE_TAKE=1 skips the rewrite;
+// JAX_METALLIB_TAKE_FUSED_GRAPH=1 keeps it but lowers the tagged gather in
+// MPSGraph (shape_ops.mm HandleFusedTake).
+static bool TakeSplatAPInt(mlir::Value v, llvm::APInt* out) {
+    for (int d = 0; d < 4 && v; ++d) {
+        mlir::Operation* def = v.getDefiningOp();
+        if (!def) {
+            return false;
+        }
+        if (auto bc = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(def)) {
+            v = bc.getOperand();
+            continue;
+        }
+        auto c = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(def);
+        auto a = c ? mlir::dyn_cast<mlir::DenseIntElementsAttr>(c.getValue()) : nullptr;
+        if (!a || !a.isSplat()) {
+            return false;
+        }
+        *out = a.getSplatValue<llvm::APInt>();
+        return true;
+    }
+    return false;
+}
+
+static bool TakeSplatFloatBits(mlir::Value v, mlir::Type elem, uint64_t* out) {
+    for (int d = 0; d < 4 && v; ++d) {
+        mlir::Operation* def = v.getDefiningOp();
+        if (!def) {
+            return false;
+        }
+        if (auto bc = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(def)) {
+            v = bc.getOperand();
+            continue;
+        }
+        auto c = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(def);
+        auto a = c ? mlir::dyn_cast<mlir::DenseFPElementsAttr>(c.getValue()) : nullptr;
+        if (!a || !a.isSplat() || a.getElementType() != elem) {
+            return false;
+        }
+        *out = a.getSplatValue<llvm::APFloat>().bitcastToAPInt().getZExtValue();
+        return true;
+    }
+    return false;
+}
+
+static bool TakeSignedCompare(mlir::stablehlo::CompareOp c, mlir::stablehlo::ComparisonDirection dir) {
+    if (!c || c.getComparisonDirection() != dir) {
+        return false;
+    }
+    auto ct = c.getCompareType();
+    return !ct || *ct == mlir::stablehlo::ComparisonType::SIGNED;
+}
+
+static void FuseTakePatterns(mlir::Block& block) {
+    namespace shlo = mlir::stablehlo;
+    using Dir = shlo::ComparisonDirection;
+    if (EnvFlagEnabled("JAX_METALLIB_DISABLE_NATIVE_TAKE")) {
+        return;
+    }
+    llvm::SmallVector<shlo::SelectOp> sels;
+    for (mlir::Operation& op : block) {
+        if (auto s = mlir::dyn_cast<shlo::SelectOp>(op)) {
+            sels.push_back(s);
+        }
+    }
+    llvm::SmallPtrSet<mlir::Operation*, 32> erased;
+    for (shlo::SelectOp sel : sels) {
+        if (erased.count(sel.getOperation())) {
+            continue;
+        }
+        auto g = sel.getOnTrue().getDefiningOp<shlo::GatherOp>();
+        if (!g || g->getBlock() != &block || !g->getResult(0).hasOneUse() ||
+            !IsEligibleGatherRowsNativeOp(g) || sel.getType() != g->getResult(0).getType()) {
+            continue;
+        }
+        auto ttype = mlir::cast<mlir::RankedTensorType>(g->getOperand(0).getType());
+        const int64_t rows = ttype.getDimSize(0);
+        uint64_t fill = 0;
+        if (rows <= 0 || rows > std::numeric_limits<int32_t>::max() ||
+            !TakeSplatFloatBits(sel.getOnFalse(), ttype.getElementType(), &fill)) {
+            continue;
+        }
+        // Wrapped index: idx = broadcast_in_dim(select(raw < 0, raw + R, raw), [0]).
+        mlir::Value idx = g->getOperand(1);
+        auto idxBc = idx.getDefiningOp<shlo::BroadcastInDimOp>();
+        if (!idxBc || idxBc.getBroadcastDimensions().size() != 1 || idxBc.getBroadcastDimensions()[0] != 0) {
+            continue;
+        }
+        auto wsel = idxBc.getOperand().getDefiningOp<shlo::SelectOp>();
+        auto wtype = mlir::dyn_cast<mlir::RankedTensorType>(idxBc.getOperand().getType());
+        if (!wsel || !wtype || wtype.getRank() != 1 || !wtype.getElementType().isInteger(32)) {
+            continue;
+        }
+        mlir::Value raw = wsel.getOnFalse();
+        llvm::APInt c;
+        auto ltz = wsel.getPred().getDefiningOp<shlo::CompareOp>();
+        if (raw.getType() != wtype || !TakeSignedCompare(ltz, Dir::LT) || ltz.getLhs() != raw ||
+            !TakeSplatAPInt(ltz.getRhs(), &c) || !c.isZero()) {
+            continue;
+        }
+        auto add = wsel.getOnTrue().getDefiningOp<shlo::AddOp>();
+        mlir::Value addend;
+        if (add && add.getLhs() == raw) {
+            addend = add.getRhs();
+        } else if (add && add.getRhs() == raw) {
+            addend = add.getLhs();
+        }
+        if (!addend || !TakeSplatAPInt(addend, &c) || c.getSExtValue() != rows) {
+            continue;
+        }
+        // Mask: broadcast_in_dim(reduce_and(and(idx >= 0, idx <= R - 1), [1], true), [0]).
+        auto predBc = sel.getPred().getDefiningOp<shlo::BroadcastInDimOp>();
+        if (!predBc || predBc.getBroadcastDimensions().size() != 1 ||
+            predBc.getBroadcastDimensions()[0] != 0) {
+            continue;
+        }
+        auto red = predBc.getOperand().getDefiningOp<shlo::ReduceOp>();
+        if (!red || red->getNumOperands() != 2 || red->getNumResults() != 1 ||
+            GetReduceBodyOpName(red) != "stablehlo.and" || red.getDimensions().size() != 1 ||
+            red.getDimensions()[0] != 1 || !TakeSplatAPInt(red->getOperand(1), &c) || !c.isAllOnes()) {
+            continue;
+        }
+        auto andOp = red->getOperand(0).getDefiningOp<shlo::AndOp>();
+        if (!andOp) {
+            continue;
+        }
+        bool haveGe = false;
+        bool haveLe = false;
+        for (mlir::Value side : {andOp.getLhs(), andOp.getRhs()}) {
+            auto cmp = side.getDefiningOp<shlo::CompareOp>();
+            if (!cmp || cmp.getLhs() != idx || !TakeSplatAPInt(cmp.getRhs(), &c)) {
+                continue;
+            }
+            if (TakeSignedCompare(cmp, Dir::GE) && c.isZero()) {
+                haveGe = true;
+            } else if (TakeSignedCompare(cmp, Dir::LE) && c.getSExtValue() == rows - 1) {
+                haveLe = true;
+            }
+        }
+        if (!haveGe || !haveLe) {
+            continue;
+        }
+
+        mlir::OpBuilder b(g);
+        g->setOperand(1, raw);
+        g->setAttr("__take_fused", b.getUnitAttr());
+        g->setAttr("__take_fill_bits", b.getI64IntegerAttr(static_cast<int64_t>(fill)));
+        sel.getResult().replaceAllUsesWith(g->getResult(0));
+        MPS_LOG_INFO("take fusion: wrap + mask + gather + select -> native take\n");
+
+        llvm::SmallVector<mlir::Operation*, 32> work{sel.getOperation(), idxBc.getOperation()};
+        while (!work.empty()) {
+            mlir::Operation* op = work.pop_back_val();
+            if (!op || erased.count(op) || op->getBlock() != &block || !mlir::isOpTriviallyDead(op)) {
+                continue;
+            }
+            for (mlir::Value v : op->getOperands()) {
+                if (mlir::Operation* def = v.getDefiningOp()) {
+                    work.push_back(def);
+                }
+            }
+            erased.insert(op);
+            op->erase();
+        }
+    }
 }
 
 static void FuseReduceMeanPatterns(mlir::Block& block) {
@@ -5024,6 +5232,32 @@ static bool BakeNativeStep(id<MTLDevice> device, NativeStep* ns) {
 
     mlir::Operation* op = ns->op;
 
+    // Fused jnp.take: the gather-rows dispatch with the take kernel (fill bits
+    // at buffer 6). Checked first: its [N] indices fail the plain gather test.
+    if (IsFusedTakeOp(op)) {
+        std::vector<int64_t> tshape, ishape;
+        MPSDataType dt = MPSDataTypeInvalid;
+        if (!GetStaticTensorInfo(op->getOperand(0).getType(), &tshape, nullptr, &dt) ||
+            !GetStaticTensorInfo(op->getOperand(1).getType(), &ishape, nullptr, nullptr)) {
+            return false;
+        }
+        id<MTLComputePipelineState> pipeline =
+            GetFastNativePipeline(device, dt == MPSDataTypeFloat16 ? "take_rows_b16" : "take_rows_b32");
+        if (!pipeline) {
+            return false;
+        }
+        ns->baked_kind = NativeStep::BakedKind::kGatherRows;
+        ns->baked_pipeline = pipeline;
+        ns->baked_gather_num_indices = static_cast<uint32_t>(ishape[0]);
+        ns->baked_gather_cols = static_cast<uint32_t>(tshape[1]);
+        ns->baked_gather_table_rows = static_cast<uint32_t>(tshape[0]);
+        ns->baked_take_fill_bits =
+            static_cast<uint32_t>(op->getAttrOfType<mlir::IntegerAttr>("__take_fill_bits").getInt());
+        ComputeLinearDispatchConfig(pipeline, ns->baked_gather_num_indices * ns->baked_gather_cols,
+                                    &ns->baked_grid, &ns->baked_tg, dt);
+        return true;
+    }
+
     IntrinsicNativeKind simpleKind = ClassifySimpleKind(op);
     if (simpleKind == IntrinsicNativeKind::kReshapeAlias && IsEligibleReshapeAliasOp(op)) {
         ns->baked_kind = NativeStep::BakedKind::kReshapeAlias;
@@ -6009,6 +6243,50 @@ static id<MTLBuffer> NativeIntrinsicGatherRowsHandler(id<MTLDevice> device,
     return out;
 }
 
+static id<MTLBuffer> NativeTakeRowsHandler(id<MTLDevice> device, id<MTLCommandBuffer> commandBuffer,
+                                           mlir::Operation* op, const std::vector<id<MTLBuffer>>& inputs) {
+    if (!device || !commandBuffer || !IsFusedTakeOp(op) || inputs.size() < 2 || !inputs[0] || !inputs[1]) {
+        return nil;
+    }
+    std::vector<int64_t> tshape, ishape;
+    MPSDataType dt = MPSDataTypeInvalid;
+    if (!GetStaticTensorInfo(op->getOperand(0).getType(), &tshape, nullptr, &dt) ||
+        !GetStaticTensorInfo(op->getOperand(1).getType(), &ishape, nullptr, nullptr)) {
+        return nil;
+    }
+    const uint32_t num_indices = static_cast<uint32_t>(ishape[0]);
+    const uint32_t cols = static_cast<uint32_t>(tshape[1]);
+    const uint32_t table_rows = static_cast<uint32_t>(tshape[0]);
+    const uint32_t fill_bits =
+        static_cast<uint32_t>(op->getAttrOfType<mlir::IntegerAttr>("__take_fill_bits").getInt());
+    size_t outBytes = ByteSizeFromType(op->getResult(0).getType());
+    if (outBytes == 0) {
+        return nil;
+    }
+    id<MTLBuffer> out = AcquireReusableOutputBuffer(device, outBytes);
+    if (!out) {
+        return nil;
+    }
+    id<MTLComputePipelineState> pipeline =
+        GetFastNativePipeline(device, dt == MPSDataTypeFloat16 ? "take_rows_b16" : "take_rows_b32");
+    if (!pipeline) {
+        CFRelease((__bridge CFTypeRef)out);
+        return nil;
+    }
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:inputs[0] offset:0 atIndex:0];
+    [encoder setBuffer:inputs[1] offset:0 atIndex:1];
+    [encoder setBuffer:out offset:0 atIndex:2];
+    [encoder setBytes:&num_indices length:sizeof(num_indices) atIndex:3];
+    [encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+    [encoder setBytes:&table_rows length:sizeof(table_rows) atIndex:5];
+    [encoder setBytes:&fill_bits length:sizeof(fill_bits) atIndex:6];
+    EncodeLinearDispatch(encoder, pipeline, num_indices * cols, dt);
+    [encoder endEncoding];
+    return out;
+}
+
 static bool ShouldPreferGraphForIntrinsic(mlir::Operation* op) {
     (void)op;
     return false;
@@ -6204,6 +6482,12 @@ static id<MTLBuffer> NativeIntrinsicSortHandler(id<MTLDevice> device, id<MTLComm
 static NativeOpHandler TrySelectIntrinsicNativeHandler(mlir::Operation* op) {
     if (!op) {
         return nullptr;
+    }
+    // Fused jnp.take (FuseTakePatterns) is a standalone kernel like the native
+    // sort, so it routes natively even with the intrinsic family gated off.
+    if (IsFusedTakeOp(op)) {
+        static const bool take_graph = EnvFlagEnabled("JAX_METALLIB_TAKE_FUSED_GRAPH");
+        return take_graph ? nullptr : NativeTakeRowsHandler;
     }
     // Large last-axis sum/mean reductions route natively EVEN when the
     // intrinsic-kernel family is gated off: the TG reduce kernel is 13-100x
@@ -7396,6 +7680,7 @@ bool MpsExecutable::BuildExecutionPlan() {
             FuseLayerNormPatterns(preBlock);
             FuseSoftmaxPatterns(preBlock);
             FuseReduceMeanPatterns(preBlock);
+            FuseTakePatterns(preBlock);
         }
         MPS_LOG_DEBUG("BuildExecutionPlan: layernorm/softmax/reduce_mean fusion pass complete\n");
 
@@ -7577,7 +7862,8 @@ bool MpsExecutable::BuildExecutionPlan() {
                         has_explicit_native_segment = true;
                     }
                     if (seg.ops[0]->hasAttr("__softmax_fused") || seg.ops[0]->hasAttr("__mean_fused") ||
-                        seg.ops[0]->hasAttr("__softmax_numerator_fused")) {
+                        seg.ops[0]->hasAttr("__softmax_numerator_fused") ||
+                        seg.ops[0]->hasAttr("__take_fused")) {
                         has_explicit_native_segment = true;
                     }
                 }
@@ -9170,6 +9456,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                                         [fp_enc setBytes:&ns_fp.baked_gather_table_rows
                                                   length:sizeof(ns_fp.baked_gather_table_rows)
                                                  atIndex:5];
+                                        [fp_enc setBytes:&ns_fp.baked_take_fill_bits
+                                                  length:sizeof(ns_fp.baked_take_fill_bits)
+                                                 atIndex:6];
                                         if (ns_fp.baked_use_stride) {
                                             [fp_enc dispatchThreadgroups:ns_fp.baked_grid
                                                    threadsPerThreadgroup:ns_fp.baked_tg];
@@ -10096,6 +10385,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                         [nativeComputeEncoder setBytes:&ns.baked_gather_table_rows
                                                 length:sizeof(ns.baked_gather_table_rows)
                                                atIndex:5];
+                        [nativeComputeEncoder setBytes:&ns.baked_take_fill_bits
+                                                length:sizeof(ns.baked_take_fill_bits)
+                                               atIndex:6];
                         if (ns.baked_use_stride) {
                             [nativeComputeEncoder dispatchThreadgroups:ns.baked_grid
                                                  threadsPerThreadgroup:ns.baked_tg];
@@ -10936,6 +11228,9 @@ ExecutionResult MpsExecutable::Execute(const std::vector<MpsBuffer*>& inputs, Mp
                             [enc setBytes:&ns.baked_gather_table_rows
                                    length:sizeof(ns.baked_gather_table_rows)
                                   atIndex:5];
+                            [enc setBytes:&ns.baked_take_fill_bits
+                                   length:sizeof(ns.baked_take_fill_bits)
+                                  atIndex:6];
                             if (ns.baked_use_stride) {
                                 [enc dispatchThreadgroups:ns.baked_grid threadsPerThreadgroup:ns.baked_tg];
                             } else {

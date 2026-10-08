@@ -2113,6 +2113,41 @@ kernel void gather_rows_f16(device const half* operand [[buffer(0)]],
     output[gid] = (half)0.0f;
   }
 }
+// --- Fused jnp.take (FuseTakePatterns): wrap, bounds check, copy or fill ---
+// indices: [num_indices] int32 raw (before JAX's negative wrap). A row index
+// i < 0 becomes i + table_rows (no overflow: table_rows <= INT32_MAX); rows
+// outside [0, table_rows) get fill_bits. Raw bits are copied, so NaN
+// payloads and signed zeros are exact.
+kernel void take_rows_b32(device const uint* operand [[buffer(0)]],
+                          device const int* indices [[buffer(1)]],
+                          device uint* output [[buffer(2)]],
+                          constant uint& num_indices [[buffer(3)]],
+                          constant uint& cols [[buffer(4)]],
+                          constant uint& table_rows [[buffer(5)]],
+                          constant uint& fill_bits [[buffer(6)]],
+                          uint gid [[thread_position_in_grid]]) {
+  if (gid >= num_indices * cols) return;
+  uint r = gid / cols;
+  uint c = gid - r * cols;
+  int i = indices[r];
+  if (i < 0) i += (int)table_rows;
+  output[gid] = (i >= 0 && (uint)i < table_rows) ? operand[(uint)i * cols + c] : fill_bits;
+}
+kernel void take_rows_b16(device const ushort* operand [[buffer(0)]],
+                          device const int* indices [[buffer(1)]],
+                          device ushort* output [[buffer(2)]],
+                          constant uint& num_indices [[buffer(3)]],
+                          constant uint& cols [[buffer(4)]],
+                          constant uint& table_rows [[buffer(5)]],
+                          constant uint& fill_bits [[buffer(6)]],
+                          uint gid [[thread_position_in_grid]]) {
+  if (gid >= num_indices * cols) return;
+  uint r = gid / cols;
+  uint c = gid - r * cols;
+  int i = indices[r];
+  if (i < 0) i += (int)table_rows;
+  output[gid] = (i >= 0 && (uint)i < table_rows) ? operand[(uint)i * cols + c] : (ushort)fill_bits;
+}
 
 // --- Coalesced gather: float4 reads, shared indices, 2D dispatch ---
 // Each threadgroup handles ROWS_PER_TG rows. Thread.y iterates over float4 columns.

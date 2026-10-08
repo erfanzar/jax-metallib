@@ -3514,7 +3514,70 @@ static bool Gather16RawBitsDisabled() {
     return disabled;
 }
 
+// Graph lowering of a gather tagged by FuseTakePatterns (mps_executable.mm):
+// operand 1 holds the raw [N] int32 jnp.take indices. Wrap negatives (i + R),
+// gather the clamped rows (16-bit tables as raw int16), and select the fill
+// bits where the wrapped index is out of range, on integer views so NaN
+// payloads survive. Used when the native take step is not taken
+// (JAX_METALLIB_TAKE_FUSED_GRAPH=1).
+static ProcessResult HandleFusedTake(HandlerContext& ctx) {
+    MPSGraph* g = ctx.graph;
+    MPSGraphTensor* table = GetInputTensor(ctx, 0);
+    MPSGraphTensor* raw = GetInputTensor(ctx, 1);
+    auto fillAttr = ctx.op->getAttrOfType<mlir::IntegerAttr>("__take_fill_bits");
+    if (!table || !raw || !fillAttr || table.shape.count != 2 || raw.shape.count != 1) {
+        return ProcessResult::Error("gather: malformed fused take");
+    }
+    const MPSDataType dt = table.dataType;
+    const bool half = dt == MPSDataTypeFloat16 || dt == MPSDataTypeBFloat16;
+    if (!half && dt != MPSDataTypeFloat32) {
+        return ProcessResult::Error("gather: fused take supports f32/f16 tables only");
+    }
+    const MPSDataType bitsType = half ? MPSDataTypeInt16 : MPSDataTypeInt32;
+    const int64_t rows = [table.shape[0] longLongValue];
+    raw = EnsureInt32(g, raw);
+    MPSGraphTensor* zero = [g constantWithScalar:0 dataType:MPSDataTypeInt32];
+    MPSGraphTensor* nrows = [g constantWithScalar:(double)rows dataType:MPSDataTypeInt32];
+    MPSGraphTensor* last = [g constantWithScalar:(double)(rows - 1) dataType:MPSDataTypeInt32];
+    MPSGraphTensor* neg = [g lessThanWithPrimaryTensor:raw secondaryTensor:zero name:nil];
+    MPSGraphTensor* w = [g selectWithPredicateTensor:neg
+                                 truePredicateTensor:[g additionWithPrimaryTensor:raw
+                                                                  secondaryTensor:nrows
+                                                                             name:nil]
+                                falsePredicateTensor:raw
+                                                name:nil];
+    MPSGraphTensor* valid = [g
+        logicalANDWithPrimaryTensor:[g greaterThanOrEqualToWithPrimaryTensor:w secondaryTensor:zero name:nil]
+                    secondaryTensor:[g lessThanOrEqualToWithPrimaryTensor:w secondaryTensor:last name:nil]
+                               name:nil];
+    MPSGraphTensor* clamped = [g maximumWithPrimaryTensor:[g minimumWithPrimaryTensor:w
+                                                                      secondaryTensor:last
+                                                                                 name:nil]
+                                          secondaryTensor:zero
+                                                     name:nil];
+    MPSGraphTensor* src = half ? [g reinterpretCastTensor:table toType:MPSDataTypeInt16 name:nil] : table;
+    MPSGraphTensor* gathered = [g gatherWithUpdatesTensor:src
+                                            indicesTensor:clamped
+                                                     axis:0
+                                          batchDimensions:0
+                                                     name:nil];
+    MPSGraphTensor* bits =
+        half ? gathered : [g reinterpretCastTensor:gathered toType:MPSDataTypeInt32 name:nil];
+    const uint64_t fill = static_cast<uint64_t>(fillAttr.getInt());
+    const double fillValue = half ? (double)(int16_t)(uint16_t)fill : (double)(int32_t)(uint32_t)fill;
+    MPSGraphTensor* fillT = [g constantWithScalar:fillValue dataType:bitsType];
+    MPSGraphTensor* mask = [g reshapeTensor:valid withShape:@[raw.shape[0], @1] name:nil];
+    MPSGraphTensor* out = [g selectWithPredicateTensor:mask
+                                   truePredicateTensor:bits
+                                  falsePredicateTensor:fillT
+                                                  name:nil];
+    return Result(ctx, [g reinterpretCastTensor:out toType:dt name:nil], "gather");
+}
+
 static ProcessResult HandleGather(HandlerContext& ctx) {
+    if (ctx.op && ctx.op->hasAttr("__take_fused")) {
+        return HandleFusedTake(ctx);
+    }
     MPSGraphTensor* operand = GetInputTensor(ctx, 0);
     if (operand && (operand.dataType == MPSDataTypeFloat16 || operand.dataType == MPSDataTypeBFloat16) &&
         !Gather16RawBitsDisabled() && ctx.op->getNumOperands() >= 2 && ctx.op->getNumResults() == 1 &&
