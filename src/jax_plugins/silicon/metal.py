@@ -127,13 +127,11 @@ def _get_pipeline(source: str, function_name: str):
     else:
         lib = _library_cache[src_hash]
 
-    # Get function
     fn = lib.newFunctionWithName_(function_name)
     if fn is None:
         names = list(lib.functionNames())
         raise ValueError(f"Kernel function '{function_name}' not found. Available: {names}")
 
-    # Create pipeline
     pipeline, err = device.newComputePipelineStateWithFunction_error_(fn, None)
     if pipeline is None:
         err_str = str(err) if err else "unknown error"
@@ -286,7 +284,6 @@ def execute(
     cmd_buf = command_queue.commandBuffer()
     encoder = cmd_buf.computeCommandEncoder()
 
-    # Set pipeline
     encoder.setComputePipelineState_(pipeline)
 
     # Bind input buffers
@@ -319,7 +316,6 @@ def execute(
     cmd_buf.commit()
     cmd_buf.waitUntilCompleted()
 
-    # Check for errors
     if cmd_buf.error() is not None:
         raise RuntimeError(f"Metal kernel execution failed: {cmd_buf.error()}")
 

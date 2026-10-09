@@ -87,7 +87,6 @@ def _find_library():
             break
 
     for path, _ in _get_search_paths():
-        # Handle glob patterns
         if "*" in str(path):
             try:
                 for match in Path("/").glob(str(path).lstrip("/")):
@@ -153,14 +152,12 @@ def initialize():
     Raises:
         SiliconPluginError: If Metal GPU is not available or plugin initialization fails.
     """
-    # Check platform first
     if sys.platform != "darwin":
         raise SiliconPluginError(
             f"MPS plugin requires macOS, but running on {sys.platform}. MPS "
             "Performance Shaders) is only available on Apple devices."
         )
 
-    # Check jaxlib version compatibility
     _check_jaxlib_version()
 
     library_path = _find_library()

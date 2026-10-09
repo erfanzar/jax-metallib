@@ -259,7 +259,6 @@ def main():
                 f"{format_time(mps_gt):>10} {gspeedup:>8.2f}x  {gstatus}"
             )
 
-    # Summary
     print("\n" + "=" * 80)
     if slow_ops:
         print(f"\n{len(slow_ops)} operations where MPS is slower than CPU:\n")

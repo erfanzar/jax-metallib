@@ -603,7 +603,6 @@ static GemmAutotuneResult GetAutotunedGemmAlgorithm(id<MTLDevice> device, id<MTL
     memset(aData, 0x42, aBytes);
     memset(bData, 0xAB, bBytes);
     
-    // Create matrix descriptors
     MPSMatrixDescriptor* aDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:k rowBytes:0 dataType:dtype];
     MPSMatrixDescriptor* bDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:k columns:n rowBytes:0 dataType:dtype];
     MPSMatrixDescriptor* cDesc = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n rowBytes:0 dataType:dtype];

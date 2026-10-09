@@ -961,14 +961,12 @@ def main():
     if args.cycles < 1:
         parser.error("--cycles must be >= 1")
 
-    # Verify interpreters exist
     for label, path in [("jax-metallib", args.jax_metallib_python), ("jax-mps", args.jax_mps_python)]:
         if not Path(path).exists():
             print(f"ERROR: {label} Python not found at {path}")
             print(f"  Install {label} in the appropriate venv first.")
             sys.exit(1)
 
-    # Get version info
     for label, pybin in [("jax-metallib", args.jax_metallib_python), ("jax-mps", args.jax_mps_python)]:
         try:
             out = subprocess.check_output(
@@ -1030,7 +1028,6 @@ def main():
             }
         )
 
-    # Summary
     print("\n" + "=" * 90)
     wins = sum(1 for r in results if r["speedup"] is not None and r["speedup"] >= 1.0)
     losses = sum(1 for r in results if r["speedup"] is not None and r["speedup"] < 1.0)
@@ -1048,7 +1045,6 @@ def main():
         print(f"Geometric mean speedup (silicon over jax-mps): {geo_mean:.2f}x")
         print(f"Max speedup: {max(speedups):.2f}x  |  Min: {min(speedups):.2f}x")
 
-    # Write detailed results
     out_dir = REPO_ROOT / "tmp-files"
     out_dir.mkdir(parents=True, exist_ok=True)
 

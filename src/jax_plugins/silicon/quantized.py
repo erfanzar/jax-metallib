@@ -153,7 +153,6 @@ def mx_quantize(w, *, mode: str = "mxfp4") -> tuple:
     w_flat = w_np.reshape(-1, K)
     num_rows = w_flat.shape[0]
 
-    # Process each group
     num_groups = K // group_size
     pack_factor = 2 if bits == 4 else 1
 
@@ -168,7 +167,6 @@ def mx_quantize(w, *, mode: str = "mxfp4") -> tuple:
             end = start + group_size
             group = w_flat[row, start:end]
 
-            # Compute group scale
             group_max = np.max(np.abs(group))
             max_repr = 6.0 if bits == 4 else 448.0
             raw_scale = group_max / max_repr if group_max != 0 else 0.0
