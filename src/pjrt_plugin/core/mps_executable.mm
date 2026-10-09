@@ -7430,15 +7430,59 @@ static bool IsFlattenableElementwiseSegment(const std::vector<mlir::Operation*>&
         }
         return rt.getShape() == shape;
     };
+    // A rank-0 float constant broadcast to the segment shape (x * 1.702,
+    // t * 0.1) is allowed when the constant feeds only in-segment broadcasts
+    // and each broadcast feeds only the elementwise ops above. The broadcast
+    // is bound to a [1] tensor that MPSGraph broadcasts implicitly; every
+    // elementwise op needs one full-size operand, so results stay [numel].
+    // JAX_METALLIB_DISABLE_FLAT_SCALAR_OPERANDS=1 disqualifies such segments.
+    static const bool no_scalars = EnvFlagEnabled("JAX_METALLIB_DISABLE_FLAT_SCALAR_OPERANDS");
+    std::unordered_set<mlir::Operation*> seg_set(ops.begin(), ops.end());
+    std::unordered_set<void*> scalar_vals;
+    int64_t elem_ops = 0;
     for (mlir::Operation* op : ops) {
+        if (auto c = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op)) {
+            auto ct = mlir::dyn_cast<mlir::RankedTensorType>(c.getType());
+            if (no_scalars || !ct || ct.getRank() != 0 || !mlir::isa<mlir::FloatType>(ct.getElementType()) ||
+                op->use_empty()) {
+                return false;
+            }
+            for (mlir::Operation* user : op->getUsers()) {
+                if (!seg_set.count(user) || !mlir::isa<mlir::stablehlo::BroadcastInDimOp>(user)) {
+                    return false;
+                }
+            }
+            continue;
+        }
+        if (auto bc = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(op)) {
+            mlir::Operation* def = bc.getOperand().getDefiningOp();
+            auto st = mlir::dyn_cast<mlir::RankedTensorType>(bc.getOperand().getType());
+            if (no_scalars || !def || !seg_set.count(def) || !mlir::isa<mlir::stablehlo::ConstantOp>(def) ||
+                !st || st.getRank() != 0 || !check(bc.getType()) || op->use_empty()) {
+                return false;
+            }
+            for (mlir::Operation* user : op->getUsers()) {
+                if (!seg_set.count(user) || !IsFlattenableElementwiseOp(user)) {
+                    return false;
+                }
+            }
+            scalar_vals.insert(bc.getResult().getAsOpaquePointer());
+            continue;
+        }
         if (op->getNumRegions() != 0 || !IsFlattenableElementwiseOp(op)) {
             return false;
         }
+        bool full_operand = false;
         for (mlir::Value v : op->getOperands()) {
             if (!check(v.getType())) {
                 return false;
             }
+            full_operand = full_operand || !scalar_vals.count(v.getAsOpaquePointer());
         }
+        if (!full_operand) {
+            return false;
+        }
+        ++elem_ops;
         for (mlir::Value v : op->getResults()) {
             if (!check(v.getType())) {
                 return false;
@@ -7448,7 +7492,7 @@ static bool IsFlattenableElementwiseSegment(const std::vector<mlir::Operation*>&
     if (numel_out) {
         *numel_out = numel;
     }
-    return have;
+    return have && elem_ops > 0;
 }
 
 // A static slice of an entry argument that covers one contiguous row-major
@@ -8217,6 +8261,17 @@ bool MpsExecutable::BuildExecutionPlan() {
                     @try {
                         for (auto* op : seg.ops) {
                             if (view_skip.count(op)) {
+                                continue;
+                            }
+                            if (flat_segment && mlir::isa<mlir::stablehlo::BroadcastInDimOp>(op)) {
+                                MPSGraphTensor* src = GetTensor(values, op->getOperand(0));
+                                if (!src) {
+                                    error_ = "flat elementwise: missing scalar operand";
+                                    return false;
+                                }
+                                values[op->getResult(0).getAsOpaquePointer()] = [graph reshapeTensor:src
+                                                                                           withShape:@[@1]
+                                                                                                name:nil];
                                 continue;
                             }
                             std::string op_name = op->getName().getStringRef().str();
