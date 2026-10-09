@@ -161,8 +161,8 @@ Important restrictions:
   replacement. Disabling the Python lowering exposes those restrictions.
 - **Numerical differences remain.** Tests use per-operation tolerances and
   targeted bitwise checks, not a blanket guarantee of equality with CPU.
-  Some special functions use approximations. Eligible float32 matmuls narrow
-  inputs by default; see the precision setting below.
+  Some special functions use approximations. Float32 matmuls keep float32
+  inputs unless `JAX_METALLIB_GEMM_FAST_F32=1`; see the precision setting below.
 
 Unsupported operations and custom-call targets report diagnostics with the
 operation name and, where available, shape/type information. Native custom
@@ -177,13 +177,31 @@ then creates an ordered sequence of:
 1. **MPSGraph segments:** operation handlers build graphs that are compiled
    and encoded through MPSGraph.
 2. **Native steps:** Metal or MPS kernels operate on `MTLBuffer` objects.
-   Eligible reductions, sorts, and softmax patterns have native routes;
-   `metal.compile` calls use a separate native custom-call path.
+   Eligible reductions, sorts, softmax patterns, and `jnp.take` row lookups
+   have native routes; `metal.compile` calls use a separate native custom-call
+   path.
 3. **CPU steps:** selected small GEMMs, sorts, and Cholesky decompositions use
    Accelerate BLAS/vDSP/LAPACK routines.
 
 Eligible native elementwise chains can be combined into generated MSL kernels.
 This does not fuse arbitrary user-written Metal kernels.
+
+The parser and planner also rewrite some common patterns before execution.
+Each rewrite has an environment switch that turns it off (see Configuration):
+
+- A top-level counted `while` loop with a constant trip count of at most 16
+  (for example `lax.scan` over the layers of a model) is unrolled when the
+  module is parsed, so per-layer weight indexing becomes static slicing.
+- A static slice of a jit argument that covers one contiguous range is bound
+  to the graph as a view of the argument's buffer instead of being copied.
+- A graph segment made only of same-shape float elementwise ops, optionally
+  with broadcast scalar constants, runs on flat 1-D tensors over the same
+  buffers.
+- `jnp.take(table, i, axis=0)` on float32/float16 tables runs as one Metal
+  kernel that wraps negative indices, checks bounds, and copies rows or
+  writes the fill value.
+- `[..., K] @ [K, N]` dense-layer dots pass the rank-N input straight to the
+  MPSGraph matmul instead of flattening it.
 
 The optional intrinsic-kernel family, including LayerNorm fusion and additional
 GEMM/elementwise routing, is disabled by default. Enabling it is experimental.
@@ -355,6 +373,12 @@ stable specification of every internal tuning flag.
 | `JAX_METALLIB_DISABLE_NATIVE_ROW_MINMAX` | Off | Keep per-row last-axis max/min on MPSGraph instead of the native row kernel |
 | `JAX_METALLIB_JACOBI_EARLY_EXIT` | `1` | `0` runs the eigh/SVD Jacobi paths for a fixed 12 sweeps |
 | `JAX_METALLIB_LOOP_UNROLL` | `8` | Counted-loop unroll limit, clamped to 1–32; `1` disables it |
+| `JAX_METALLIB_LOOP_PARSE_UNROLL_MAX_TRIPS` | `16` | Largest trip count fully unrolled at parse time (capped at 64); `0` keeps every loop |
+| `JAX_METALLIB_DISABLE_INPUT_SLICE_VIEWS` | Off | Slice jit arguments inside the graph instead of binding buffer views |
+| `JAX_METALLIB_DISABLE_FLAT_ELEMENTWISE_GRAPH` | Off | Build elementwise segments on their declared shapes instead of flat 1-D tensors |
+| `JAX_METALLIB_DISABLE_FLAT_SCALAR_OPERANDS` | Off | Keep segments that contain broadcast scalar constants off the flat path |
+| `JAX_METALLIB_DISABLE_NATIVE_TAKE` | Off | Leave `jnp.take` as JAX lowers it instead of the native take kernel |
+| `JAX_METALLIB_DISABLE_DOT_RANKN_BROADCAST` | Off | Flatten `[..., K] @ [K, N]` dots to 2-D again |
 | `JAX_METALLIB_AUTOTUNE_CACHE_DIR` | `~/.cache/jax-silicon` | Directory for autotune choices, not compiled custom Metal pipelines |
 | `JAX_METALLIB_TRACE_PLAN` | Off | Print the execution plan to stderr |
 
@@ -433,12 +457,33 @@ synchronized steady-state timing separately. Its defaults are 10 warmups,
 repeat medians. JSONL output is appended. The bottleneck script generates
 microbenchmarks for a subset of registered operations and records skips/errors.
 
+### Comparison with jax-mps
+
 A jax-mps comparison needs a separate environment because both plugins register
-as `mps`:
+as `mps`. Put jax-mps in `.venv-jax-mps-0.11` (or `.venv-jax-mps`), or pass its
+interpreter explicitly, then run:
 
 ```bash
-uv run python benchmarks/vs_jax_mps.py --jax-mps-python /path/to/jax-mps-venv/bin/python
+scripts/run_benchmarks.sh                    # all 46 workloads, ABBA order, 3 cycles
+scripts/run_benchmarks.sh --filter fusion.   # workloads whose name contains "fusion."
+scripts/run_benchmarks.sh --jax-mps-python /path/to/jax-mps-venv/bin/python
 ```
+
+The script rebuilds the native library, runs `benchmarks/vs_jax_mps.py`, and
+writes a log, JSONL, and Markdown report to `build/bench-runs/`, named by UTC
+time and commit. Before starting it refuses to run on battery power, above a
+1-minute load of 6, while another benchmark or pytest run is active, or while a
+known GPU-heavy process (a browser GPU helper, the Metal shader compiler, a
+game) is busy. Each of these skewed timings during development: battery power
+roughly halved loop-heavy rows on a laptop. Power and load are logged again at
+the end, so a run disturbed half-way can be discarded. `--filter` is a plain
+substring match, not a regex. See `scripts/run_benchmarks.sh --help` for the
+other options.
+
+Each workload runs both backends in fresh processes in A-B-B-A order, so each
+goes first equally often. The `pairs` column counts how many paired runs
+jax-metallib won; treat a row as a win or loss only when it repeats across
+runs, since workloads under about 0.5 ms vary by 10–20% between processes.
 
 These are synthetic workloads, not an application-level speedup guarantee.
 Report hardware, OS, JAX/jaxlib and plugin versions, comparator revision,

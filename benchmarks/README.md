@@ -34,6 +34,19 @@ Write JSONL output:
 uv run python -m benchmarks.bench run --case 'anchor\\..*' --json-out /tmp/jax_silicon_bench.jsonl
 ```
 
+## Compare with jax-mps
+
+`vs_jax_mps.py` runs 46 workloads on jax-metallib and on jax-mps (in a separate
+interpreter, since both register as `mps`) and reports per-workload speedups.
+Use the wrapper, which checks power and load first and keeps a log per run:
+
+```bash
+scripts/run_benchmarks.sh --filter loop.
+```
+
+See `scripts/run_benchmarks.sh --help` and the Benchmarks section of the
+top-level README.
+
 ## Suggested Budgets (Document-Only)
 
 On the same machine:
